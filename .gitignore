@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime artifacts (never commit credentials)
+*.pwd
+*.credentials
+.my_tmp_*.cnf
+
+# Patch scripts (dev only)
+patch_*.py
