@@ -77,6 +77,34 @@ All notable changes to WP-SSL-Bootstrap are documented in this file.
 
 ---
 
+### 🔧 维护修复 / Maintenance Fixes
+
+> 以下修复在安全审计发布后基于代码复查及同类工具最佳实践调研追加，统一纳入 V3.1.1。
+> The following fixes were added post-audit during code review and best-practice research, consolidated under V3.1.1.
+
+- **[P1] Certbot deploy hook 绝对路径改为运行时探测** — Issue 1 的初始修复将 `nginx` / `systemctl` 替换为硬编码的 `/usr/sbin/nginx` / `/bin/systemctl`。进一步改为在 `SiteConfig.__init__` 通过 `shutil.which()` 探测实际路径并缓存（`self.nginx_bin` / `self.systemctl_bin`），hook 脚本写入时使用缓存值。硬编码路径在 OpenSUSE（`/usr/bin/nginx`）等非标布局发行版上会静默失败。
+  **Certbot deploy hook: hardcoded paths → runtime detection** — Initial Issue 1 fix used hardcoded `/usr/sbin/nginx` / `/bin/systemctl`. Now detected via `shutil.which()` at `SiteConfig.__init__` (cached as `nginx_bin` / `systemctl_bin`). Hardcoded paths fail silently on non-standard distros (e.g. OpenSUSE uses `/usr/bin/nginx`).
+
+- **[P2] 移除 `renew_cert()` 内联 `--deploy-hook` 防双重 reload** — `renew_cert()` 原有 `--certbot … --deploy-hook "nginx -t && systemctl reload nginx"` 与 Issue 1 新写入的持久 `renewal-hooks/deploy/01-reload-nginx.sh` 构成双重触发：certbot 续期成功后先执行持久 hook、再执行内联 hook，nginx 被无谓 reload 两次。已移除内联参数，统一由持久 hook 负责。
+  **Remove inline `--deploy-hook` in `renew_cert()` to prevent double reload** — The inline `--deploy-hook` and the persistent `renewal-hooks/deploy/` hook (Issue 1) both fired on renewal, causing two consecutive nginx reloads. Inline parameter removed; persistent hook is now the sole reload trigger.
+
+- **[P3] 升级边界：`renew_cert()` 开头确保持久 hook 存在** — 从旧版本升级后若直接执行 `renew` 而未执行 `update`/`deploy`，持久 hook 文件尚未写入，续期成功后 nginx 不会 reload，证书虽已更新但服务仍使用旧证书。`renew_cert()` 开头补调 `_install_certbot_deploy_hook()`，幂等、低开销，彻底消除此升级边界。
+  **Upgrade boundary: ensure persistent hook exists at `renew_cert()` start** — Upgrading from older versions and running `renew` before `update`/`deploy` left the persistent hook absent: renewal succeeded but nginx kept serving the old certificate. Added `_install_certbot_deploy_hook()` call at the top of `renew_cert()` (idempotent, low overhead).
+
+- **[P7] `setup_db_optimize_timer()` 中 `mysqlcheck` 改用绝对路径** — systemd 单元 `ExecStart` 的默认 PATH 仅为 `/usr/bin:/bin`，某些发行版将 `mysqlcheck` 安装在 `/usr/local/bin`。在 `SiteConfig.__init__` 通过 `shutil.which("mysqlcheck")` 探测并缓存为 `self.mysqlcheck_bin`，写入 service 文件的两个分支（有/无密码文件）均替换为绝对路径，保持与 P1 相同的严谨度。
+  **`setup_db_optimize_timer()`: `mysqlcheck` absolute path** — systemd unit `ExecStart` uses a narrow default PATH. Some distros place `mysqlcheck` in `/usr/local/bin`. Detected via `shutil.which()` at `SiteConfig.__init__` (cached as `mysqlcheck_bin`); both exec branches (with/without password file) now write the absolute path into the service unit.
+
+- **[P8] 移除 `_nginx_security_headers()` 中冗余的 `X-Frame-Options`** — `X-Frame-Options: SAMEORIGIN` 与 CSP `frame-ancestors 'self'` 功能完全等价；现代浏览器（Chrome 40+、Firefox 33+、Safari 10.1+）优先采用 CSP 策略。同时保留两者不会出错，但在需要调整 iframe 策略（如 Elementor 预览）时须两处同步修改，增加维护负担。已移除 `X-Frame-Options` 行，保留 CSP `frame-ancestors`。如需兼容 IE11 及以下可手动恢复。
+  **Remove redundant `X-Frame-Options` from `_nginx_security_headers()`** — `X-Frame-Options: SAMEORIGIN` is functionally equivalent to `frame-ancestors 'self'` in CSP; modern browsers prioritize CSP. Keeping both creates dual maintenance points (e.g. for Elementor iframe preview). `X-Frame-Options` line removed; CSP `frame-ancestors` retained. Restore manually if IE11 compatibility is required.
+
+- **[P9] 禁用 OCSP Stapling（Let's Encrypt 2025-08-06 关停服务）** ★ — Let's Encrypt 于 2025-05-07 起不再在新签发证书中内嵌 OCSP URL，2025-08-06 完全关停 OCSP 响应服务。`_nginx_ssl_params()` 中保留 `ssl_stapling on` 将产生 `nginx: [warn] "ssl_stapling" ignored, no OCSP responder URL` 日志，在 resolver 无响应时还可能阻塞 `nginx reload`。已注释 `ssl_stapling on/off`、`ssl_stapling_verify`、`resolver`、`resolver_timeout` 四行，保留原文便于追溯。证书吊销验证职责已由 LE 转移至客户端 CRL 机制。
+  **Disable OCSP Stapling (Let's Encrypt retired service 2025-08-06)** ★ — Let's Encrypt stopped embedding OCSP URLs in certificates (2025-05-07) and shut down the OCSP responder entirely (2025-08-06). Retaining `ssl_stapling on` produces `nginx: [warn] … no OCSP responder URL` and can block `nginx reload` when the resolver is unreachable. All four directives commented out with explanation. Certificate revocation checking now falls entirely to client-side CRL.
+
+- **[P10] `Permissions-Policy` 补全三项高风险特性** — 参照 OWASP Secure Headers Project 2025 建议，在原有四项（`camera` / `microphone` / `geolocation` / `payment`）基础上追加：`interest-cohort=()`（禁用 Google FLoC 用户画像追踪，WordPress 隐私保护最佳实践）、`usb=()`（禁用 WebUSB，WordPress 无此 API 使用场景）、`display-capture=()`（禁用屏幕录制，WordPress 无此 API 使用场景）。同步更新 `_nginx_security_headers()` 主块与 `_nginx_static_cache_headers()` 字体 location 重声明块（后者若不同步，Nginx 继承规则将导致字体请求返回更宽松的策略）。
+  **`Permissions-Policy` expanded with three additional directives** — Per OWASP Secure Headers Project 2025: added `interest-cohort=()` (disables Google FLoC profiling; WordPress privacy best practice), `usb=()` (no WebUSB use case in WordPress), and `display-capture=()` (no screen-capture use case in WordPress). Both `_nginx_security_headers()` (server block) and the font location re-declaration block in `_nginx_static_cache_headers()` updated in sync (the font location uses `add_header`, which overrides parent-block headers in Nginx).
+
+---
+
 ## [V3.1.0]
 
 > **升级说明 / Upgrade note**
