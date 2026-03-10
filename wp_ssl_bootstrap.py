@@ -6847,11 +6847,11 @@ class WPDeployManager:
 # ---------------------------------------------------------------------------
 # 用户可通过环境变量 WP_UPDATE_URL / WP_UPDATE_HASH_URL 覆盖
 SELF_UPDATE_URL_DEFAULT = (
-    "https://raw.githubusercontent.com/wp-ssl-bootstrap/wp-ssl-bootstrap"
+    "https://raw.githubusercontent.com/wenghang-hub/wp-ssl-bootstrap"
     "/main/wp_ssl_bootstrap.py"
 )
 SELF_UPDATE_HASH_URL_DEFAULT = (
-    "https://raw.githubusercontent.com/wp-ssl-bootstrap/wp-ssl-bootstrap"
+    "https://raw.githubusercontent.com/wenghang-hub/wp-ssl-bootstrap"
     "/main/wp_ssl_bootstrap.py.sha256"
 )
 
