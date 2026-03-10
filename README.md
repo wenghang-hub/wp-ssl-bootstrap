@@ -11,7 +11,7 @@ One command to deploy WordPress with HTTPS, auto-renewal, and production-grade s
 
 ## Features
 
-- **Zero-config HTTPS** — Let's Encrypt → BuyPass Go automatic failover; certbot error classification with circuit-breaker logic
+- **Zero-config HTTPS** — Let's Encrypt → BuyPass Go automatic failover; certbot error classification with circuit-breaker logic; Snap/certbot-auto/standard installs auto-detected
 - **Multi-distro** — Alibaba Cloud Linux 3 / CentOS 7–9 / RHEL / Ubuntu / Debian
 - **Database security** — auth_socket/unix_socket auto-detection; credentials never exposed in process list (`--defaults-extra-file`)
 - **Multi-source download** — Chinese mirror + global fallback with SHA-256 verification; WP-CLI fallback when tar.gz sources fail
@@ -22,6 +22,8 @@ One command to deploy WordPress with HTTPS, auto-renewal, and production-grade s
 - **Backup & restore** — one-command backup (DB + files + Nginx + Fail2Ban/logrotate); one-command restore
 - **Config hot-update** — `update` subcommand applies new templates without touching data
 - **Redis object cache** — optional `--redis`, composable with FastCGI page cache
+- **Performance tuning** — PHP-FPM pool auto-sized by RAM, MariaDB InnoDB tuning, BBR + TCP sysctl, swap auto-creation, Nginx `open_file_cache` (`--optimize`)
+- **WordPress Cron offload** — systemd 15-min timer replaces per-request wp-cron.php
 - **Bilingual UI** — Chinese/English; auto-detected from locale, persistable via `--lang`
 - **External database** — `--db-host` for RDS/remote MySQL, auto SSL transport
 - **Idempotent** — safe to re-run; existing passwords and databases are preserved
@@ -64,6 +66,7 @@ All other dependencies (Nginx, PHP-FPM, MariaDB, certbot, etc.) are installed au
 | `backup` | Back up DB + files + Nginx config + Fail2Ban/logrotate |
 | `restore` | Restore from backup (auto-selects latest, or `--from PATH`) |
 | `update` | Hot-update config templates after script upgrade |
+| `self-update` | Download latest script version with SHA-256 verification and atomic replace |
 | `uninstall` | Remove daemon components; preserves data and certificates |
 
 ## Options
@@ -75,14 +78,19 @@ All other dependencies (Nginx, PHP-FPM, MariaDB, certbot, etc.) are installed au
 --db-root-pass PASS     MariaDB/MySQL root password (env: WP_DB_ROOT_PASS)
 --cache {none,fastcgi}  Nginx cache mode
 --redis                 Enable Redis object cache
+--cloudflare            Fetch Cloudflare IP ranges and configure real IP restoration
 --allow-xmlrpc          Allow xmlrpc.php with rate limiting (default: deny)
+--wp-auto-install       Complete WordPress setup wizard automatically via WP-CLI
+--optimize              Enable Nginx open_file_cache for static-heavy sites
 --php-version X.Y       Force specific PHP-FPM version
 --skip-deps             Skip package installation
 --backup-dir PATH       Backup root directory (default: /root/backups)
+--keep N                Number of backups to retain (backup subcommand)
 --dry-run               Simulate without making changes
 --staging               Use Let's Encrypt staging environment
 --lang {zh,en}          Interface language (persisted after first use)
 --quiet                 Only WARNING and above
+--url URL               Custom source URL for self-update (env: WP_UPDATE_URL)
 ```
 
 ## Examples
@@ -108,6 +116,14 @@ sudo python3 wp_ssl_bootstrap.py deploy \
   --domain example.com --email admin@example.com \
   --db-host rds.example.com --db-root-pass 'YourPassword'
 
+# Cloudflare reverse proxy + auto-complete WordPress wizard
+sudo python3 wp_ssl_bootstrap.py deploy \
+  --domain example.com --email admin@example.com \
+  --cloudflare --wp-auto-install
+
+# Update to latest script version
+sudo python3 wp_ssl_bootstrap.py self-update
+
 # Uninstall (keeps data + certs)
 sudo python3 wp_ssl_bootstrap.py uninstall --domain example.com
 ```
@@ -121,7 +137,7 @@ sudo python3 wp_ssl_bootstrap.py uninstall --domain example.com
 - **wp-config.php hardening** — `DISALLOW_FILE_EDIT`, `FORCE_SSL_ADMIN`, `DISALLOW_UNFILTERED_HTML`, etc.
 - **Core dump disabled** — `RLIMIT_CORE=0` + `PR_SET_DUMPABLE=0`
 - **Nginx defense-in-depth** — `server_tokens off`, uploads PHP blocked, wp-cron localhost-only, login rate limiting
-- **Certbot circuit-breaker** — non-CA fatal errors break out immediately
+- **Certbot circuit-breaker** — non-CA fatal errors break out immediately; Snap/certbot-auto paths auto-detected
 
 ## Known Limitations
 
@@ -139,6 +155,8 @@ After deployment, credentials are saved to `/root/.wp_credentials_<domain>.txt` 
 /etc/nginx/conf.d/<domain>.conf              Nginx HTTPS config
 /etc/systemd/system/<prefix>-ssl.service     Renewal service
 /etc/systemd/system/<prefix>-ssl.timer       Daily renewal timer
+/etc/systemd/system/<prefix>-wpcron.*        WordPress Cron timer
+/etc/systemd/system/<prefix>-dboptimize.*    Weekly DB optimize timer
 /etc/fail2ban/filter.d/wordpress-*.conf      Fail2Ban filter
 /etc/fail2ban/jail.d/wordpress-*.conf        Fail2Ban jail
 /etc/logrotate.d/nginx-wp-*                  Log rotation
@@ -155,7 +173,7 @@ After deployment, credentials are saved to `/root/.wp_credentials_<domain>.txt` 
 
 ## 功能特性
 
-- **零配置 HTTPS** — Let's Encrypt → BuyPass Go 自动容灾；certbot 错误分类熔断
+- **零配置 HTTPS** — Let's Encrypt → BuyPass Go 自动容灾；certbot 错误分类熔断；自动探测 Snap/certbot-auto/标准安装
 - **多发行版** — Alibaba Cloud Linux 3 / CentOS 7–9 / RHEL / Ubuntu / Debian
 - **数据库安全** — auth_socket/unix_socket 自适应；凭据不暴露于进程列表（`--defaults-extra-file`）
 - **多源下载** — 中文镜像 + 全球主源 fallback，SHA-256 校验；WP-CLI 兜底
@@ -166,6 +184,8 @@ After deployment, credentials are saved to `/root/.wp_credentials_<domain>.txt` 
 - **备份恢复** — 一键备份（数据库 + 文件 + Nginx + Fail2Ban/logrotate）；一键恢复
 - **配置热更新** — `update` 子命令应用新模板，不触碰数据
 - **Redis 对象缓存** — 可选 `--redis`，可与 FastCGI 页面缓存叠加
+- **性能调优** — PHP-FPM 按内存动态调参、MariaDB InnoDB 调优、BBR + TCP sysctl、Swap 自动创建、Nginx `open_file_cache`（`--optimize`）
+- **WordPress Cron 卸载** — systemd 15 分钟定时器替代每请求触发 wp-cron.php
 - **双语界面** — 中英文自动切换，`--lang` 持久化
 - **外置数据库** — `--db-host` 支持 RDS/远程 MySQL，自动 SSL 传输
 - **幂等重跑** — 安全重复执行；已有密码和数据库自动保留
@@ -208,6 +228,7 @@ sudo python3 wp_ssl_bootstrap.py deploy \
 | `backup` | 备份数据库 + 站点文件 + Nginx 配置 + Fail2Ban/logrotate |
 | `restore` | 从备份恢复（自动选最新，或 `--from 路径`） |
 | `update` | 热更新配置模板（脚本升级后使用） |
+| `self-update` | 下载最新版脚本，SHA-256 校验后原子替换 |
 | `uninstall` | 卸载守护组件（保留数据与证书） |
 
 ## 常用参数
@@ -219,14 +240,19 @@ sudo python3 wp_ssl_bootstrap.py deploy \
 --db-root-pass PASS     MariaDB/MySQL root 密码（环境变量: WP_DB_ROOT_PASS）
 --cache {none,fastcgi}  Nginx 缓存模式
 --redis                 启用 Redis 对象缓存
+--cloudflare            从 Cloudflare API 获取 IP 段并配置真实 IP 还原
 --allow-xmlrpc          放开 xmlrpc.php（默认拒绝，启用后为速率限制透传）
+--wp-auto-install       通过 WP-CLI 自动完成 WordPress 安装向导
+--optimize              启用 Nginx open_file_cache，适合静态资源密集站点
 --php-version X.Y       强制指定 PHP-FPM 版本
 --skip-deps             跳过系统包安装
 --backup-dir PATH       备份根目录（默认: /root/backups）
+--keep N                备份保留份数（backup 子命令）
 --dry-run               演练模式，不执行写操作
 --staging               使用 Let's Encrypt Staging 环境
 --lang {zh,en}          界面语言（首次指定后自动持久化）
 --quiet                 静默模式，仅输出 WARNING 及以上
+--url URL               自更新自定义源地址（环境变量: WP_UPDATE_URL）
 ```
 
 ## 使用示例
@@ -252,6 +278,14 @@ sudo python3 wp_ssl_bootstrap.py deploy \
   --domain example.com --email admin@example.com \
   --db-host rds.example.com --db-root-pass 'YourPassword'
 
+# Cloudflare 反代 + 自动完成安装向导
+sudo python3 wp_ssl_bootstrap.py deploy \
+  --domain example.com --email admin@example.com \
+  --cloudflare --wp-auto-install
+
+# 更新脚本至最新版
+sudo python3 wp_ssl_bootstrap.py self-update
+
 # 卸载守护组件（保留数据和证书）
 sudo python3 wp_ssl_bootstrap.py uninstall --domain example.com
 ```
@@ -265,7 +299,7 @@ sudo python3 wp_ssl_bootstrap.py uninstall --domain example.com
 - **wp-config.php 加固** — `DISALLOW_FILE_EDIT`、`FORCE_SSL_ADMIN`、`DISALLOW_UNFILTERED_HTML` 等
 - **禁用 Core dump** — `RLIMIT_CORE=0` + `PR_SET_DUMPABLE=0`
 - **Nginx 纵深防御** — 隐藏版本号、uploads 禁 PHP、wp-cron 限本机、登录速率限制
-- **certbot 错误熔断** — 非 CA 侧致命错误立即跳出
+- **certbot 错误熔断** — 非 CA 侧致命错误立即跳出；自动探测 Snap/certbot-auto/标准安装路径
 
 ## 已知限制
 
@@ -283,6 +317,8 @@ sudo python3 wp_ssl_bootstrap.py uninstall --domain example.com
 /etc/nginx/conf.d/<域名>.conf                Nginx HTTPS 配置
 /etc/systemd/system/<前缀>-ssl.service       续期服务
 /etc/systemd/system/<前缀>-ssl.timer         每日续期定时器
+/etc/systemd/system/<前缀>-wpcron.*          WordPress Cron 定时器
+/etc/systemd/system/<前缀>-dboptimize.*      每周数据库优化定时器
 /etc/fail2ban/filter.d/wordpress-*.conf      Fail2Ban 过滤规则
 /etc/fail2ban/jail.d/wordpress-*.conf        Fail2Ban jail 规则
 /etc/logrotate.d/nginx-wp-*                  日志轮转配置
