@@ -25,7 +25,7 @@
 
 """
 =============================================================================
-WP-SSL-Bootstrap: 高可用建站引擎 (V3.0.14)
+WP-SSL-Bootstrap: 高可用建站引擎 (V3.0.15)
 适应平台: Alibaba Cloud Linux 3 / CentOS 7-9 / RHEL / Ubuntu / Debian
 =============================================================================
 
@@ -62,7 +62,7 @@ WP-SSL-Bootstrap: 高可用建站引擎 (V3.0.14)
 
 """
 
-__version__ = "3.0.14"
+__version__ = "3.0.15"
 
 import os
 import sys
@@ -478,6 +478,79 @@ _MESSAGES: dict = {
     "err_no_curl_wget": {
         "zh": "缺失 curl/wget。",
         "en": "Missing curl/wget.",
+    },
+    # [V3.0.15] B5: 下载源名称 / 磁盘检查标签 / 回滚描述 国际化
+    "src_cn_node": {
+        "zh": "官方中文节点",
+        "en": "Official Chinese mirror",
+    },
+    "src_global_node": {
+        "zh": "官方全球主节点",
+        "en": "Official global mirror",
+    },
+    "label_wp_download": {
+        "zh": "WordPress 下载",
+        "en": "WordPress download",
+    },
+    "label_args_redacted": {
+        "zh": "[参数已隐藏]",
+        "en": "[REDACTED]",
+    },
+    "label_wp_extract": {
+        "zh": "WordPress 解压",
+        "en": "WordPress extraction",
+    },
+    "rollback_wp_dir": {
+        "zh": "删除 WordPress 站点目录 {path}",
+        "en": "Remove WordPress webroot {path}",
+    },
+    "rollback_db_user": {
+        "zh": "删除数据库 {db} 和用户 {user}",
+        "en": "Drop database {db} and user {user}",
+    },
+    "cred_header": {
+        "zh": "===== [ {domain} ] 站点凭据 =====",
+        "en": "===== [ {domain} ] Site Credentials =====",
+    },
+    "cred_emergency": {
+        "zh": "===== 急救指南 =====",
+        "en": "===== Emergency Guide =====",
+    },
+    "cred_db_connect": {
+        "zh": "# 手动连接数据库 (执行后交互式输入密码，避免进程列表泄露)",
+        "en": "# Connect to database manually (enter password interactively to avoid process list exposure)",
+    },
+    "cred_fix_perms": {
+        "zh": "# 重置站点文件权限",
+        "en": "# Reset site file permissions",
+    },
+    "cred_fix_perms_warn": {
+        "zh": "  # ⚠️  必须在 find 之后单独执行，恢复安全权限：",
+        "en": "  # ⚠️  Must run after find to restore secure permissions:",
+    },
+    "cred_manual_renew": {
+        "zh": "# 手动续期 SSL 证书",
+        "en": "# Manually renew SSL certificate",
+    },
+    "cred_nginx_reload": {
+        "zh": "# 检查 Nginx 配置并重载",
+        "en": "# Test Nginx config and reload",
+    },
+    "cred_timer_status": {
+        "zh": "# 查看续期定时器状态",
+        "en": "# Check renewal timer status",
+    },
+    "cred_uninstall": {
+        "zh": "# 完整卸载本站守护组件 (保留数据与证书)",
+        "en": "# Uninstall site daemon components (data & certs preserved)",
+    },
+    "cred_site_status": {
+        "zh": "# 查看站点运行状态",
+        "en": "# Check site status",
+    },
+    "cred_backup": {
+        "zh": "# 一键备份 (数据库 + 站点文件 + Nginx 配置)",
+        "en": "# Full backup (database + site files + Nginx config)",
     },
     "err_wp_download_all_failed": {
         "zh": "❌ 所有下载方式均失败（tar.gz 源 + WP-CLI）。",
@@ -1332,8 +1405,8 @@ _MESSAGES: dict = {
     },
     # ── ArgumentParser description / subcommand help ─────────────────────────
     "parser_description": {
-        "zh": "高可用建站引擎 (V3.0.14)",
-        "en": "High-availability WordPress deployment engine (V3.0.14)",
+        "zh": "高可用建站引擎 (V3.0.15)",
+        "en": "High-availability WordPress deployment engine (V3.0.15)",
     },
     "subcmd_list": {
         "zh": "可用子命令",
@@ -2222,6 +2295,21 @@ def inject_wp_hardening(content: str) -> str:
     return content + inject_block
 
 
+def patch_wplang(content: str) -> str:
+    """[V3.0.15] B6: 确保 wp-config.php 中 WPLANG 与 _LANG 一致。
+
+    解决跨语言兜底下载问题：用户选英文但中文源先成功时，
+    wp-config-sample.php 中 WPLANG='zh_CN'；反之亦然。
+    此函数在生成 wp-config.php 时强制校正。
+    """
+    target_locale = "zh_CN" if _LANG == "zh" else ""
+    # 匹配已有 define('WPLANG', '...')
+    pattern = r"(define\(\s*'WPLANG'\s*,\s*')(?:[^'\\]|\\.)*('\s*\);)"
+    if re.search(pattern, content):
+        content = re.sub(pattern, lambda m: m.group(1) + target_locale + m.group(2), content)
+    return content
+
+
 # ---------------------------------------------------------------------------
 # PHP 配置修改（纯函数，替代 sed）
 # ---------------------------------------------------------------------------
@@ -2305,13 +2393,16 @@ def classify_certbot_error(stderr: str) -> int:
     )):
         return CmdResult.FATAL
     # webroot 不可达 / 验证文件无法访问
+    # [V3.0.15] B3: 注释澄清——此分支的 "unauthorized" 指 ACME challenge 验证失败
+    # （CA 返回 HTTP 403 "unauthorized"），属于 CA 侧交互问题，换 CA 可能成功；
+    # 与下方本地文件系统 "permission denied" / "access denied" 是完全不同的错误类型。
+    # "challenge failed" 同理：可能是 CA 端网络波动导致验证超时。
+    # 仅 "webroot path does not exist" 确定为本地致命错误。
     if any(k in err for k in (
         "webroot path does not exist", "challenge failed",
         "404", "connection refused on port 80",
         "unauthorized", "the server could not connect",
     )):
-        # challenge failed 可能是 CA 侧临时问题，也可能是本地配置问题
-        # 保守归为 RETRYABLE，让用户有机会尝试另一个 CA
         if "webroot path does not exist" in err:
             return CmdResult.FATAL
         return CmdResult.RETRYABLE
@@ -2701,6 +2792,15 @@ class WPDeployManager:
                 except BlockingIOError:
                     pass  # 仍然失败，走下面的错误退出
             logging.error(t("err_lock_domain", domain=self.cfg.domain))
+            # [V3.0.15] B4: per-domain 锁获取失败时显式释放已持有的全局锁，
+            # 避免 sys.exit() 依赖内核隐式释放，保持资源清理的显式性。
+            try:
+                if self.global_lock_fd:
+                    fcntl.flock(self.global_lock_fd, fcntl.LOCK_UN)
+                    self.global_lock_fd.close()
+                    self.global_lock_fd = None
+            except OSError:
+                pass
             sys.exit(1)
 
     # -----------------------------------------------------------------------
@@ -2725,7 +2825,7 @@ class WPDeployManager:
             return CmdResult.success()
         if not quiet:
             # [V2.9.5] sensitive=True 时脱敏，仅记录命令名
-            _log_cmd = f"{cmd_list[0]} [参数已隐藏]" if sensitive else ' '.join(cmd_list)
+            _log_cmd = f"{cmd_list[0]} {t('label_args_redacted')}" if sensitive else ' '.join(cmd_list)
             logging.info(t("info_run_cmd", cmd=_log_cmd))
         try:
             r = subprocess.run(
@@ -2748,7 +2848,7 @@ class WPDeployManager:
             return CmdResult(ok=False, code=error_code, stdout=r.stdout.strip(), stderr=stderr_text)
         except subprocess.TimeoutExpired:
             # [V2.9.6] 超时路径同样遵守 sensitive 脱敏
-            _t_cmd = f"{cmd_list[0]} [参数已隐藏]" if sensitive else ' '.join(cmd_list)
+            _t_cmd = f"{cmd_list[0]} {t('label_args_redacted')}" if sensitive else ' '.join(cmd_list)
             logging.error(t("err_cmd_timeout", cmd=_t_cmd))
             return CmdResult(ok=False, code=CmdResult.TIMEOUT, stderr="timeout")
         except Exception as e:
@@ -3430,21 +3530,21 @@ class WPDeployManager:
         return self.run_cmd(cmd, timeout=timeout, quiet=quiet)
 
     def _wpcli_download_wordpress(self) -> bool:
-        """WP-CLI 兜底下载：wp core download --locale=zh_CN。"""
+        """WP-CLI 兜底下载：根据 _LANG 决定 --locale。"""
         if not self._wpcli_bin:
             return False
         logging.info(t("info_wpcli_wp_fallback"))
         self.cfg.webroot_path.mkdir(parents=True, exist_ok=True)
-        result = self._run_wpcli(
-            "core", "download", "--locale=zh_CN", "--force",
-            timeout=300, quiet=True,
-        )
+        # [V3.0.15] B1: 优先下载与 _LANG 匹配的版本，失败后尝试另一语言
+        if _LANG == "zh":
+            _primary_args = ("core", "download", "--locale=zh_CN", "--force")
+            _fallback_args = ("core", "download", "--force")
+        else:
+            _primary_args = ("core", "download", "--force")
+            _fallback_args = ("core", "download", "--locale=zh_CN", "--force")
+        result = self._run_wpcli(*_primary_args, timeout=300, quiet=True)
         if not result:
-            # 中文版失败，尝试英文版
-            result = self._run_wpcli(
-                "core", "download", "--force",
-                timeout=300, quiet=True,
-            )
+            result = self._run_wpcli(*_fallback_args, timeout=300, quiet=True)
         if result:
             logging.info(t("ok_wpcli_wp"))
         else:
@@ -3539,22 +3639,24 @@ class WPDeployManager:
         if not self.check_disk_space(
             self.cfg.webroot_path,
             SiteConfig.MIN_DISK_FREE_MB_DOWNLOAD,
-            "WordPress 下载",
+            t("label_wp_download"),
         ):
             return False
 
-        sources = [
-            {
-                "name": "官方中文节点",
-                "wp": "https://cn.wordpress.org/latest-zh_CN.tar.gz",
-                "hash": "https://cn.wordpress.org/latest-zh_CN.tar.gz.sha256",
-            },
-            {
-                "name": "官方全球主节点 (Fallback)",
-                "wp": "https://wordpress.org/latest.tar.gz",
-                "hash": "https://wordpress.org/latest.tar.gz.sha256",
-            },
-        ]
+        # [V3.0.15] B1: 根据 _LANG 决定下载源顺序。
+        # _LANG == "zh" → 中文包优先，全球主源兜底
+        # _LANG == "en" → 全球主源（英文）优先，中文包兜底
+        _src_zh = {
+            "name": t("src_cn_node"),
+            "wp": "https://cn.wordpress.org/latest-zh_CN.tar.gz",
+            "hash": "https://cn.wordpress.org/latest-zh_CN.tar.gz.sha256",
+        }
+        _src_en = {
+            "name": t("src_global_node"),
+            "wp": "https://wordpress.org/latest.tar.gz",
+            "hash": "https://wordpress.org/latest.tar.gz.sha256",
+        }
+        sources = [_src_zh, _src_en] if _LANG == "zh" else [_src_en, _src_zh]
 
         fd_wp, dest = tempfile.mkstemp(prefix="wp_", suffix=".tar.gz")
         os.close(fd_wp)
@@ -3623,7 +3725,7 @@ class WPDeployManager:
                 if not self.check_disk_space(
                     self.cfg.webroot_path,
                     SiteConfig.MIN_DISK_FREE_MB_EXTRACT,
-                    "WordPress 解压",
+                    t("label_wp_extract"),
                 ):
                     return False
 
@@ -3699,7 +3801,9 @@ class WPDeployManager:
                 content = patch_php_ini_line(content, 'opcache.interned_strings_buffer', '16')
                 content = patch_php_ini_line(content, 'opcache.max_accelerated_files', '10000')
                 content = patch_php_ini_line(content, 'opcache.revalidate_freq', '2')
-                Path(ini_path).write_text(content, encoding='utf-8')
+                # [V3.0.15] B2: 原子写入，防止断电时 PHP-FPM 读到截断的配置
+                if not self._safe_write_file(ini_path, content, mode=0o644):
+                    logging.warning(t("warn_php_ini_fail", path=ini_path, e="atomic write failed"))
             except Exception as e:
                 logging.warning(t("warn_php_ini_fail", path=ini_path, e=e))
 
@@ -3707,7 +3811,9 @@ class WPDeployManager:
             try:
                 content = Path(conf_path).read_text(encoding='utf-8')
                 content = patch_php_fpm_pool_user(content, self.nginx_user)
-                Path(conf_path).write_text(content, encoding='utf-8')
+                # [V3.0.15] B2: 原子写入，与 php.ini 保持一致
+                if not self._safe_write_file(conf_path, content, mode=0o644):
+                    logging.warning(t("warn_php_ini_fail", path=conf_path, e="atomic write failed"))
             except Exception as e:
                 logging.warning(t("warn_php_ini_fail", path=conf_path, e=e))
 
@@ -3739,7 +3845,7 @@ class WPDeployManager:
             # 本次新下载的 WordPress 文件：注册回滚清理
             webroot = self.cfg.webroot_path
             self._register_rollback(
-                f"删除 WordPress 站点目录 {webroot}",
+                t("rollback_wp_dir", path=webroot),
                 lambda p=str(webroot): shutil.rmtree(p, ignore_errors=True),
             )
 
@@ -3844,7 +3950,7 @@ class WPDeployManager:
                 f"FLUSH PRIVILEGES;\n"
             )
             self._register_rollback(
-                f"删除数据库 {db_name} 和用户 {db_user}",
+                t("rollback_db_user", db=db_name, user=db_user),
                 lambda sql=drop_sql: self.run_sql(sql, use_pwd=True),
             )
 
@@ -3861,7 +3967,7 @@ class WPDeployManager:
                 )
                 # [V2.9.6] 原子写入, 从创建瞬间即为 0440
                 if not self._safe_write_file(wp_config, _wpc, mode=0o440):
-                    raise OSError("_safe_write_file 写入 wp-config.php 失败")
+                    raise OSError("_safe_write_file failed to write wp-config.php")
                 logging.info(t("info_wpconfig_pwd_updated"))
             except Exception as e:
                 logging.error(t("err_wpconfig_update", e=e))
@@ -3876,12 +3982,13 @@ class WPDeployManager:
                 )
                 content = inject_salts(content)
                 content = inject_wp_hardening(content)  # [V2.9.7] 安全加固常量
+                content = patch_wplang(content)  # [V3.0.15] B6: 校正 WPLANG
                 # [V2.9.6] 原子写入, 从创建瞬间即为 0440
                 if not self._safe_write_file(wp_config, content, mode=0o440):
-                    raise OSError("_safe_write_file 创建 wp-config.php 失败")
+                    raise OSError("_safe_write_file failed to create wp-config.php")
                 # 本次新写的 wp-config.php：注册回滚清理
                 self._register_rollback(
-                    f"删除 {wp_config}",
+                    f"Remove {wp_config}",
                     lambda p=wp_config: (p.unlink() if p.exists() else None),
                 )
             except Exception as e:
@@ -4705,8 +4812,9 @@ class WPDeployManager:
     def print_final_summary(self):
         cred_file = Path(f"/root/.wp_credentials_{self.cfg.systemd_prefix}.txt")
         db_host_arg = f" -h {self.cfg.db_host}" if self.cfg.is_external_db else ""
+        # [V3.0.15] B5: 凭据文件内容国际化
         cred_content = (
-            f"===== [ {self.cfg.domain} ] 站点凭据 =====\n"
+            f"{t('cred_header', domain=self.cfg.domain)}\n"
             f"Webroot   : {self.cfg.webroot_path}\n"
             f"DB Host   : {self.cfg.db_host}\n"
             f"DB Name   : {self.cfg.db_name}\n"
@@ -4714,30 +4822,30 @@ class WPDeployManager:
             f"DB Pass   : {self.cfg.db_pass}\n\n"
             f"===== MariaDB Root =====\n"
             f"Root Password: {self.db_root_pass}\n\n"
-            f"===== 急救指南 =====\n"
-            f"# 手动连接数据库 (执行后交互式输入密码，避免进程列表泄露)\n"
+            f"{t('cred_emergency')}\n"
+            f"{t('cred_db_connect')}\n"
             f"  mysql{db_host_arg} -u {self.cfg.db_user} -p {self.cfg.db_name}\n\n"
-            f"# 重置站点文件权限\n"
+            f"{t('cred_fix_perms')}\n"
             f"  chown -R {self.nginx_user}:{self.nginx_user} {self.cfg.webroot_path}\n"
             f"  find {self.cfg.webroot_path} -type d -exec chmod 755 {{}} +\n"
             f"  find {self.cfg.webroot_path} -type f -exec chmod 644 {{}} +\n"
-            f"  # ⚠️  必须在 find 之后单独执行，恢复安全权限：\n"
+            f"{t('cred_fix_perms_warn')}\n"
             f"  chmod 0440 {self.cfg.webroot_path}/wp-config.php\n\n"
-            f"# 手动续期 SSL 证书\n"
+            f"{t('cred_manual_renew')}\n"
             f"  certbot certonly --webroot -w {self.cfg.webroot_path} \\\n"
             f"    -d {self.cfg.domain} -d www.{self.cfg.domain} \\\n"
             f"    --cert-name {self.cfg.domain}\n\n"
-            f"# 检查 Nginx 配置并重载\n"
+            f"{t('cred_nginx_reload')}\n"
             f"  nginx -t && systemctl reload nginx\n\n"
-            f"# 查看续期定时器状态\n"
+            f"{t('cred_timer_status')}\n"
             f"  systemctl status {self.cfg.systemd_prefix}-ssl.timer\n\n"
-            f"# 完整卸载本站守护组件 (保留数据与证书)\n"
+            f"{t('cred_uninstall')}\n"
             f"  {sys.executable} {self.cfg.script_path} uninstall \\\n"
             f"    --domain {self.cfg.domain}\n\n"
-            f"# 查看站点运行状态\n"
+            f"{t('cred_site_status')}\n"
             f"  {sys.executable} {self.cfg.script_path} status \\\n"
             f"    --domain {self.cfg.domain}\n\n"
-            f"# 一键备份 (数据库 + 站点文件 + Nginx 配置)\n"
+            f"{t('cred_backup')}\n"
             f"  {sys.executable} {self.cfg.script_path} backup \\\n"
             f"    --domain {self.cfg.domain}\n"
         )

@@ -5,6 +5,21 @@ All notable changes to WP-SSL-Bootstrap are documented in this file.
 
 ---
 
+## V3.0.15
+
+- **[Fix]** `download_and_verify_wordpress()` / `_wpcli_download_wordpress()`: WordPress download now respects `_LANG` setting. English mode downloads the global (en) package first with zh_CN as fallback; Chinese mode preserves previous behavior.
+  WordPress 下载适配语言设置。英文模式优先下载全球主源（英文包），中文包兜底；中文模式保持原有行为。
+- **[Fix]** New `patch_wplang()`: forces `WPLANG` in `wp-config.php` to match `_LANG`, preventing language mismatch when a cross-language fallback source is used (e.g. user chose English but Chinese package downloaded as fallback).
+  新增 `patch_wplang()`：强制 wp-config.php 中 WPLANG 与 `_LANG` 一致，防止跨语言兜底下载导致安装语言错乱。
+- **[Robustness]** `setup_lemp_and_wp()`: `php.ini` and `www.conf` writes switched from `Path.write_text()` to `_safe_write_file()` atomic write, preventing PHP-FPM from reading truncated config on power loss.
+  `php.ini` 和 `www.conf` 写入改用 `_safe_write_file()` 原子写入，防止断电时 PHP-FPM 读到截断配置。
+- **[Fix]** `classify_certbot_error()`: clarified comments for `"unauthorized"` keyword — this refers to ACME challenge verification failure (CA-side HTTP 403), not local filesystem permission errors; RETRYABLE classification is intentional.
+  `classify_certbot_error()` 澄清 `"unauthorized"` 注释：指 ACME challenge 验证失败（CA 端 HTTP 403），非本地权限错误；RETRYABLE 归类为有意为之。
+- **[Fix]** `acquire_lock()`: explicitly releases `global_lock_fd` before `sys.exit(1)` on per-domain lock failure, avoiding reliance on kernel implicit cleanup.
+  `acquire_lock()` 在 per-domain 锁失败退出前显式释放全局锁，不依赖内核隐式清理。
+- **[i18n]** `print_final_summary()` credential file content fully internationalized; `check_disk_space` labels, `_register_rollback` descriptions, `_safe_write_file` OSError messages, and `run_cmd` sensitive-mode `[参数已隐藏]` marker switched from hardcoded Chinese to `t()` / English.
+  `print_final_summary()` 凭据文件内容完整国际化；磁盘检查标签、回滚描述、OSError 消息、`run_cmd` 脱敏标记从硬编码中文改为 `t()` / 英文。
+
 ## V3.0.14
 
 - **[i18n]** `_mysql_escape_value` ValueError: hardcoded Chinese → `t("err_escape_control_char")`
