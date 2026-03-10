@@ -62,7 +62,7 @@ WP-SSL-Bootstrap: 高可用建站引擎 (V3.1.0)
 
 """
 
-__version__ = "3.1.0"
+__version__ = "3.1.1"
 
 import os
 import sys
@@ -542,6 +542,16 @@ _MESSAGES: dict = {
     "warn_self_update_no_hash": {
         "zh": "⚠️  未找到校验文件, 跳过 SHA256 校验。",
         "en": "⚠️  Hash file not found; skipping SHA256 verification.",
+    },
+    # [V3.1.1] Issue 8: mandatory SHA256 verification
+    "err_self_update_hash_unavailable": {
+        "zh": "❌ 无法获取 SHA256 校验文件, 为安全起见更新已中止: {e}",
+        "en": "❌ Cannot fetch SHA256 hash file; update aborted for safety: {e}",
+    },
+    # [V3.1.1] Issue 1: certbot deploy hook
+    "info_certbot_deploy_hook": {
+        "zh": "✅ Certbot 持久化 deploy hook 已安装: {path}",
+        "en": "✅ Certbot persistent deploy hook installed: {path}",
     },
     # [V3.1.0 S2] 版本降级保护
     "warn_self_update_downgrade": {
@@ -2173,6 +2183,10 @@ def _nginx_preamble(domain: str, cache_mode: str, allow_xmlrpc: bool = False) ->
     parts.append(
         f"limit_req_zone $binary_remote_addr zone=wplogin_{safe}:10m rate=1r/s;"
     )
+    # [V3.1.1] Issue 3: admin-ajax.php rate limiting zone
+    parts.append(
+        f"limit_req_zone $binary_remote_addr zone=wpadmin_{safe}:10m rate=10r/s;"
+    )
     # [V3.0.3] 放开 XML-RPC 时增加独立 zone，在 PHP 被唤醒前截断暴力攻击
     if allow_xmlrpc:
         parts.append(
@@ -2262,6 +2276,9 @@ def _nginx_ssl_core(domain: str, webroot: Path,
         f"\n"
         f"    index index.php index.html index.htm;\n"
         f"    client_max_body_size 100M;\n"
+        f"\n"
+        f"    # [V3.1.1] Issue 9: Block non-standard HTTP methods\n"
+        f"    if ($request_method !~ ^(GET|POST|HEAD|OPTIONS)$) {{ return 444; }}\n"
     )
 
 
@@ -2297,6 +2314,7 @@ def _nginx_static_cache() -> str:
         f"        add_header Referrer-Policy strict-origin-when-cross-origin always;\n"
         f"        add_header Permissions-Policy"
         f" \"camera=(), microphone=(), geolocation=(), payment=()\" always;\n"
+        f"        add_header X-Permitted-Cross-Domain-Policies \"none\" always;\n"
     )
     return (
         f"\n"
@@ -2355,7 +2373,8 @@ def _nginx_security_headers(cache_mode: str = "none",
         f"    add_header X-Content-Type-Options nosniff always;\n"
         f"    add_header Referrer-Policy strict-origin-when-cross-origin always;\n"
         f"    add_header Permissions-Policy \"camera=(), microphone=(), geolocation=(), payment=()\" always;\n"
-        f"    add_header Content-Security-Policy-Report-Only \"default-src 'self'; "
+        f"    add_header X-Permitted-Cross-Domain-Policies \"none\" always;\n"
+        f"    add_header Content-Security-Policy \"default-src 'self'; "
         f"script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
         f"style-src 'self' 'unsafe-inline'; "
         f"img-src 'self' data: https:; "
@@ -2459,6 +2478,8 @@ def _nginx_php_location(sock_path: str, cache_mode: str = "none",
             f"        fastcgi_cache_bypass $skip_cache;\n"
             f"        fastcgi_no_cache $skip_cache;\n"
             f"        fastcgi_cache_key \"$scheme$request_method$host$request_uri\";\n"
+            f"        fastcgi_cache_lock on;\n"
+            f"        fastcgi_cache_lock_timeout 5s;\n"
         )
     return (
         f"\n"
@@ -2503,6 +2524,16 @@ def _nginx_wp_security(safe_name: str, sock_path: str,
         f"    location ~ /\\. {{ deny all; }}\n"
         f"    location ~* wp-config\\.php {{ deny all; return 404; }}\n"
         f"    location ~* /wp-content/uploads/.*\\.php$ {{ deny all; return 404; }}\n"
+        f"    # [V3.1.1] Issue 3: admin-ajax.php rate limiting\n"
+        f"    location = /wp-admin/admin-ajax.php {{\n"
+        f"        limit_req zone=wpadmin_{safe_name} burst=20 nodelay;\n"
+        f"        limit_req_status 429;\n"
+        f"        try_files $uri =404;\n"
+        f"        fastcgi_pass unix:{sock_path};\n"
+        f"        fastcgi_index index.php;\n"
+        f"        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;\n"
+        f"        include fastcgi.conf;\n"
+        f"    }}\n"
         f"    location = /wp-login.php {{\n"
         f"        limit_req zone=wplogin_{safe_name} burst=5 nodelay;\n"
         f"        limit_req_status 429;\n"
@@ -2525,6 +2556,16 @@ def _nginx_wp_security(safe_name: str, sock_path: str,
         f"        include fastcgi.conf;\n"
         f"    }}\n"
         f"{xmlrpc_block}"
+        f"    # [V3.1.1] Issue 10: Block direct PHP execution in wp-includes\n"
+        f"    # Exception: ms-files.php needed by Multisite media serving\n"
+        f"    location = /wp-includes/ms-files.php {{\n"
+        f"        try_files $uri =404;\n"
+        f"        fastcgi_pass unix:{sock_path};\n"
+        f"        fastcgi_index index.php;\n"
+        f"        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;\n"
+        f"        include fastcgi.conf;\n"
+        f"    }}\n"
+        f"    location ~* /wp-includes/.*\\.php$ {{ deny all; }}\n"
         f"    location ^~ /.well-known/acme-challenge/ {{ allow all; }}\n"
         f"}}\n"
     )
@@ -3258,6 +3299,7 @@ class WPDeployManager:
                     self.run_cmd(
                         ["systemctl", "restart", self.db_svc], quiet=True,
                     )
+                    self._wait_db_ready()  # [V3.1.1] Issue 6
                 except Exception as e:
                     logging.warning(t("warn_mariadb_tuning_fail", e=e))
                 return
@@ -3874,6 +3916,35 @@ class WPDeployManager:
             return bool(self.run_cmd(["systemctl", "reload", "nginx"], quiet=True))
         logging.warning(t("warn_nginx_reload_test_fail"))
         return False
+
+    # -----------------------------------------------------------------------
+    # [V3.1.1] Issue 1: Certbot persistent deploy hook
+    # -----------------------------------------------------------------------
+    def _install_certbot_deploy_hook(self) -> None:
+        """Install a persistent deploy hook for certbot renewal.
+
+        Writes /etc/letsencrypt/renewal-hooks/deploy/01-reload-nginx.sh
+        with absolute paths for nginx and systemctl.  This ensures Nginx
+        reload works regardless of snap confinement, PATH limitations,
+        or whether renewal is triggered by the script timer or certbot's
+        own timer.
+        """
+        if self.cfg.dry_run:
+            return
+        hook_dir = Path("/etc/letsencrypt/renewal-hooks/deploy")
+        try:
+            hook_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        hook_file = hook_dir / "01-reload-nginx.sh"
+        content = (
+            "#!/bin/sh\n"
+            "# [V3.1.1] Auto-generated by WP-SSL-Bootstrap\n"
+            "/usr/sbin/nginx -t 2>/dev/null && "
+            "/bin/systemctl reload nginx\n"
+        )
+        if self._safe_write_file(hook_file, content, mode=0o755):
+            logging.info(t("info_certbot_deploy_hook", path=hook_file))
 
     # -----------------------------------------------------------------------
     # Nginx 配置安全应用
@@ -5393,7 +5464,7 @@ class WPDeployManager:
             "--cert-name", self.cfg.domain,
             "--quiet", "--non-interactive",
             "--register-unsafely-without-email",  # V2.7.2: 兜底无账户场景
-            "--deploy-hook", "nginx -t && systemctl reload nginx",
+            "--deploy-hook", "/usr/sbin/nginx -t 2>/dev/null && /bin/systemctl reload nginx",
         ]
         if force:
             cmd.append("--force-renewal")
@@ -5774,7 +5845,9 @@ class WPDeployManager:
             f"logpath  = {log_path}\n"
             f"maxretry = 5\n"
             f"findtime = 600\n"
-            f"bantime  = 3600\n"
+            f"bantime  = 86400\n"
+            f"bantime.increment = true\n"
+            f"bantime.rndtime = 1800\n"
         )
 
         try:
@@ -6634,6 +6707,7 @@ class WPDeployManager:
         self.setup_logrotate()
         self.setup_wp_cron_timer()  # [V3.0.16] P2
         self.setup_db_optimize_timer()  # [V3.0.16] P11
+        self._install_certbot_deploy_hook()  # [V3.1.1] Issue 1
         self._setup_brotli()
         self._setup_cloudflare_real_ip()  # [V3.0.16] P12
         # [V3.0.9] B4: 改用 _ensure_wpcli()，允许在 update 时补装 WP-CLI
@@ -6801,6 +6875,7 @@ class WPDeployManager:
         self.setup_logrotate()
         self.setup_wp_cron_timer()  # [V3.0.16] P2
         self.setup_db_optimize_timer()  # [V3.0.16] P11
+        self._install_certbot_deploy_hook()  # [V3.1.1] Issue 1
         self._install_nginx_helper()
         self._setup_redis_cache()
         self.print_final_summary()
@@ -6909,8 +6984,10 @@ def _do_self_update(update_url: str = "") -> None:
             if sha256.hexdigest() != expected_hash:
                 logging.error(t("err_self_update_hash"))
                 return
-        except (urllib.error.URLError, urllib.error.HTTPError, OSError):
-            logging.warning(t("warn_self_update_no_hash"))
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+            # [V3.1.1] Issue 8: SHA256 verification is now mandatory
+            logging.error(t("err_self_update_hash_unavailable", e=e))
+            return
 
         # 提取新版本号
         new_content = Path(tmp_path).read_text(encoding="utf-8")

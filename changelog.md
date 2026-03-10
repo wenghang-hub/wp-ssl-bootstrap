@@ -2,6 +2,78 @@
 
 All notable changes to WP-SSL-Bootstrap are documented in this file.
 本文件记录 WP-SSL-Bootstrap 的所有重要变更。
+---
+
+## [V3.1.1]
+
+> **升级说明 / Upgrade note**
+> V3.1.1 是基于外部安全审计报告的专项修复版本，涵盖 10 项审计发现（2 高 / 4 中 / 4 低）
+> 及 3 项审计后复查修复。从 V3.1.0 升级时，直接替换脚本文件并执行 `update` 子命令即可。
+>
+> V3.1.1 is a security-focused release addressing all 10 findings from an external security audit
+> (2 high / 4 medium / 4 low) plus 3 post-audit review fixes.
+> To upgrade from V3.1.0, replace the script and run the `update` subcommand.
+
+---
+
+### 🔴 高优先级修复 / High Priority Fixes
+
+- **[Issue 1] Certbot deploy-hook 绝对路径 + 持久化 renewal hook** — `renew_cert()` 的 `--deploy-hook` 从裸命令 `nginx` / `systemctl` 改为绝对路径 `/usr/sbin/nginx` / `/bin/systemctl`，修复 Snap confinement 环境下 PATH 受限导致 hook 静默失败的问题。新增 `_install_certbot_deploy_hook()` 方法，在 deploy 和 update 时写入 `/etc/letsencrypt/renewal-hooks/deploy/01-reload-nginx.sh`，确保无论由脚本 timer 还是 certbot 自身 timer 触发续期，Nginx 均能可靠 reload。
+  **Certbot deploy-hook absolute paths + persistent renewal hook** — Fixed silent hook failure in Snap confinement by using absolute paths. New `_install_certbot_deploy_hook()` writes a persistent shell hook to `/etc/letsencrypt/renewal-hooks/deploy/`, ensuring Nginx reload works regardless of which timer triggers renewal.
+
+- **[Issue 2] CSP 从 Report-Only 升级为 enforcement 模式** — `Content-Security-Policy-Report-Only` 改为 `Content-Security-Policy`。原 Report-Only 模式缺少 `report-uri` 端点，浏览器检测到违规后报告静默丢弃，监控完全失效。
+  **CSP upgraded from Report-Only to enforcement** — `Content-Security-Policy-Report-Only` changed to `Content-Security-Policy`. The Report-Only mode had no `report-uri` endpoint, making violation reports silently discarded.
+
+---
+
+### 🟡 中优先级修复 / Medium Priority Fixes
+
+- **[Issue 3] `admin-ajax.php` 速率限制** — 新增 `limit_req_zone wpadmin_{safe}:10m rate=10r/s` 及独立 `location = /wp-admin/admin-ajax.php` 块（`burst=20 nodelay`），封堵此前未受保护的高频 DoS 攻击面。
+  **`admin-ajax.php` rate limiting** — New rate limit zone and dedicated location block protect this previously unguarded high-frequency endpoint.
+
+- **[Issue 4] Fail2Ban 封禁时间 1h → 24h + 渐进式封禁** — `bantime` 从 `3600` 提升至 `86400`，启用 `bantime.increment = true` 和 `bantime.rndtime = 1800`，对持续性攻击者实施递增封禁。
+  **Fail2Ban ban duration 1h → 24h + progressive banning** — Enables `bantime.increment` for escalating bans against persistent attackers.
+
+- **[Issue 5] FastCGI `cache_lock` 防惊群** — 在 `_nginx_php_location()` 的 FastCGI 缓存指令块中新增 `fastcgi_cache_lock on` 和 `fastcgi_cache_lock_timeout 5s`，防止高并发下同一缓存 key 过期时多个请求同时穿透到 PHP-FPM。
+  **FastCGI `cache_lock` anti-stampede** — Prevents multiple concurrent requests from hitting PHP-FPM when the same cache key expires simultaneously.
+
+- **[Issue 6] MariaDB 重启后等待就绪** — `_tune_mariadb()` 中 `systemctl restart` 之后补充 `self._wait_db_ready()` 调用，消除后续 SQL 操作在数据库尚未就绪时失败的竞态条件。
+  **MariaDB restart wait-for-ready** — Added `_wait_db_ready()` call after `systemctl restart` in `_tune_mariadb()`, eliminating race condition with subsequent SQL operations.
+
+---
+
+### 🟢 低优先级修复 / Low Priority Fixes
+
+- **[Issue 7] `X-Permitted-Cross-Domain-Policies` 安全响应头** — 在 `_nginx_security_headers()` 和字体 location 的安全头重声明块中新增 `add_header X-Permitted-Cross-Domain-Policies "none" always`，补全 OWASP 推荐的标准安全头集合。
+  **`X-Permitted-Cross-Domain-Policies` header** — Added to both server-level and font location security headers, completing the OWASP-recommended header set.
+
+- **[Issue 8] `self-update` 强制 SHA-256 校验** — 校验文件获取失败时从 `logging.warning` + 继续更新 改为 `logging.error` + 中止更新，防止 DNS 劫持 / CDN 入侵场景下未校验的恶意脚本以 root 执行。
+  **`self-update` mandatory SHA-256 verification** — Hash fetch failure now aborts the update instead of proceeding without verification, preventing supply-chain attacks.
+
+- **[Issue 9] HTTP 请求方法过滤** — 在 `_nginx_ssl_core()` 中新增 `if ($request_method !~ ^(GET|POST|HEAD|OPTIONS)$) { return 444; }`，封锁 `DELETE` / `PUT` / `TRACE` 等 WordPress 不需要的方法（WordPress REST API 通过 POST + `_method` 隧道化）。保留 `OPTIONS` 以支持 CORS preflight。
+  **HTTP method filtering** — Blocks non-standard methods with Nginx's connection-drop `444`. `OPTIONS` retained for CORS preflight; WordPress REST API tunnels `PUT`/`DELETE` via POST.
+
+- **[Issue 10] `wp-includes/*.php` 直接访问拦截** — 新增 `location ~* /wp-includes/.*\.php$ { deny all; }`，阻止攻击者直接执行 `wp-includes/` 下的 PHP 文件。通过独立的精确匹配 location 保留 `wp-includes/ms-files.php`（WordPress Multisite 媒体文件服务所需），并包含完整的 `fastcgi_pass` 指令确保 PHP 正常执行。
+  **`wp-includes/*.php` direct access deny** — Blocks direct PHP execution in `wp-includes/` while preserving `ms-files.php` for WordPress Multisite media serving via a dedicated exact-match location with full `fastcgi_pass` directives.
+
+---
+
+### 🔨 审计后复查修复 / Post-Audit Review Fixes
+
+- **[Fix A] HTTP 方法过滤补充 `OPTIONS`** — 原始审计建议仅允许 `GET|POST|HEAD`，复查发现缺少 `OPTIONS` 会阻断浏览器 CORS preflight 请求，导致跨域 REST API 调用和 Gutenberg 编辑器在 CDN 场景下静默失败。
+  **HTTP method filter adds `OPTIONS`** — Original audit omitted `OPTIONS`, which would break browser CORS preflight requests for cross-origin REST API calls and Gutenberg editor behind CDN.
+
+- **[Fix B+C] `wp-includes` 拦截规则的 `ms-files.php` 异常处理** — 初始实现使用嵌套 location `{ allow all; }`，缺少 `fastcgi_pass` 导致 Nginx 无法将 ms-files.php 作为 PHP 执行。重构为两个同级 location：精确匹配 `location =`（含完整 FastCGI 指令）+ 正则 deny，利用 Nginx `=` 优先级高于 `~*` 的规则确保正确路由。
+  **`ms-files.php` exception restructured with PHP processing** — Initial nested location lacked `fastcgi_pass`. Restructured as sibling locations: exact-match with full FastCGI directives + regex deny. Nginx `=` priority over `~*` ensures correct routing.
+
+---
+
+### Internal 内部
+
+- 新增 i18n 键：`err_self_update_hash_unavailable`（Issue 8 强制校验错误）、`info_certbot_deploy_hook`（Issue 1 hook 安装确认）。
+- `_nginx_wp_security()` 函数签名不变，内部新增 admin-ajax、wp-includes 两个 location 块。
+- `_nginx_preamble()` 新增 `wpadmin_{safe}` rate limit zone，与现有 `wplogin_{safe}` / `xmlrpc_{safe}` 保持一致的命名规范。
+- 版本号 `__version__` 从 `"3.1.0"` 升至 `"3.1.1"`。
 
 ---
 
