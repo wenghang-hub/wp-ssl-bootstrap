@@ -5,7 +5,7 @@ All notable changes to WP-SSL-Bootstrap are documented in this file.
 
 ---
 
-## [V3.1.0] - 2026-03-10
+## [V3.1.0]
 
 > **升级说明 / Upgrade note**
 > V3.1.0 是 V3.0.15 之后所有增量更新的统一发布版本（原内部版本 V3.0.16–V3.0.19 已合并至本条目），
@@ -146,7 +146,7 @@ All notable changes to WP-SSL-Bootstrap are documented in this file.
 
 ---
 
-## [V3.0.15] - 2026-02-xx
+## [V3.0.15]
 
 - **[Fix]** `download_and_verify_wordpress()` / `_wpcli_download_wordpress()`: WordPress download now respects `_LANG` setting. English mode downloads the global (en) package first with zh_CN as fallback; Chinese mode preserves previous behavior.
   WordPress 下载适配语言设置。英文模式优先下载全球主源（英文包），中文包兜底；中文模式保持原有行为。
