@@ -1,5 +1,5 @@
-# WP-SSL-Bootstrap V3.1.1 — 全新建站参数指南
-# WP-SSL-Bootstrap V3.1.1 — New Site Deployment Guide
+# WP-SSL-Bootstrap V3.2.0 — 全新建站参数指南
+# WP-SSL-Bootstrap V3.2.0 — New Site Deployment Guide
 
 ---
 
@@ -16,6 +16,14 @@ Confirm the following before running the script — these cannot be automated:
 
 3. **以 root 身份运行**（脚本强制检查 `geteuid == 0`）  
    **Run as root** (the script enforces `geteuid == 0`)
+
+> **💡 交互式向导 / Interactive Wizard**  
+> 不确定该用哪些参数？直接运行 `sudo python3 wp_ssl_bootstrap.py`，脚本会自动进入引导菜单。  
+> Not sure which flags to use? Just run `sudo python3 wp_ssl_bootstrap.py` and the interactive wizard will guide you.
+
+> **💡 域名智能归一化 / Smart Domain Normalization**  
+> 输入 `www.example.com` 时脚本自动归一为 `example.com`，`www` 作为别名写入证书。子域名（如 `blog.example.com`）自动跳过 `www` 变体。  
+> Input `www.example.com` is auto-normalized to `example.com`; `www` is added as a certificate alias. Subdomains (e.g. `blog.example.com`) automatically skip the `www` variant.
 
 ---
 
@@ -198,6 +206,69 @@ python3 wp_ssl_bootstrap.py deploy \
 
 ---
 
+## 场景八：两阶段部署（DNS 未就绪时先上线 HTTP）
+## Scenario 8: Two-Phase Deployment (Go Live on HTTP While DNS Propagates)
+
+DNS 刚修改、还在传播中，或需要先验证站点再签证书：  
+When DNS has just been changed and is still propagating, or you want to verify the site before signing a certificate:
+
+```bash
+# 阶段 1: 仅部署 HTTP（不签证书）
+# Phase 1: Deploy HTTP-only (no certificate)
+python3 wp_ssl_bootstrap.py deploy \
+  --domain example.com \
+  --skip-ssl \
+  --cache   fastcgi \
+  --wp-auto-install \
+  --persist-root-pwd
+
+# （等待 DNS 生效后……）
+# (After DNS propagation…)
+
+# 阶段 2: 补签证书，切换至 HTTPS
+# Phase 2: Sign certificate and switch to HTTPS
+python3 wp_ssl_bootstrap.py enable-ssl \
+  --domain example.com \
+  --email  admin@example.com
+```
+
+| 参数 / Parameter | 说明 / Description |
+|---|---|
+| `--skip-ssl` | 跳过 SSL 签发，生成完整的 HTTP 生产 Nginx 配置。`wp-config.php` 中 `FORCE_SSL_ADMIN` 设为 `false`。<br>Skips SSL issuance; generates a full HTTP production Nginx config. `FORCE_SSL_ADMIN` is set to `false` in `wp-config.php`. |
+| `enable-ssl` | 新子命令：为已有 HTTP 站点签发证书并切换至 HTTPS。自动恢复 `FORCE_SSL_ADMIN`、更新 siteurl/home、安装 systemd 续期定时器。<br>New subcommand: signs a certificate for an existing HTTP site and switches to HTTPS. Auto-restores `FORCE_SSL_ADMIN`, updates siteurl/home, installs systemd renewal timer. |
+
+> **注意 / Note**：`enable-ssl` 支持与 `deploy` 相同的 `--cache` / `--redis` / `--cloudflare` / `--optimize` / `--wp-auto-install` 标志。  
+> `enable-ssl` supports the same `--cache` / `--redis` / `--cloudflare` / `--optimize` / `--wp-auto-install` flags as `deploy`.
+
+---
+
+## 场景九：ZeroSSL 备用 CA（Let's Encrypt 签发受限时）
+## Scenario 9: ZeroSSL Backup CA (When Let's Encrypt Hits Rate Limits)
+
+Let's Encrypt 对同一域名每周限 5 次签发。ZeroSSL 作为备用 CA，可通过 EAB 凭据启用：  
+Let's Encrypt limits issuance to 5 certificates per domain per week. ZeroSSL serves as a backup CA via EAB credentials:
+
+```bash
+# 方式 1: 手动提供 EAB 凭据（从 app.zerossl.com/developer 获取）
+# Method 1: Provide EAB credentials manually (from app.zerossl.com/developer)
+python3 wp_ssl_bootstrap.py deploy \
+  --domain example.com \
+  --email  admin@example.com \
+  --zerossl-eab-kid       YOUR_EAB_KID \
+  --zerossl-eab-hmac-key  YOUR_EAB_HMAC_KEY
+
+# 方式 2: 仅提供 email，脚本自动调用 ZeroSSL API 获取 EAB 凭据
+# Method 2: Just provide email; the script auto-fetches EAB credentials from ZeroSSL API
+python3 wp_ssl_bootstrap.py deploy \
+  --domain example.com \
+  --email  admin@example.com
+```
+
+> **自动容灾 / Automatic Failover**：即使不提供 ZeroSSL 参数，当 Let's Encrypt 签发失败且提供了 `--email` 时，脚本会自动尝试通过 ZeroSSL API 获取 EAB 凭据并 fallback 到 ZeroSSL。  
+> Even without ZeroSSL flags, when Let's Encrypt fails and `--email` is provided, the script automatically attempts to fetch EAB credentials from ZeroSSL API and falls back to ZeroSSL.
+
+---
+
 ## 常用后续操作 / Common Post-Deployment Operations
 
 ```bash
@@ -217,6 +288,11 @@ python3 wp_ssl_bootstrap.py renew \
   --domain example.com \
   --force
 
+# 为 HTTP-only 站点补签 SSL 证书 / Add SSL to an HTTP-only site
+python3 wp_ssl_bootstrap.py enable-ssl \
+  --domain example.com \
+  --email  admin@example.com
+
 # 事后追加 Redis 缓存（无需重新完整部署）
 # Add Redis cache after the fact (no full redeploy needed)
 python3 wp_ssl_bootstrap.py update \
@@ -235,23 +311,26 @@ python3 wp_ssl_bootstrap.py self-update
 | 参数 / Parameter | 类型 / Type | 默认值 / Default | 适用子命令 / Subcommands |
 |---|---|---|---|
 | `--domain` | 字符串 / string | `$WP_DOMAIN` | 全部 / all |
-| `--email` | 字符串 / string | `$WP_EMAIL` | `deploy` |
-| `--cache` | `none` / `fastcgi` | `none` | `deploy` / `update` |
-| `--redis` | 开关 / flag | 关 / off | `deploy` / `update` |
-| `--optimize` | 开关 / flag | 关 / off | `deploy` / `update` |
-| `--cloudflare` | 开关 / flag | 关 / off | `deploy` / `update` |
-| `--wp-auto-install` | 开关 / flag | 关 / off | `deploy` |
-| `--persist-root-pwd` | 开关 / flag | 关 / off | `deploy` |
-| `--allow-xmlrpc` | 开关 / flag | 关（封锁）/ off (blocked) | `deploy` / `update` |
+| `--email` | 字符串 / string | `$WP_EMAIL` | `deploy` / `enable-ssl` |
+| `--cache` | `none` / `fastcgi` | `none` | `deploy` / `update` / `enable-ssl` / `restore` |
+| `--redis` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` / `restore` |
+| `--optimize` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` |
+| `--cloudflare` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` |
+| `--wp-auto-install` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` |
+| `--persist-root-pwd` | 开关 / flag | 关 / off | `deploy` / `enable-ssl` |
+| `--skip-ssl` | 开关 / flag | 关 / off | `deploy` |
+| `--allow-xmlrpc` | 开关 / flag | 关（封锁）/ off (blocked) | `deploy` / `update` / `enable-ssl` / `restore` |
 | `--php-version` | `X.Y` | 自动探测最高版本 / auto-detect highest | `deploy` / `update` |
 | `--db-host` | 字符串 / string | `localhost` | `deploy` / `backup` |
 | `--db-root-pass` | 字符串 / string | `$WP_DB_ROOT_PASS` | `deploy` / `backup` |
 | `--db-wait-timeout` | 秒 / seconds | 本地 30s / 外置 60s<br>30s local / 60s external | `deploy` |
+| `--zerossl-eab-kid` | 字符串 / string | `$WP_ZEROSSL_EAB_KID` | `deploy` / `enable-ssl` |
+| `--zerossl-eab-hmac-key` | 字符串 / string | `$WP_ZEROSSL_EAB_HMAC_KEY` | `deploy` / `enable-ssl` |
 | `--backup-dir` | 路径 / path | `/root/backups` | `backup` / `restore` |
 | `--keep` | 整数 / integer | `5` | `backup` |
 | `--staging` | 开关 / flag | 关 / off | `deploy` |
 | `--dry-run` | 开关 / flag | 关 / off | 全部 / all |
-| `--force` | 开关 / flag | 关 / off | `renew` |
+| `--force` | 开关 / flag | 关 / off | `renew` / `enable-ssl` |
 | `--skip-deps` | 开关 / flag | 关 / off | `deploy` |
 | `--lang` | `zh` / `en` | 自动检测 / auto-detect | 全部（全局）/ all (global) |
 

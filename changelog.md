@@ -4,6 +4,115 @@ All notable changes to WP-SSL-Bootstrap are documented in this file.
 本文件记录 WP-SSL-Bootstrap 的所有重要变更。
 ---
 
+## [V3.2.0]
+
+> **升级说明 / Upgrade note**
+> V3.2.0 是自 V3.1.1 以来的重大功能更新，内部经过 60+ 轮迭代打磨，涵盖新功能、安全增强、
+> Bug 修复和工程质量改进。从 V3.1.x 升级时，直接替换脚本文件并执行 `update` 子命令即可，
+> 所有新配置（Brotli / Cloudflare / Fail2Ban / logrotate / systemd timers）将自动重建。
+>
+> V3.2.0 is a major feature update since V3.1.1, refined through 60+ internal iterations.
+> To upgrade from V3.1.x, replace the script and run the `update` subcommand.
+> All new configs (Brotli / Cloudflare / Fail2Ban / logrotate / systemd timers) rebuild automatically.
+
+---
+
+### ✨ 新功能 / New Features
+
+- **交互式向导 / Interactive wizard** — 未指定子命令时自动进入 TTY 交互向导（非 TTY 打印帮助）。通过菜单引导用户完成域名、邮箱、SSL 策略选择，降低首次使用门槛。
+  When no subcommand is given, TTY users enter an interactive wizard that guides domain, email, and SSL policy selection. Non-TTY prints help.
+
+- **两阶段部署：`deploy --skip-ssl` + `enable-ssl`** — 新增 `--skip-ssl` 标志跳过 SSL 签发，生成完整 HTTP 生产配置；后续通过新子命令 `enable-ssl` 随时补签证书并自动切换至 HTTPS（含 `FORCE_SSL_ADMIN` 恢复、siteurl/home 更新）。适用于 DNS 尚未生效或需分步验证的场景。
+  **Two-phase deployment: `deploy --skip-ssl` + `enable-ssl`** — New `--skip-ssl` flag generates full HTTP production config. New `enable-ssl` subcommand signs the certificate and switches to HTTPS on demand.
+
+- **ZeroSSL 备用 CA 与自动 EAB 协商** — 通过 `--zerossl-eab-kid` / `--zerossl-eab-hmac-key` 或提供 `--email` 自动调用 ZeroSSL API 获取 EAB 凭据。Let's Encrypt 签发失败后自动 fallback 到 ZeroSSL，再失败则尝试 BuyPass Go（国内 DNS 不可达时已移除）。Certbot 错误分类引擎区分致命/可重试/非 CA 侧错误，非 CA 侧错误（端口占用、DNS 未解析、webroot 不可达）立即熔断跳出 CA 循环。
+  **ZeroSSL backup CA with automatic EAB negotiation** — Provides EAB credentials via CLI flags or auto-fetches them from ZeroSSL API using `--email`. Automatic fallback chain: Let's Encrypt → ZeroSSL → (BuyPass Go, removed for China DNS issues). Certbot error classifier distinguishes fatal/retryable/non-CA-side errors; non-CA-side errors (port conflict, DNS failure, webroot unreachable) break out of the CA loop immediately.
+
+- **多语言支持 (i18n)** — 200+ 条消息全量双语化（中/英）。优先级：`--lang` CLI 参数 > 持久配置文件 `/root/.wp_ssl_lang` > `WP_LANG` 环境变量 > 系统 `LANG`。首次指定后自动持久化，后续无需重复。
+  **Internationalization (i18n)** — 200+ messages fully bilingual (zh/en). Priority: `--lang` CLI > persisted config > `WP_LANG` env > system `LANG`. Auto-persisted on first use.
+
+- **域名智能归一化** — 输入 `www.example.com` 时自动剥离前缀归一为 `example.com`，`www` 作为别名自动添加到 certbot `-d` 列表。子域名（如 `blog.example.com`）自动识别并跳过 `www` 变体，避免 DNS 验证失败。
+  **Smart domain normalization** — `www.example.com` input auto-normalized to `example.com`; `www` added as certbot alias. Subdomains (e.g. `blog.example.com`) detected and skip `www` variant to avoid DNS validation failure.
+
+- **国内云检测扩展** — 新增天翼云、京东云、火山引擎、UCloud、百度云、金山云识别（DMI sysfs + 厂商专有元数据端点），自动切换国内 WordPress 下载源和 certbot 镜像。
+  **Expanded China cloud detection** — Added CTYun, JD Cloud, Volcengine, UCloud, Baidu Cloud, Kingsoft Cloud detection (DMI sysfs + vendor-specific metadata endpoints). Auto-switches to China WordPress and certbot mirrors.
+
+- **PHP Redis 扩展源码编译兜底** — 预编译包 `php-redis` 不可用时，自动通过 PECL 或源码编译安装 `phpredis`，确保 `--redis` 在所有发行版上可用。
+  **PHP Redis extension source compilation fallback** — When `php-redis` packages are unavailable, auto-compiles from PECL/source to ensure `--redis` works on all distros.
+
+- **dnf5 兼容 (EL10+)** — 自动检测 EL10+ 的 dnf5 包管理器，调整模块安装命令（`dnf5 module` 语法差异），支持 RHEL 10 / Fedora 41+ 等新一代发行版。
+  **dnf5 compatibility (EL10+)** — Auto-detects dnf5 package manager on EL10+, adapts module install commands for RHEL 10 / Fedora 41+.
+
+---
+
+### 🔒 安全增强 / Security Enhancements
+
+- **HTTP/HTTPS 公共安全响应头统一** — 将安全头（CSP / nosniff / Referrer-Policy / Permissions-Policy）提取为共享函数，HTTP 和 HTTPS 配置均调用。HTTP 配置不含 HSTS，HTTPS 配置追加 HSTS + `frame-ancestors`。消除原 HTTP-only 部署无安全头的盲区。
+  **Unified security headers for HTTP/HTTPS** — Security headers extracted into a shared function called by both HTTP and HTTPS configs. Eliminates the gap where HTTP-only deployments had no security headers.
+
+- **MySQL 密码文件 `fsync` 落盘** — `run_sql()` 创建的 `--defaults-extra-file` 临时密码文件和 `_wp_auto_install()` 追加的凭据文件在 `os.write()` 后补充 `os.fsync()`，防止断电后密码文件截断或空白。
+  **MySQL password file `fsync`** — Temporary password files and credential files now `fsync()` after write, preventing truncation on power loss.
+
+- **Nginx 配置原子写入 + 精确权限** — `apply_nginx_config_safe()` 从 `write_text()` 改为 `os.open(O_CREAT|O_TRUNC, 0o644)` + `os.fsync()` + `os.replace()` 原子替换，消除 umask 依赖和断电数据丢失风险。
+  **Nginx config atomic write + precise permissions** — `apply_nginx_config_safe()` switched from `write_text()` to `os.open()` with explicit `0o644` mode + `fsync` + atomic `os.replace()`.
+
+---
+
+### 🐛 问题修复 / Bug Fixes
+
+- **[Bug-1] `restore` 路径 WP-CLI 缺失** — 恢复后 `setup_wp_cron_timer()` 总是降级到 PHP fallback（因从未调用 `_ensure_wpcli()`），已修复。
+  **[Bug-1] restore path missing `_ensure_wpcli()`** — WP-Cron timer always fell back to PHP after restore. Fixed.
+
+- **[Bug-2] `restore` 路径 certbot deploy hook 缺失** — HTTPS 站点恢复后 certbot deploy hook 丢失，证书续期后 Nginx 不会自动 reload，已修复。
+  **[Bug-2] restore path missing `_install_certbot_deploy_hook()`** — Certbot deploy hook lost after HTTPS site restore. Fixed.
+
+- **[Bug-3] `uninstall()` 双重 `cleanup_and_exit()`** — 方法内部调用 `cleanup_and_exit(0)` 与 `main()` 的 `finally` 块重复，已移除内部调用，与其他子命令统一。
+  **[Bug-3] `uninstall()` double `cleanup_and_exit()`** — Removed redundant internal call; cleanup now handled uniformly by `main()` finally block.
+
+- **[Bug-4] `enable-ssl` 缺少 `--wp-auto-install`** — `deploy` 和 `update` 均支持此参数但 `enable-ssl` 遗漏。已补齐 argparser 定义和方法调用。
+  **[Bug-4] `enable-ssl` missing `--wp-auto-install`** — Added to argparser and method body, consistent with `deploy` and `update`.
+
+- **[Bug-5] `restore` 路径 `--redis` 无效** — `restore` 子命令接受 `--redis` 参数但 `_restore_post_fixup()` 从未调用 `_setup_redis_cache()`，已修复。
+  **[Bug-5] restore path `--redis` flag ineffective** — `_setup_redis_cache()` was never called in `_restore_post_fixup()`. Fixed.
+
+- **[Bug-6] `enable-ssl` 中 `_wp_auto_install()` 排序错误** — 健康检查在自动安装之前执行，产生误导性日志。已移至 `verify_site_health()` 之前，与 `deploy` 路径一致。
+  **[Bug-6] `enable-ssl` `_wp_auto_install()` ordering** — Health checks ran before auto-install, producing misleading logs. Moved before `verify_site_health()`, consistent with `deploy` path.
+
+- **`enable-ssl` 后续步骤完整性** — `enable-ssl` 成功后缺少 Fail2Ban、logrotate、nginx-helper、Redis 缓存等配置步骤，已与 `deploy` HTTPS 路径完全对齐。
+  **`enable-ssl` post-setup completeness** — Missing Fail2Ban, logrotate, nginx-helper, Redis setup after `enable-ssl` success. Now fully aligned with `deploy` HTTPS path.
+
+- **`wp-config.php` salt 注入 off-by-one** — `inject_salts()` 中 `rfind()` 返回 0（`require` 行在文件开头）时被误判为未找到，salt 注入失败。已修正判断条件。
+  **`wp-config.php` salt injection off-by-one** — `rfind()` returning 0 (require at file start) was misinterpreted as not-found. Fixed.
+
+- **Certbot 错误正则误匹配** — `"port 80"` 会误匹配 `"port 8080"`、`"404"` 会误匹配 `"4048"` 等端口号。已改用全词匹配正则。
+  **Certbot error regex false positives** — `"port 80"` matched `"port 8080"`, `"404"` matched `"4048"`. Fixed with word-boundary regex.
+
+---
+
+### 🔨 工程改进 / Engineering
+
+- **大型方法拆分** — `setup_lemp_and_wp()`、`backup()`、`restore()`、`download_and_verify_wordpress()`、`enable_ssl()` 等拆分为多个职责单一的子方法，提升可读性和可测试性。
+  **Large method decomposition** — `setup_lemp_and_wp()`, `backup()`, `restore()`, `download_and_verify_wordpress()`, `enable_ssl()` split into focused sub-methods.
+
+- **跨路径一致性审计** — 系统对比 `deploy`（HTTP/HTTPS）、`enable-ssl`、`update`、`restore` 五条路径的后置步骤序列，确保 `_ensure_wpcli` / `_install_certbot_deploy_hook` / `_setup_redis_cache` / `_wp_auto_install` 排序和完整性一致。
+  **Cross-path consistency audit** — Systematic comparison of post-setup step sequences across all 5 command paths, ensuring consistent ordering and completeness.
+
+- **线程安全缓存** — `_is_china_cloud()` 和 `_detect_nginx_http2_directive()` 的结果缓存加入 `threading.Lock` + 双重检查锁，防止未来多线程调用时数据竞争。
+  **Thread-safe caching** — `_is_china_cloud()` and `_detect_nginx_http2_directive()` caches protected with `threading.Lock` + double-checked locking.
+
+- **常量/路径重构** — 全局锁文件、MySQL 临时凭据目录、certbot 锁超时等硬编码值提升为类级常量（`_GLOBAL_LOCK_FILE`、`_MYSQL_TMP_DIR`、`_CERTBOT_LOCK_TIMEOUT`），统一管理。
+  **Constants/paths refactored** — Hardcoded values (lock files, temp dirs, timeouts) elevated to class-level constants for centralized management.
+
+- **`subprocess` 编码统一** — 全量清理，所有 `subprocess.run()` / `Popen()` 统一使用 `encoding='utf-8', errors='replace'`，消除非 UTF-8 locale 下的 `UnicodeDecodeError` 风险。
+  **`subprocess` encoding standardization** — All `subprocess` calls unified to `encoding='utf-8', errors='replace'`, eliminating `UnicodeDecodeError` risk under non-UTF-8 locales.
+
+- **`_sd_escape()` 提升为模块级函数** — 原为 `setup_wp_cron_timer()` 内嵌函数，导致 `setup_systemd()` 无法访问，systemd `ExecStart` 路径中的 `%` / `$` 字符未转义。
+  **`_sd_escape()` elevated to module-level** — Previously nested inside `setup_wp_cron_timer()`, making it inaccessible to `setup_systemd()`. Systemd `ExecStart` paths now properly escape `%` / `$` characters.
+
+- 版本号 `__version__` 从 `"3.1.1"` 升至 `"3.2.0"`。
+
+---
+
 ## [V3.1.1]
 
 > **升级说明 / Upgrade note**
