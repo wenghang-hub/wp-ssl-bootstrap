@@ -1,5 +1,5 @@
-# WP-SSL-Bootstrap V3.2.0 — 全新建站参数指南
-# WP-SSL-Bootstrap V3.2.0 — New Site Deployment Guide
+# WP-SSL-Bootstrap V3.2.1 — 全新建站参数指南
+# WP-SSL-Bootstrap V3.2.1 — New Site Deployment Guide
 
 ---
 
@@ -24,6 +24,10 @@ Confirm the following before running the script — these cannot be automated:
 > **💡 域名智能归一化 / Smart Domain Normalization**  
 > 输入 `www.example.com` 时脚本自动归一为 `example.com`，`www` 作为别名写入证书。子域名（如 `blog.example.com`）自动跳过 `www` 变体。  
 > Input `www.example.com` is auto-normalized to `example.com`; `www` is added as a certificate alias. Subdomains (e.g. `blog.example.com`) automatically skip the `www` variant.
+
+> **💡 单站点自动推断 / Single-Site Auto Inference** *(V3.2.1 新增 / New)*  
+> 除 `deploy` 外的子命令，若未指定 `--domain` 且服务器上仅有一个已部署站点，脚本自动使用该域名，无需重复输入。  
+> For non-deploy subcommands, if `--domain` is omitted and only one site is deployed, the script auto-selects it.
 
 ---
 
@@ -54,8 +58,8 @@ python3 wp_ssl_bootstrap.py deploy \
 
 ### 部署完成后 / After Deployment
 
-脚本输出凭据文件路径，例如 `/root/.wp_credentials_example_com.txt`，其中包含：  
-The script prints the path to a credentials file, e.g. `/root/.wp_credentials_example_com.txt`, containing:
+脚本输出凭据文件路径，例如 `/root/.wp_credentials_example_d_com.txt`，其中包含：  
+The script prints the path to a credentials file, e.g. `/root/.wp_credentials_example_d_com.txt`, containing:
 
 - WordPress 管理员用户名 / 密码 / WordPress admin username and password
 - 数据库名、用户名、密码 / Database name, user, and password
@@ -79,7 +83,8 @@ python3 wp_ssl_bootstrap.py deploy \
   --optimize \
   --cloudflare \
   --wp-auto-install \
-  --persist-root-pwd
+  --persist-root-pwd \
+  --notify-webhook https://hooks.slack.com/services/xxx
 ```
 
 ### 相比场景一新增的参数 / Additional Parameters vs. Scenario 1
@@ -89,6 +94,7 @@ python3 wp_ssl_bootstrap.py deploy \
 | `--redis` | 启用 Redis 对象缓存，与 FastCGI 页面缓存**叠加**：FastCGI 缓存完整 HTML，Redis 缓存数据库查询；已登录用户（绕过 FastCGI 缓存）同样受益。<br>Enables Redis object cache on top of FastCGI page cache. FastCGI caches full HTML; Redis caches DB queries. Logged-in users (who bypass FastCGI) also benefit. |
 | `--optimize` | 启用 Nginx `open_file_cache`（`max=10000 inactive=60s`），减少静态文件密集请求时的内核 `stat()` 调用。<br>Enables Nginx `open_file_cache` (`max=10000 inactive=60s`), reducing kernel `stat()` calls for static-asset-heavy traffic. |
 | `--cloudflare` | 自动从 Cloudflare API 拉取最新 IP 段，写入全局 `real_ip_from` + `CF-Connecting-IP` 配置，确保日志和 Fail2Ban 记录访客真实 IP 而非 CF 节点 IP；获取失败时回退内置默认值。<br>Auto-fetches Cloudflare IP ranges and writes a global `real_ip_from` + `CF-Connecting-IP` config so logs and Fail2Ban see visitor IPs, not Cloudflare node IPs. Falls back to built-in defaults on fetch failure. |
+| `--notify-webhook` | 续期失败时发送 Webhook 通知（Slack / 飞书 / 企微等）。仅允许 HTTPS URL，内网地址会被安全策略拒绝。<br>Sends a Webhook notification on renewal failure (Slack / Lark / WeCom). HTTPS only; internal URLs are blocked by security policy. |
 
 > **注意 / Note**：`--cloudflare` 写入全局 Nginx 配置，同台服务器多个域名共享，只需在**首个域名**部署时加，后续域名无需重复。  
 > `--cloudflare` writes a global Nginx config shared across all domains on the server. Only add it when deploying the **first domain**; subsequent domains on the same server do not need it.
@@ -146,8 +152,11 @@ python3 wp_ssl_bootstrap.py deploy \
   --staging
 ```
 
-调试完成后执行一次不带 `--staging` 的 `deploy` 或 `renew --force` 替换为正式证书。Staging 证书不受浏览器信任，仅用于流程验证。  
-Once debugging is complete, run `deploy` (or `renew --force`) without `--staging` to replace it with a trusted certificate. Staging certificates are not browser-trusted.
+调试完成后执行一次不带 `--staging` 的 `deploy` 或 `renew --force --no-staging` 替换为正式证书。Staging 证书不受浏览器信任，仅用于流程验证。  
+Once debugging is complete, run `deploy` (or `renew --force --no-staging`) without `--staging` to replace it with a trusted certificate. Staging certificates are not browser-trusted.
+
+> **`--no-staging`** *(V3.2.1 新增 / New)* — 显式覆盖从已有定时器继承的 `--staging` 标志，强制切换回生产 CA。  
+> Explicitly overrides `--staging` inherited from existing timer config, forcing production CA.
 
 ---
 
@@ -203,6 +212,7 @@ python3 wp_ssl_bootstrap.py deploy \
 |---|---|
 | `--db-host` | 外置数据库主机地址。脚本检测到非 `localhost` / `127.0.0.1` 时，自动跳过本地 MariaDB 安装、调优及 mysqlcheck 定时器。<br>External database host. When not `localhost`/`127.0.0.1`, the script skips local MariaDB installation, tuning, and the mysqlcheck timer. |
 | `--db-wait-timeout 120` | 跨地域云数据库连接延迟较高，默认 60s 可能不够，建议设为 120～300。<br>Cross-region cloud databases have higher latency. The default 60s may be insufficient; 120–300 is recommended. |
+| `--no-db-ssl` | 内网直连场景下禁用数据库 SSL 传输（默认外置 DB 自动启用 SSL）。<br>Disables SSL transport for external DB connections (default: SSL auto-enabled for external DB). Use for LAN/VPC direct connections. |
 
 ---
 
@@ -237,8 +247,8 @@ python3 wp_ssl_bootstrap.py enable-ssl \
 | `--skip-ssl` | 跳过 SSL 签发，生成完整的 HTTP 生产 Nginx 配置。`wp-config.php` 中 `FORCE_SSL_ADMIN` 设为 `false`。<br>Skips SSL issuance; generates a full HTTP production Nginx config. `FORCE_SSL_ADMIN` is set to `false` in `wp-config.php`. |
 | `enable-ssl` | 新子命令：为已有 HTTP 站点签发证书并切换至 HTTPS。自动恢复 `FORCE_SSL_ADMIN`、更新 siteurl/home、安装 systemd 续期定时器。<br>New subcommand: signs a certificate for an existing HTTP site and switches to HTTPS. Auto-restores `FORCE_SSL_ADMIN`, updates siteurl/home, installs systemd renewal timer. |
 
-> **注意 / Note**：`enable-ssl` 支持与 `deploy` 相同的 `--cache` / `--redis` / `--cloudflare` / `--optimize` / `--wp-auto-install` 标志。  
-> `enable-ssl` supports the same `--cache` / `--redis` / `--cloudflare` / `--optimize` / `--wp-auto-install` flags as `deploy`.
+> **注意 / Note**：`enable-ssl` 支持与 `deploy` 相同的 `--cache` / `--redis` / `--cloudflare` / `--optimize` / `--wp-auto-install` / `--notify-webhook` 标志。  
+> `enable-ssl` supports the same `--cache` / `--redis` / `--cloudflare` / `--optimize` / `--wp-auto-install` / `--notify-webhook` flags as `deploy`.
 
 ---
 
@@ -269,6 +279,58 @@ python3 wp_ssl_bootstrap.py deploy \
 
 ---
 
+## 场景十：续期失败 Webhook 通知
+## Scenario 10: Renewal Failure Webhook Notification
+
+需要在 SSL 续期失败时第一时间收到告警（Slack / 飞书 / 企微 / 自定义 Webhook）：  
+Get alerted immediately when SSL renewal fails (Slack / Lark / WeCom / custom Webhook):
+
+```bash
+python3 wp_ssl_bootstrap.py deploy \
+  --domain example.com \
+  --email  admin@example.com \
+  --cache  fastcgi \
+  --wp-auto-install \
+  --persist-root-pwd \
+  --notify-webhook https://hooks.slack.com/services/T00/B00/xxxxx
+```
+
+| 参数 / Parameter | 说明 / Description |
+|---|---|
+| `--notify-webhook URL` | 续期失败时发送 JSON POST（`{"text": "..."}`）到指定 URL。仅允许 HTTPS，内网地址 / `localhost` / 私有域名后缀会被安全策略拒绝。也可通过环境变量 `WP_NOTIFY_WEBHOOK` 传入。<br>Sends a JSON POST on renewal failure. HTTPS only; localhost, private IPs, and internal domain suffixes are blocked. Also accepts `WP_NOTIFY_WEBHOOK` env var. |
+
+> **注意 / Note**：`--skip-ssl` 模式下无 SSL 续期定时器，Webhook 暂不生效；后续执行 `enable-ssl` 后自动激活。  
+> In `--skip-ssl` mode there is no SSL renewal timer, so the webhook is inactive until `enable-ssl` is run.
+
+---
+
+## 场景十一：彻底清理站点 / 证书吊销
+## Scenario 11: Full Site Purge / Certificate Revocation
+
+卸载守护组件的同时彻底删除数据库、站点文件和证书（**不可逆**）：  
+Remove daemon components AND permanently delete database, files, and certificates (**irreversible**):
+
+```bash
+# 彻底清理（需交互确认域名）
+# Full purge (requires interactive domain confirmation)
+python3 wp_ssl_bootstrap.py uninstall \
+  --domain example.com \
+  --purge
+
+# 仅吊销证书（需输入 yes 确认）
+# Revoke certificate only (requires yes confirmation)
+python3 wp_ssl_bootstrap.py uninstall \
+  --domain example.com \
+  --revoke
+```
+
+| 参数 / Parameter | 说明 / Description |
+|---|---|
+| `--purge` | 删除数据库、站点文件、Let's Encrypt 证书目录和凭据文件。需在 TTY 中输入域名确认。<br>Drops database, removes webroot, deletes certificate directories and credentials file. Requires typing the domain name to confirm in TTY. |
+| `--revoke` | 吊销 Let's Encrypt 证书并删除本地证书文件。需输入 `yes` 确认。<br>Revokes the Let's Encrypt certificate and deletes local cert files. Requires typing `yes` to confirm. |
+
+---
+
 ## 常用后续操作 / Common Post-Deployment Operations
 
 ```bash
@@ -278,9 +340,9 @@ python3 wp_ssl_bootstrap.py backup \
   --domain example.com \
   --keep   7
 
-# 查看站点状态 / Check site status
-python3 wp_ssl_bootstrap.py status \
-  --domain example.com
+# 查看站点状态（单站点时可省略 --domain）
+# Check site status (--domain optional when only one site deployed)
+python3 wp_ssl_bootstrap.py status
 
 # 手动触发证书续期（正常情况 systemd timer 自动执行；--force 忽略到期时间）
 # Manual certificate renewal (normally handled by systemd timer; --force ignores expiry)
@@ -300,6 +362,10 @@ python3 wp_ssl_bootstrap.py update \
   --cache  fastcgi \
   --redis
 
+# 从备份恢复 / Restore from backup
+python3 wp_ssl_bootstrap.py restore \
+  --domain example.com
+
 # 脚本自更新 / Self-update the script
 python3 wp_ssl_bootstrap.py self-update
 ```
@@ -311,26 +377,32 @@ python3 wp_ssl_bootstrap.py self-update
 | 参数 / Parameter | 类型 / Type | 默认值 / Default | 适用子命令 / Subcommands |
 |---|---|---|---|
 | `--domain` | 字符串 / string | `$WP_DOMAIN` | 全部 / all |
-| `--email` | 字符串 / string | `$WP_EMAIL` | `deploy` / `enable-ssl` |
+| `--email` | 字符串 / string | `$WP_EMAIL` | `deploy` / `enable-ssl` / `renew` / `update` / `restore` |
 | `--cache` | `none` / `fastcgi` | `none` | `deploy` / `update` / `enable-ssl` / `restore` |
 | `--redis` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` / `restore` |
-| `--optimize` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` |
-| `--cloudflare` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` |
-| `--wp-auto-install` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` |
-| `--persist-root-pwd` | 开关 / flag | 关 / off | `deploy` / `enable-ssl` |
-| `--skip-ssl` | 开关 / flag | 关 / off | `deploy` |
+| `--optimize` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` / `restore` |
+| `--cloudflare` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` / `restore` |
+| `--wp-auto-install` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` / `restore` |
+| `--persist-root-pwd` | 开关 / flag | 关 / off | `deploy` / `enable-ssl` / `backup` / `restore` |
+| `--skip-ssl` | 开关 / flag | 关 / off | `deploy` / `restore` |
 | `--allow-xmlrpc` | 开关 / flag | 关（封锁）/ off (blocked) | `deploy` / `update` / `enable-ssl` / `restore` |
-| `--php-version` | `X.Y` | 自动探测最高版本 / auto-detect highest | `deploy` / `update` |
-| `--db-host` | 字符串 / string | `localhost` | `deploy` / `backup` |
-| `--db-root-pass` | 字符串 / string | `$WP_DB_ROOT_PASS` | `deploy` / `backup` |
-| `--db-wait-timeout` | 秒 / seconds | 本地 30s / 外置 60s<br>30s local / 60s external | `deploy` |
-| `--zerossl-eab-kid` | 字符串 / string | `$WP_ZEROSSL_EAB_KID` | `deploy` / `enable-ssl` |
-| `--zerossl-eab-hmac-key` | 字符串 / string | `$WP_ZEROSSL_EAB_HMAC_KEY` | `deploy` / `enable-ssl` |
-| `--backup-dir` | 路径 / path | `/root/backups` | `backup` / `restore` |
+| `--php-version` | `X.Y` | 自动探测最高版本 / auto-detect highest | `deploy` / `update` / `enable-ssl` / `restore` |
+| `--db-host` | 字符串 / string | `localhost` | 全部 / all |
+| `--db-root-pass` | 字符串 / string | `$WP_DB_ROOT_PASS` | 全部 / all |
+| `--no-db-ssl` | 开关 / flag | 关 / off | 全部 / all |
+| `--db-wait-timeout` | 秒 / seconds | 本地 30s / 外置 60s<br>30s local / 60s external | `deploy` / `enable-ssl` / `update` / `restore` |
+| `--zerossl-eab-kid` | 字符串 / string | `$WP_ZEROSSL_EAB_KID` | `deploy` / `enable-ssl` / `renew` / `update` / `restore` |
+| `--zerossl-eab-hmac-key` | 字符串 / string | `$WP_ZEROSSL_EAB_HMAC_KEY` | `deploy` / `enable-ssl` / `renew` / `update` / `restore` |
+| `--notify-webhook` | URL | `$WP_NOTIFY_WEBHOOK` | `deploy` / `enable-ssl` / `renew` / `update` / `restore` |
+| `--no-pre-backup` | 开关 / flag | 关 / off | `deploy` / `enable-ssl` / `update` / `restore` |
+| `--backup-dir` | 路径 / path | `/root/backups` | 全部 / all |
 | `--keep` | 整数 / integer | `5` | `backup` |
-| `--staging` | 开关 / flag | 关 / off | `deploy` |
+| `--staging` | 开关 / flag | 关 / off | `deploy` / `enable-ssl` |
+| `--no-staging` | 开关 / flag | 关 / off | `renew` / `update` / `restore` / `enable-ssl` |
 | `--dry-run` | 开关 / flag | 关 / off | 全部 / all |
-| `--force` | 开关 / flag | 关 / off | `renew` / `enable-ssl` |
+| `--force` | 开关 / flag | 关 / off | `renew` |
+| `--purge` | 开关 / flag | 关 / off | `uninstall` |
+| `--revoke` | 开关 / flag | 关 / off | `uninstall` |
 | `--skip-deps` | 开关 / flag | 关 / off | `deploy` |
 | `--lang` | `zh` / `en` | 自动检测 / auto-detect | 全部（全局）/ all (global) |
 
@@ -355,3 +427,6 @@ The following run **unconditionally** during `deploy` without any flags:
 | **Certbot 持久化 deploy hook** / Persistent certbot hook | 证书续期后自动 reload Nginx，无论由脚本 timer 还是 certbot 自身 timer 触发<br>Reloads Nginx after every renewal regardless of which timer triggered it |
 | **静态资源长缓存** / Static asset caching | 图片 365 天、JS/CSS 30 天、字体 365 天 + CORS<br>Images 365d, JS/CSS 30d, fonts 365d + CORS headers |
 | **安全响应头** / Security headers | HSTS / CSP / X-Content-Type-Options / Referrer-Policy / Permissions-Policy 全套<br>Full suite: HSTS, CSP, X-Content-Type-Options, Referrer-Policy, Permissions-Policy |
+| **OS 自动安全更新** / OS auto security updates | Debian/Ubuntu: unattended-upgrades；RHEL 系: dnf-automatic / yum-cron<br>Debian/Ubuntu: unattended-upgrades; RHEL: dnf-automatic / yum-cron |
+| **操作前自动备份** / Pre-operation backup | `enable-ssl` / `update` / `restore` 执行前自动轻量备份（DB + Nginx 配置），可通过 `--no-pre-backup` 跳过<br>Lightweight auto-backup (DB + Nginx config) before `enable-ssl` / `update` / `restore`; skip with `--no-pre-backup` |
+| **ECC 证书** / ECDSA certificates | 优先使用 ECDSA P-256 密钥签发（TLS 握手更快），certbot 不支持时自动降级 RSA<br>Prefers ECDSA P-256 key type (faster TLS handshake); auto-falls back to RSA if unsupported |

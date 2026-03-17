@@ -4,6 +4,182 @@ All notable changes to WP-SSL-Bootstrap are documented in this file.
 本文件记录 WP-SSL-Bootstrap 的所有重要变更。
 ---
 
+## [V3.2.1]
+
+> **升级说明 / Upgrade note**
+> V3.2.1 是 V3.2.0 之后经过 160+ 轮内部迭代的稳定性与安全性强化版本，
+> 涵盖 4 轮独立安全审计修复、10+ 项关键 Bug 修复、EL10/dnf5 兼容性改进、
+> 以及大量工程质量提升。从 V3.2.0 升级时，直接替换脚本文件并执行 `update` 子命令即可。
+>
+> V3.2.1 is a stability and security hardening release after V3.2.0, refined through
+> 160+ internal iterations. It includes 4 independent security audit rounds, 10+ critical
+> bug fixes, EL10/dnf5 compatibility, and extensive engineering improvements.
+> To upgrade from V3.2.0, replace the script and run the `update` subcommand.
+
+---
+
+### ✨ 新功能 / New Features
+
+- **外置数据库交互式向导支持** — 交互式向导新增数据库主机、Root 密码、SSL 开关、等待超时等提示，覆盖跨地域/跨 VPC 部署场景。
+  **External DB interactive wizard** — Wizard now prompts for DB host, root password, SSL toggle, and wait timeout for cross-region deployments.
+
+- **轻量级系统状态展示** — 未部署站点时 `status` 子命令展示 Nginx/PHP-FPM/MariaDB 服务状态和磁盘空间，帮助首次部署前评估环境就绪度。
+  **Lightweight system status** — `status` without deployed sites shows base service health and disk space for pre-deploy assessment.
+
+- **单站点自动域名推断** — 非 deploy 子命令在未指定 `--domain` 且仅检测到一个已部署站点时自动使用该域名，减少重复输入。
+  **Single-site auto domain inference** — Non-deploy subcommands auto-select the domain when exactly one site is deployed.
+
+- **数据库恢复原子切换** — `restore` 路径改用 `RENAME TABLE` 原子切换：先导入临时库，再单条 SQL 原子替换正式库表，中断时正式库数据完全不受影响。
+  **Atomic DB restore via RENAME TABLE** — Restore imports to a temp database, then atomically swaps tables via a single `RENAME TABLE` statement. Interruption leaves the live database intact.
+
+- **外置数据库备份重试** — 跨地域/跨 VPC 场景下 `mysqldump` 失败时自动重试最多 3 次（指数退避 5s/15s/30s），适应不稳定网络。
+  **External DB backup retry** — `mysqldump` failures for external databases retry up to 3 times with exponential backoff (5s/15s/30s).
+
+- **mysqldump 内容完整性校验** — 备份后检查 `.sql.gz` 尾部是否包含 `Dump completed` 标记，检测 OOM/磁盘满/网络中断导致的 SQL 截断。
+  **mysqldump content integrity check** — Verifies `Dump completed` marker at EOF to detect truncation from OOM, disk-full, or network interruption.
+
+- **证书 SAN 与 Nginx 对齐** — 生成 HTTPS 配置时自动读取证书 SAN，若证书不含 `www` 则从 Nginx `server_name` 移除 `www` 变体，避免 HTTPS 重定向循环。
+  **Cert SAN / Nginx alignment** — HTTPS config auto-reads certificate SAN; removes `www` from `server_name` when cert lacks it, preventing redirect loops.
+
+- **enable-ssl 前置服务检查** — `enable-ssl` 执行前检测 Nginx 和 PHP-FPM 是否运行，未运行时自动启动并诊断修复，替代原先的模糊错误提示。
+  **enable-ssl service pre-check** — Verifies Nginx and PHP-FPM are running before SSL setup; auto-starts and diagnoses failures with clear messages.
+
+- **插件更新安全回滚** — `update` 子命令升级 nginx-helper / redis-cache 插件后执行健康检查，失败时自动回滚到升级前版本并还原配置。
+  **Plugin update safe rollback** — `update` performs health checks after upgrading managed plugins; auto-rolls back version and config on failure.
+
+---
+
+### 🔒 安全增强 / Security Enhancements
+
+- **4 轮独立安全审计修复** — 累计修复 50+ 项审计发现，涵盖 SSRF 防护、SQL 注入纵深防御、符号链接攻击防护、进程凭据泄露、供应链安全等。
+  **4 independent security audit rounds** — 50+ findings fixed across SSRF protection, SQL injection defense-in-depth, symlink attack prevention, credential leak mitigation, and supply-chain security.
+
+- **`self-update` 双源交叉校验** — 脚本从源 A 下载后，必须从源 B 获取 SHA256 哈希进行交叉验证；任一源不可达或哈希不匹配则中止更新，防御单源投毒。
+  **`self-update` cross-source verification** — Script downloaded from source A must have its SHA256 cross-verified from source B. Update aborts if cross-verification fails.
+
+- **管理员密码环境变量传递** — `_wp_auto_install()` 改用环境变量 `_WP_ADMIN_PASS` 传递密码，替代 `/proc/<pid>/cmdline` 明文暴露的 `--admin_password` 参数。
+  **Admin password via env var** — `_wp_auto_install()` passes password through `_WP_ADMIN_PASS` environment variable instead of exposing it in `/proc/<pid>/cmdline`.
+
+- **Webhook URL SSRF 防护增强** — 强制 HTTPS 协议、拒绝内网域名后缀（`.local`/`.internal`/`.corp` 等）、IPv4-mapped IPv6 绕过检测、配置时预解析 IP + 运行时 `/16` 前缀校验。
+  **Webhook SSRF hardening** — Enforces HTTPS, blocks private domain suffixes, detects IPv4-mapped IPv6 bypass, pre-resolves IP at config time with runtime `/16` prefix validation.
+
+- **`O_NOFOLLOW` 全路径覆盖** — `_write_bytes_to_fd()`、`apply_nginx_config_safe()`、`_write_mysql_defaults_file()` 等所有原子写入路径添加 `O_NOFOLLOW`，拒绝写入符号链接目标。
+  **`O_NOFOLLOW` across all write paths** — All atomic write functions now use `O_NOFOLLOW` to refuse writing through symlinks.
+
+- **敏感 CLI 参数清洗** — `main()` 入口在 argparse 解析后立即覆盖 `sys.argv` 中的 `--db-root-pass` 和 `--zerossl-eab-hmac-key`，防止 `/proc/<pid>/cmdline` 泄露。
+  **Sensitive CLI arg scrubbing** — `--db-root-pass` and `--zerossl-eab-hmac-key` values in `sys.argv` are overwritten with `<REDACTED>` immediately after parsing.
+
+- **SQL 控制字符拦截** — `run_sql()` 入口拦截 NUL (`\x00`)、SUB (`\x1a`) 及全部 C0 控制字符（保留 `\t`/`\n`/`\r`），防止 MySQL 协议截断攻击。
+  **SQL control character interception** — `run_sql()` blocks NUL, SUB, and all C0 control characters (except tab/newline/CR) to prevent MySQL protocol truncation.
+
+- **备份路径符号链接防护** — `backup()` 和 `restore()` 拒绝符号链接指向的备份根目录和归档文件，防止路径穿越覆盖敏感文件。
+  **Backup path symlink protection** — `backup()` and `restore()` refuse symlinked backup roots and archives to prevent path traversal.
+
+- **tar 路径遍历检测** — `restore` 解压前扫描归档成员，拒绝含 `../` 路径或指向外部的符号链接成员。
+  **tar path traversal detection** — `restore` scans archive members before extraction, refusing entries with `../` paths or external symlinks.
+
+---
+
+### 🐛 问题修复 / Bug Fixes
+
+- **[PATCH-158 FIX-2] `restore` 数据库半导入态** — 原 `gunzip | mysql` 管道中断时数据库处于半导入态。改用临时库 + `RENAME TABLE` 原子切换，中断时正式库完全不受影响。
+  **[PATCH-158 FIX-2] restore DB partial import** — Direct pipe interruption left DB in partial state. Now uses temp DB + atomic `RENAME TABLE`; live DB unaffected on interruption.
+
+- **[PATCH-162 FIX-2] Nginx `server_name` 与证书 SAN 不一致** — 证书不含 `www` 时 Nginx 仍配置 `www` 变体，导致 HTTPS 重定向循环。现自动对齐。
+  **[PATCH-162 FIX-2] Nginx server_name / cert SAN mismatch** — Nginx configured `www` variant even when cert lacked it, causing redirect loops. Now auto-aligned.
+
+- **[PATCH-163 FIX-1] `enable-ssl` 后 WordPress URL 与证书不一致** — `siteurl`/`home` 可能设为 `https://www.domain` 但证书仅覆盖裸域名。现通过 `_https_canonical_domain()` 证书感知选择。
+  **[PATCH-163 FIX-1] WordPress URL / cert domain mismatch after enable-ssl** — `siteurl`/`home` could be set to `https://www.domain` when cert only covers bare domain. Now cert-aware.
+
+- **[PATCH-162 FIX-4] 凭据文件密码覆写为空** — `enable-ssl` / `update` 路径重写凭据文件时，`db_pass` / `db_root_pass` 可能为空，覆盖原有有效密码。现增加 `_guard_credential_fields()` 从旧文件恢复。
+  **[PATCH-162 FIX-4] Credentials file password overwrite** — Credential rewrite could blank `db_pass`/`db_root_pass`. Added `_guard_credential_fields()` to recover from existing file.
+
+- **[PATCH-164] 凭据文件 certbot 命令与证书 SAN 不一致** — 凭据文件中的手动续期命令硬编码 `-d www.domain`，但证书可能不含 `www`。现从证书 SAN 动态生成。
+  **[PATCH-164] Credential file certbot command / cert SAN mismatch** — Manual renewal command in credentials file hardcoded `-d www.domain`. Now dynamically generated from cert SAN.
+
+- **[PATCH-159 FIX-1] `ALTER USER` 成功但密码未同步到 `wp-config.php`** — 密码恢复验证失败时 `ALTER USER` 成功，但因后续 `GRANT` 失败导致函数返回 `False`，新密码未写入配置。现 `ALTER USER` 成功后立即同步。
+  **[PATCH-159 FIX-1] ALTER USER success but password not synced** — ALTER USER succeeded but GRANT failure caused function to return False without writing the new password to wp-config.php. Now syncs immediately.
+
+- **[PATCH-159 FIX-2] `systemctl enable` 后 timer 未被检测为 active** — `setup_wp_cron_timer()` 刚 `enable --now` 后 systemd 可能尚未标记 timer 为 active，导致 `_ensure_wp_cron_constant` 误将 `DISABLE_WP_CRON` 回退为 `false`。现通过运行内标志跳过竞态窗口。
+  **[PATCH-159 FIX-2] Timer not detected as active after enable** — Timer marked inactive immediately after `enable --now` due to systemd activation delay. Added run-internal flag to skip race window.
+
+- **[PATCH-161 FIX-1] 证书 SAN 解析失败时续期域名列表回退** — `openssl x509` 失败时直接使用默认域名列表，可能与实际证书不一致。现增加 `certbot certificates` 中间回退层。
+  **[PATCH-161 FIX-1] Cert SAN parse failure domain list fallback** — Added `certbot certificates` as intermediate fallback when `openssl x509` fails, before defaulting to standard domain list.
+
+- **[PATCH-161 FIX-2] `status` 证书到期时间在中文 locale 下解析失败** — `strptime("%b")` 在 `zh_CN` locale 下期望中文月份名。改用固定映射表替代，消除 locale 依赖。
+  **[PATCH-161 FIX-2] Certificate expiry date parse failure under zh_CN locale** — Replaced `strptime("%b")` with fixed month mapping to eliminate locale dependency.
+
+- **[V3.2.124 FIX-1] Redis drop-in 检测路径错误** — `_detect_site_config()` 中 `.parent.parent` 多上溯一层，导致 `object-cache.php` 路径永远不存在。修正为 `.parent`。
+  **[V3.2.124 FIX-1] Redis drop-in detection path error** — `.parent.parent` overshot by one level; fixed to `.parent`.
+
+- **[V3.2.122 FIX-1] IPv6 地址缺少方括号** — `_verify_ssl_handshake()` 传递裸 IPv6 地址给 `openssl s_client -connect`，`:443` 被误解析为 IPv6 地址的一部分。现统一加方括号。
+  **[V3.2.122 FIX-1] IPv6 address missing brackets** — Bare IPv6 in `openssl s_client -connect` caused port misparse. Now wrapped in brackets.
+
+- **[V3.2.121 FIX-2] MariaDB 版本检测误判** — `mysql --version` 输出含 `"MariaDB"` 时仍被正则匹配为 MySQL 版本号 `(15, 1)`，导致选择 MariaDB 不支持的 `caching_sha2_password` 插件。现检测 MariaDB 字样后返回 `(0, 0)` 走保守路径。
+  **[V3.2.121 FIX-2] MariaDB version detection false positive** — `mysql --version` with MariaDB output matched as MySQL version `(15, 1)`, causing selection of unsupported `caching_sha2_password`. Now returns `(0, 0)` for MariaDB.
+
+- **[P126-1] `db-optimize` timer 密码文件格式错误** — `global_root_pwd_file` 是裸密码文本而非 INI 格式，`--defaults-extra-file` 读取失败。现创建域名级专用 `.cnf` 文件。
+  **[P126-1] db-optimize timer password file format** — Global password file is plaintext, not INI format. Now creates a domain-specific `.cnf` file with proper `[client]` section.
+
+---
+
+### 🔨 工程改进 / Engineering
+
+- **EL10 / dnf5 全面兼容** — `_detect_is_dnf5()` 提升为实例属性，`install_packages()` / `_brotli_install_deps()` / `_compile_php_redis_extension()` 统一引用；`php-json` 仅在 PHP < 8 时追加；Redis/Valkey 多包名候选自动适配。
+  **EL10 / dnf5 full compatibility** — `_detect_is_dnf5()` elevated to instance attribute; `php-json` only added for PHP < 8; Redis/Valkey multi-package candidate auto-selection.
+
+- **密码字符集白名单单一事实来源** — `_RE_SAFE_PASSWORD` / `_is_safe_password()` / `_generate_secure_password()` 提取为模块级函数，替代 7 处重复的 `re.fullmatch` 和 3 处重复的 `secrets.choice` 循环。
+  **Password charset whitelist single source of truth** — `_is_safe_password()` / `_generate_secure_password()` extracted as module-level functions, replacing 7 duplicate regex checks and 3 duplicate generation loops.
+
+- **共享转义/反转义工具** — `_escape_single_quoted()` / `_escape_double_quoted()` / `_unescape_single_quoted()` 从 6 处内联 `.replace()` 链提取，统一反斜杠优先处理顺序。
+  **Shared escape/unescape utilities** — Extracted from 6 inline `.replace()` chains with unified backslash-first processing order.
+
+- **`_write_bytes_to_fd()` 底层统一** — 从 `_write_lang_file` / `_safe_write_file` / `atomic_write` 三处重复的 fd 操作模式提取为单一实现，含 `O_NOFOLLOW` + `fchmod` + `fsync`。
+  **`_write_bytes_to_fd()` unified primitive** — Extracted from 3 duplicate fd operation patterns into single implementation with `O_NOFOLLOW` + `fchmod` + `fsync`.
+
+- **`_encode_domain_id()` 共享编码** — `SiteConfig.__init__` 和 `_nginx_safe_name()` 的域名编码逻辑合并为单一函数，消除两处独立维护的编码规则分歧风险。
+  **`_encode_domain_id()` shared encoding** — Domain encoding logic from `SiteConfig.__init__` and `_nginx_safe_name()` merged into single function.
+
+- **`_run_subcommand()` 统一框架** — 所有子命令（含 deploy/renew）统一走 `setup_signals → acquire_lock → operation → rollback → cleanup` 框架，消除 `run()` 方法的平行错误处理路径。
+  **`_run_subcommand()` unified framework** — All subcommands (including deploy/renew) now use the unified signal → lock → operation → rollback → cleanup framework. Legacy `run()` method removed.
+
+- **`_install_systemd_timer()` 通用方法** — `setup_systemd()` / `setup_wp_cron_timer()` / `setup_db_optimize_timer()` 三处重复的 `atomic_write → daemon-reload → enable --now` 尾部逻辑提取为单一方法。
+  **`_install_systemd_timer()` generic method** — Extracted duplicate `atomic_write → daemon-reload → enable --now` tail logic from 3 timer setup methods.
+
+- **`_fetch_wp_version()` 合并** — 原 `_fetch_wp_latest_version` / `_fetch_wp_zh_version` 两个 90% 重复的方法合并为参数化单一实现。
+  **`_fetch_wp_version()` merged** — Two 90%-duplicate version fetch methods merged into single parameterized implementation.
+
+- **`_try_issue_ecc_with_rsa_fallback()` 共享** — `apply_cert()` 和 `renew_cert()` 的 ECC→RSA 逐 CA 降级逻辑提取为独立方法。
+  **`_try_issue_ecc_with_rsa_fallback()` shared** — ECC→RSA per-CA fallback logic extracted from `apply_cert()` and `renew_cert()`.
+
+- **`_pre_backup()` 统一** — `enable_ssl` / `update_config` / `restore` 三处 pre-backup 逻辑统一为单一方法，含 `_exit_code` 隔离保护。
+  **`_pre_backup()` unified** — Pre-backup logic from 3 subcommands unified with `_exit_code` isolation.
+
+- **SiteConfig 属性提取** — `credentials_file` / `le_live_dir` / `le_archive_dir` / `le_renewal_conf` 提升为 `@property`，消除 15+ 处硬编码路径拼接。
+  **SiteConfig property extraction** — `credentials_file` / `le_live_dir` / `le_archive_dir` / `le_renewal_conf` elevated to `@property`, eliminating 15+ hardcoded path concatenations.
+
+- **GIL 禁用运行时检测** — 检测 `sys._is_gil_enabled()` (PEP 703)，GIL 禁用时跳过无锁快速路径，确保 `_is_china_cloud` / `_detect_nginx_http2_directive` 双重检查锁的正确性。
+  **GIL-disabled runtime detection** — Checks `sys._is_gil_enabled()` (PEP 703); skips lock-free fast paths when GIL is disabled.
+
+- **版本轻量检查频率限制** — `_lightweight_version_check()` 通过时间戳文件限制为每 7 天最多一次，避免 systemd timer 每日 renew 时重复 HTTP 请求。
+  **Version check rate limiting** — `_lightweight_version_check()` limited to once per 7 days via timestamp file.
+
+---
+
+### Internal 内部
+
+- `__version__` 从 `"3.2.0"` 升至 `"3.2.1"`；`__build__` 升至 `"3.2.164"`。
+- `concurrent.futures` 替换为 `threading.Thread`（单个 stderr drain 不值得线程池开销）。
+- `typing.Optional` 直接导入，移除 Python 3.6 fallback 死代码。
+- 备份校验增加 DB dump 期望存在性检查：外置 DB 因密码不可用导致 dump 跳过时不清理旧备份。
+- `_nginx_reset_conflicting_conf()` 增加成对冲突检测和 `nginx.conf` 自身错误预检。
+- `_ensure_wp_cron_constant()` 增加旁路锁文件 `flock` 保护 read-modify-write 周期。
+- `certbot` 锁等待改用 `LOCK_NB` 轮询 + 指数退避 + 随机抖动，替代无超时 `LOCK_EX`。
+- `_do_self_update()` 语法校验 (`compile()`) 在版本比较和 SHA256 校验之后执行。
+- `show_status()` 证书到期时间转换为本地时区并按语言格式化显示。
+- `_detect_existing_sites()` 增加 5 秒进程内缓存，消除交互向导重复扫描开销。
+- 日志脱敏：`_log_journal_tail()` 替换含密码的日志字段；`_SENSITIVE_CLI_ARGS` 清洗 `sys.argv`。
+
 ## [V3.2.0]
 
 > **升级说明 / Upgrade note**
