@@ -18,12 +18,15 @@ One command to deploy WordPress with HTTPS, auto-renewal, and production-grade s
 - **Database security** — auth_socket/unix_socket auto-detection; credentials never exposed in process list (`--defaults-extra-file`); admin password via environment variable (not `/proc/cmdline`)
 - **Multi-source download** — Chinese mirror + global fallback with SHA-256 verification; cross-source hash verification for self-update; WP-CLI fallback when tar.gz sources fail
 - **Strict permissions** — wp-config.php locked to 0440 from creation; `O_NOFOLLOW` on all atomic write paths; SELinux booleans auto-configured
-- **Nginx hardening** — rate limiting on wp-login.php + admin-ajax.php, HSTS, CSP enforcement, wp-config/uploads/xmlrpc/wp-includes deny, HTTP method filtering, cert SAN / server_name auto-alignment, FastCGI cache (optional), Brotli (optional)
+- **Nginx hardening** — rate limiting on wp-login.php + admin-ajax.php, HSTS, CSP enforcement, wp-config/uploads/xmlrpc/wp-includes deny, HTTP method filtering, cert SAN / server_name auto-alignment, FastCGI cache (optional), Redis srcache full-page cache (optional), Brotli (optional), HTTP/3 QUIC (optional)
 - **Fail2Ban** — auto-configured WordPress brute-force protection with progressive banning (24h + escalation)
 - **Auto-renewal** — systemd daily timer with randomized delay, `--cert-name` precision renewal, persistent deploy hook, post-renewal Nginx certificate verification, renewal failure webhook notification
 - **Backup & restore** — one-command backup (DB + files + Nginx + Fail2Ban/logrotate + Let's Encrypt certs); atomic DB restore via RENAME TABLE; external DB retry with exponential backoff
 - **Config hot-update** — `update` subcommand applies new templates without touching data; managed plugin safe-upgrade with health-check rollback
 - **Redis object cache** — optional `--redis`, composable with FastCGI page cache; PHP Redis source-compile fallback; Valkey (EL10+) auto-detection
+- **Redis full-page cache** — optional `--cache redis`, srcache-nginx-module based; auto-compiles 5 OpenResty dynamic modules with ABI verification; auto-degrades to FastCGI on failure
+- **HTTP/3 QUIC** — optional `--http3`; auto-detects Nginx `http_v3` module; auto-opens UDP 443 firewall port; multi-site `reuseport` sharing; silently ignored when unsupported
+- **`--no-*` reverse switches** — `--no-redis` / `--no-optimize` / `--no-cloudflare` / `--no-http3` / `--no-allow-xmlrpc` to explicitly disable auto-detected features during `update`/`enable-ssl`/`restore`
 - **Performance tuning** — PHP-FPM pool auto-sized by RAM, MariaDB InnoDB tuning, BBR + TCP sysctl, swap auto-creation, Nginx `open_file_cache` (`--optimize`)
 - **WordPress Cron offload** — systemd 15-min timer replaces per-request wp-cron.php
 - **Bilingual UI** — Chinese/English; auto-detected from locale, persistable via `--lang`
@@ -44,13 +47,13 @@ sudo python3 wp_ssl_bootstrap.py deploy \
   --email admin@example.com
 ```
 
-With FastCGI cache + Redis:
+With FastCGI cache + Redis + HTTP/3:
 
 ```bash
 sudo python3 wp_ssl_bootstrap.py deploy \
   --domain example.com \
   --email admin@example.com \
-  --cache fastcgi --redis
+  --cache fastcgi --redis --http3
 ```
 
 Two-phase deployment (HTTP first, SSL later):
@@ -99,12 +102,13 @@ All other dependencies (Nginx, PHP-FPM, MariaDB, certbot, etc.) are installed au
 --db-root-pass PASS       MariaDB/MySQL root password (env: WP_DB_ROOT_PASS)
 --no-db-ssl               Disable SSL for external DB (for LAN/VPC direct connect)
 --db-wait-timeout SECS    DB readiness timeout (default: 30s local, 60s external)
---cache {none,fastcgi}    Nginx cache mode
+--cache {none,fastcgi,redis}    Nginx cache mode (redis = srcache full-page cache)
 --redis                   Enable Redis object cache
 --cloudflare              Fetch Cloudflare IP ranges and configure real IP restoration
 --allow-xmlrpc            Allow xmlrpc.php with rate limiting (default: deny)
 --wp-auto-install         Complete WordPress setup wizard automatically via WP-CLI
 --optimize                Enable Nginx open_file_cache for static-heavy sites
+--http3                   Enable HTTP/3 QUIC (requires Nginx http_v3 module)
 --skip-ssl                Deploy HTTP-only (skip SSL); use enable-ssl later
 --force                   Force certificate renewal regardless of expiry (renew)
 --persist-root-pwd        Save MariaDB root password to disk
@@ -119,6 +123,11 @@ All other dependencies (Nginx, PHP-FPM, MariaDB, certbot, etc.) are installed au
 --dry-run                 Simulate without making changes
 --staging                 Use Let's Encrypt staging environment
 --no-staging              Override inherited --staging, force production CA
+--no-redis                Explicitly disable Redis (override auto-detection)
+--no-optimize             Explicitly disable Nginx optimizations
+--no-cloudflare           Explicitly disable Cloudflare Real IP
+--no-http3                Explicitly disable HTTP/3 QUIC
+--no-allow-xmlrpc         Explicitly block xmlrpc.php
 --purge                   Full cleanup: drop DB + remove files + delete certs (uninstall)
 --revoke                  Revoke and delete Let's Encrypt certificate (uninstall)
 --lang {zh,en}            Interface language (persisted after first use)
@@ -161,8 +170,19 @@ sudo python3 wp_ssl_bootstrap.py deploy \
 # Cloudflare reverse proxy + auto-complete WordPress wizard + webhook
 sudo python3 wp_ssl_bootstrap.py deploy \
   --domain example.com --email admin@example.com \
-  --cloudflare --wp-auto-install \
+  --cloudflare --http3 --wp-auto-install \
   --notify-webhook https://hooks.slack.com/services/xxx
+
+# Redis full-page cache (srcache) instead of FastCGI
+sudo python3 wp_ssl_bootstrap.py deploy \
+  --domain example.com --email admin@example.com \
+  --cache redis
+
+# Enable HTTP/3 on existing site
+sudo python3 wp_ssl_bootstrap.py update --domain example.com --http3
+
+# Disable auto-detected Redis during update
+sudo python3 wp_ssl_bootstrap.py update --domain example.com --no-redis
 
 # ZeroSSL as backup CA (auto-failover from Let's Encrypt)
 sudo python3 wp_ssl_bootstrap.py deploy \
@@ -235,12 +255,15 @@ After deployment, credentials are saved to `/root/.wp_credentials_<domain>.txt` 
 - **数据库安全** — auth_socket/unix_socket 自适应；凭据不暴露于进程列表（`--defaults-extra-file`）；管理员密码通过环境变量传递（不经 `/proc/cmdline`）
 - **多源下载** — 中文镜像 + 全球主源 fallback，SHA-256 校验；self-update 双源交叉哈希验证；WP-CLI 兜底
 - **严格权限** — wp-config.php 创建即 0440；所有原子写入路径 `O_NOFOLLOW` 防符号链接攻击；SELinux 布尔值自动配置
-- **Nginx 加固** — wp-login.php + admin-ajax.php 速率限制、HSTS、CSP 强制执行、wp-config/uploads/xmlrpc/wp-includes 拦截、HTTP 方法过滤、证书 SAN 与 server_name 自动对齐、FastCGI 缓存（可选）、Brotli（可选）
+- **Nginx 加固** — wp-login.php + admin-ajax.php 速率限制、HSTS、CSP 强制执行、wp-config/uploads/xmlrpc/wp-includes 拦截、HTTP 方法过滤、证书 SAN 与 server_name 自动对齐、FastCGI 缓存（可选）、Redis srcache 全页缓存（可选）、Brotli（可选）、HTTP/3 QUIC（可选）
 - **Fail2Ban** — 自动配置 WordPress 暴力破解防护，渐进式封禁（24h + 递增）
 - **自动续期** — systemd 每日定时器，随机延迟，`--cert-name` 精准续期，持久化 deploy hook，续期后自动验证 Nginx 证书加载，失败 Webhook 通知
 - **备份恢复** — 一键备份（数据库 + 文件 + Nginx + Fail2Ban/logrotate + Let's Encrypt 证书）；RENAME TABLE 原子恢复；外置 DB 指数退避重试
 - **配置热更新** — `update` 子命令应用新模板，不触碰数据；托管插件安全升级 + 健康检查回滚
 - **Redis 对象缓存** — 可选 `--redis`，可与 FastCGI 页面缓存叠加；PHP Redis 源码编译兜底；Valkey（EL10+）自动检测
+- **Redis 全页缓存** — 可选 `--cache redis`，基于 srcache-nginx-module；自动编译 5 个 OpenResty 动态模块并做 ABI 验证；编译失败自动降级 FastCGI
+- **HTTP/3 QUIC** — 可选 `--http3`；自动探测 Nginx `http_v3` 模块；自动开放 UDP 443 防火墙端口；多站点共享 `reuseport`；不支持时静默忽略
+- **`--no-*` 反向开关** — `--no-redis` / `--no-optimize` / `--no-cloudflare` / `--no-http3` / `--no-allow-xmlrpc` 可在 `update`/`enable-ssl`/`restore` 中显式禁用自动探测到的功能
 - **性能调优** — PHP-FPM 按内存动态调参、MariaDB InnoDB 调优、BBR + TCP sysctl、Swap 自动创建、Nginx `open_file_cache`（`--optimize`）
 - **WordPress Cron 卸载** — systemd 15 分钟定时器替代每请求触发 wp-cron.php
 - **双语界面** — 中英文自动切换，`--lang` 持久化
@@ -261,13 +284,13 @@ sudo python3 wp_ssl_bootstrap.py deploy \
   --email admin@example.com
 ```
 
-启用 FastCGI 缓存 + Redis：
+启用 FastCGI 缓存 + Redis + HTTP/3：
 
 ```bash
 sudo python3 wp_ssl_bootstrap.py deploy \
   --domain example.com \
   --email admin@example.com \
-  --cache fastcgi --redis
+  --cache fastcgi --redis --http3
 ```
 
 两阶段部署（先 HTTP，后补签 SSL）：
@@ -316,12 +339,13 @@ sudo python3 wp_ssl_bootstrap.py enable-ssl \
 --db-root-pass PASS       MariaDB/MySQL root 密码（环境变量: WP_DB_ROOT_PASS）
 --no-db-ssl               禁用外置数据库 SSL 传输（内网直连场景）
 --db-wait-timeout SECS    数据库就绪等待超时（默认: 本地 30s / 外置 60s）
---cache {none,fastcgi}    Nginx 缓存模式
+--cache {none,fastcgi,redis}    Nginx 缓存模式（redis = srcache 全页缓存）
 --redis                   启用 Redis 对象缓存
 --cloudflare              从 Cloudflare API 获取 IP 段并配置真实 IP 还原
 --allow-xmlrpc            放开 xmlrpc.php（默认拒绝，启用后为速率限制透传）
 --wp-auto-install         通过 WP-CLI 自动完成 WordPress 安装向导
 --optimize                启用 Nginx open_file_cache，适合静态资源密集站点
+--http3                   启用 HTTP/3 QUIC 协议（需 Nginx http_v3 模块）
 --skip-ssl                仅部署 HTTP（跳过 SSL）；后续用 enable-ssl 补签
 --force                   强制续期证书，忽略到期时间（renew）
 --persist-root-pwd        将 MariaDB root 密码保存至磁盘
@@ -336,6 +360,11 @@ sudo python3 wp_ssl_bootstrap.py enable-ssl \
 --dry-run                 演练模式，不执行写操作
 --staging                 使用 Let's Encrypt Staging 环境
 --no-staging              覆盖继承的 --staging，强制使用生产 CA
+--no-redis                显式禁用 Redis（覆盖自动探测）
+--no-optimize             显式禁用 Nginx 优化
+--no-cloudflare           显式禁用 Cloudflare Real IP
+--no-http3                显式禁用 HTTP/3 QUIC
+--no-allow-xmlrpc         显式封锁 xmlrpc.php
 --purge                   彻底清理: 删除数据库 + 文件 + 证书（uninstall）
 --revoke                  吊销并删除 Let's Encrypt 证书（uninstall）
 --lang {zh,en}            界面语言（首次指定后自动持久化）
@@ -375,11 +404,22 @@ sudo python3 wp_ssl_bootstrap.py deploy \
   --db-host rds.example.com --db-root-pass 'YourPassword' \
   --db-wait-timeout 120
 
-# Cloudflare 反代 + 自动完成安装向导 + 失败通知
+# Cloudflare 反代 + HTTP/3 + 自动完成安装向导 + 失败通知
 sudo python3 wp_ssl_bootstrap.py deploy \
   --domain example.com --email admin@example.com \
-  --cloudflare --wp-auto-install \
+  --cloudflare --http3 --wp-auto-install \
   --notify-webhook https://hooks.slack.com/services/xxx
+
+# Redis 全页缓存（srcache，替代 FastCGI）
+sudo python3 wp_ssl_bootstrap.py deploy \
+  --domain example.com --email admin@example.com \
+  --cache redis
+
+# 事后开启 HTTP/3
+sudo python3 wp_ssl_bootstrap.py update --domain example.com --http3
+
+# 更新时显式关闭自动探测到的 Redis
+sudo python3 wp_ssl_bootstrap.py update --domain example.com --no-redis
 
 # ZeroSSL 备用 CA（Let's Encrypt 失败时自动切换）
 sudo python3 wp_ssl_bootstrap.py deploy \

@@ -1,32 +1,30 @@
-# V3.2.1 — Stability & Security Hardening Release
+# V3.2.2 — Feature & Stability Hardening Release
 
 One-command WordPress + HTTPS deployment engine for production Linux servers.
 
-## What's New in V3.2.1
+## What's New in V3.2.2
 
-V3.2.1 refines V3.2.0 through 160+ internal iterations, 4 independent security audit rounds, and extensive real-world testing across EL7–10, Ubuntu, and Debian.
+V3.2.2 refines V3.2.1 through 44 internal iterations plus 8 independent deep audit rounds, adding major new features and fixing 40+ defects across crash safety, credential inheritance, config detection, and cross-path alignment.
 
-🔒 **4 security audit rounds** — 50+ findings fixed: SSRF protection for webhooks, `O_NOFOLLOW` on all write paths, admin password via env var (not `/proc/cmdline`), SQL control character interception, cross-source SHA-256 verification for self-update, tar path traversal detection on restore.
+🚀 **HTTP/3 QUIC (`--http3`)** — auto-detects Nginx `http_v3` module; generates QUIC `listen` directives and `Alt-Svc` headers; auto-opens UDP 443 firewall port (firewalld/ufw/iptables); shares `reuseport` across multi-site; silently ignored when unsupported. Interactive wizard auto-recommends based on Nginx capability.
 
-🗄️ **Atomic database restore** — `restore` now imports to a temp database, then swaps tables via a single `RENAME TABLE` statement. Interruption leaves the live database completely intact.
+🗄️ **Redis full-page cache (`--cache redis`)** — srcache-nginx-module based Redis page cache; auto-compiles 5 OpenResty dynamic modules (ngx_devel_kit / set-misc / echo / redis2 / srcache) with ABI pre-check and runtime worker survival verification; auto-degrades to FastCGI on compile failure; auto-installs Redis if unavailable; nginx-helper plugin auto-adapts cache purge protocol.
 
-🔐 **ECDSA certificates** — prefers ECDSA P-256 key type (faster TLS handshake); auto-falls back to RSA per-CA if unsupported.
+🔀 **`--no-*` reverse switches** — new `--no-redis` / `--no-optimize` / `--no-cloudflare` / `--no-http3` / `--no-allow-xmlrpc` flags for `update`/`enable-ssl`/`restore` to explicitly disable auto-detected features and prevent `_apply_auto_detected_config()` from overriding user intent.
 
-📡 **Renewal failure webhook** — `--notify-webhook URL` sends a JSON POST to Slack / Lark / WeCom when SSL renewal fails. HTTPS enforced; private IPs and internal domains blocked.
+🔍 **Auto config detection** — `update`/`enable-ssl`/`restore` automatically inherit `cache`/`redis`/`optimize`/`http3`/`cloudflare`/`allow_xmlrpc` from existing Nginx config and `wp-config.php` — no need to re-pass flags each time.
 
-🧹 **Full site purge** — `uninstall --purge` drops the database, removes webroot, and deletes certificates (interactive confirmation required). `--revoke` revokes the certificate with Let's Encrypt.
+🛒 **WooCommerce cache exclusion** — FastCGI cache automatically detects WooCommerce cart/checkout/my-account pages and session cookies; bypasses cache to prevent cart data leaking across users.
 
-🐧 **EL10 / dnf5 full compatibility** — Redis/Valkey multi-package candidate auto-selection; `php-json` only added for PHP < 8; dnf5 detection elevated to instance attribute.
+🔒 **EAB/webhook credentials secured** — ZeroSSL EAB and webhook URL moved from systemd ExecStart to EnvironmentFile (0o600), preventing `/proc/<pid>/cmdline` exposure. Timer parameter inheritance now reads from EnvironmentFile with systemd double-quote unescape.
 
-🔄 **Plugin safe-upgrade** — `update` subcommand upgrades nginx-helper and redis-cache plugins with post-upgrade health checks; auto-rolls back to previous version on failure.
+💥 **Crash-safe wp-config writes** — 3 O_TRUNC write sites in `_ensure_wp_cron_constant_locked` replaced with atomic tmp+fsync+replace, preventing zero-byte wp-config.php on OOM kill (white screen 500).
 
-📋 **Pre-operation backup** — `enable-ssl`, `update`, and `restore` automatically create a lightweight backup (DB + Nginx config) before making changes. Skip with `--no-pre-backup`.
+🔧 **`uninstall` cron fix** — `uninstall` now reverts `DISABLE_WP_CRON=true` in wp-config.php; previously WordPress built-in cron was permanently broken after uninstall (auto-updates, scheduled posts, trash cleanup all disabled).
 
-🎯 **Smart domain inference** — non-deploy subcommands auto-select the domain when only one site is deployed; `status` without any deployed sites shows a lightweight system health overview.
+🔗 **EnvironmentFile inheritance** — `_extract_timer_params` now reads credentials from `.env` files (PATCH-190 moved them from ExecStart but inheritance was not updated); `update`/`enable-ssl`/`restore` no longer silently lose ZeroSSL CA failover and webhook notifications.
 
-🔀 **`--no-staging` override** — explicitly switch from staging to production CA without editing systemd unit files.
-
-📊 **Cert SAN alignment** — Nginx `server_name` and WordPress `siteurl`/`home` auto-aligned with certificate SAN, preventing HTTPS redirect loops when cert lacks `www`.
+📊 **8-round deep audit** — 17 defects found and fixed across comment stripping consistency, xmlrpc detection regression, fastcgi cache dir alignment, long-domain systemd prefix truncation, and more.
 
 ## Highlights
 
@@ -36,7 +34,7 @@ V3.2.1 refines V3.2.0 through 160+ internal iterations, 4 independent security a
 
 🌐 **Multi-distro** — tested on EL7–10 (RHEL / CentOS / AlmaLinux / Rocky / Alibaba Cloud Linux), Ubuntu 20.04–24.04, Debian 11–12.
 
-⚡ **Performance options** — FastCGI page cache, Redis object cache (with source-compile fallback + Valkey support), Brotli compression, ECDSA certificates (all optional, composable).
+⚡ **Performance options** — FastCGI page cache, Redis full-page cache (srcache), Redis object cache (with source-compile fallback + Valkey support), HTTP/3 QUIC, Brotli compression, ECDSA certificates (all optional, composable).
 
 📦 **Ops toolkit** — `backup`, `restore`, `update`, `enable-ssl`, `status`, `self-update`, `uninstall` subcommands for day-2 operations — with atomic DB restore, plugin safe-upgrade, and webhook alerting.
 
@@ -53,18 +51,39 @@ sudo python3 wp_ssl_bootstrap.py deploy \
   --domain example.com \
   --email admin@example.com
 
+# Full performance stack: FastCGI + Redis + HTTP/3
+sudo python3 wp_ssl_bootstrap.py deploy \
+  --domain example.com \
+  --email admin@example.com \
+  --cache fastcgi --redis --http3
+
+# Redis full-page cache (srcache, replaces FastCGI)
+sudo python3 wp_ssl_bootstrap.py deploy \
+  --domain example.com \
+  --email admin@example.com \
+  --cache redis
+
 # Two-phase: HTTP first, SSL later
 sudo python3 wp_ssl_bootstrap.py deploy --domain example.com --skip-ssl
 sudo python3 wp_ssl_bootstrap.py enable-ssl --domain example.com --email admin@example.com
 
-# With webhook notification on renewal failure
-sudo python3 wp_ssl_bootstrap.py deploy \
-  --domain example.com \
-  --email admin@example.com \
-  --notify-webhook https://hooks.slack.com/services/xxx
+# Enable HTTP/3 on existing site
+sudo python3 wp_ssl_bootstrap.py update --domain example.com --http3
+
+# Disable auto-detected Redis during update
+sudo python3 wp_ssl_bootstrap.py update --domain example.com --no-redis
 ```
 
 See [deploy-guide.md](./deploy-guide.md) for scenario-based examples and [README.md](./README.md) for full documentation.
+
+## Upgrade from V3.2.1
+
+```bash
+# Replace script file, then:
+sudo python3 wp_ssl_bootstrap.py update --domain example.com
+```
+
+New features (HTTP/3, Redis srcache, auto config detection, `--no-*` switches, WooCommerce cache exclusion) activate automatically. Existing timers inherit parameters from EnvironmentFile — no manual reconfiguration needed. PATCH-203~208 fixes (crash-safe wp-config writes, uninstall cron revert, credential inheritance) apply immediately.
 
 ## Upgrade from V3.2.0
 
@@ -73,7 +92,7 @@ See [deploy-guide.md](./deploy-guide.md) for scenario-based examples and [README
 sudo python3 wp_ssl_bootstrap.py update --domain example.com
 ```
 
-New features (webhook notification, pre-operation backup, plugin safe-upgrade, cert SAN alignment, OS auto-security-updates) activate automatically. Existing SSL timers inherit parameters from previous unit files — no manual reconfiguration needed.
+All V3.2.1 + V3.2.2 features activate automatically. Existing SSL timers inherit parameters from previous unit files.
 
 ## Upgrade from V3.1.x
 
@@ -82,17 +101,22 @@ New features (webhook notification, pre-operation backup, plugin safe-upgrade, c
 sudo python3 wp_ssl_bootstrap.py update --domain example.com
 ```
 
-All V3.2.0 + V3.2.1 configs (Brotli / Cloudflare / Fail2Ban / logrotate / systemd timers / webhook) rebuild automatically.
+All V3.2.0 + V3.2.1 + V3.2.2 configs (Brotli / Cloudflare / Fail2Ban / logrotate / systemd timers / webhook / HTTP/3 / srcache) rebuild automatically.
 
-## Key Bug Fixes
+## Key Bug Fixes (V3.2.2)
 
-- **Atomic DB restore** — `restore` no longer leaves the database in a half-imported state on interruption
-- **Cert SAN / Nginx mismatch** — HTTPS config auto-aligns `server_name` with certificate SAN, fixing redirect loops when cert lacks `www`
-- **WordPress URL / cert mismatch** — `siteurl`/`home` now set using cert-aware canonical domain after `enable-ssl`
-- **Credentials file password loss** — credential rewrite no longer blanks `db_pass`/`db_root_pass`
-- **MariaDB version detection** — no longer selects `caching_sha2_password` for MariaDB (which doesn't support it)
-- **Timer activation race** — `DISABLE_WP_CRON` no longer reverted to `false` due to systemd activation delay
-- **IPv6 bracket handling** — `openssl s_client` and MySQL connections correctly bracket IPv6 addresses
+- **Crash-safe wp-config writes** — 3 O_TRUNC sites replaced with atomic tmp+fsync+replace (OOM kill no longer produces zero-byte file)
+- **`uninstall` cron revert** — `DISABLE_WP_CRON=true` now reverted on uninstall (WordPress cron no longer permanently broken)
+- **EnvironmentFile credential inheritance** — ZeroSSL EAB and webhook no longer silently lost when timers are rebuilt
+- **xmlrpc detection regression** — `allow_xmlrpc` no longer false-negative when Nginx comments contain `xmlrpc` far from actual location block
+- **restore path alignment** — `_apply_auto_detected_config()`, `_ensure_fastcgi_cache_dir()`, `_align_nginx_with_cert()` all added to restore path
+- **Long-domain systemd prefix** — interactive `update`/`enable-ssl` no longer silently loses inherited params for domains >48 chars after encoding
+- **mysqldump stderr ERROR** — exit 0 with stderr ERROR now detected and marked as partial backup
+- **MySQL identifier overflow** — `RENAME TABLE` temp names truncated to 64-char MySQL limit
+- **VIEW migration in restore** — VIEWs now migrated via `CREATE`+`DROP` (not supported by `RENAME TABLE`)
+- **DEFINER clause stripping** — cross-server restore no longer fails on `DEFINER` permission errors
+- **gzip pipe verification** — backup pipeline now verifies both mysqldump and gzip exit codes
+- **select-based pipe drain** — stderr drain threads no longer leak on child process exit
 
 ## Requirements
 

@@ -1,5 +1,5 @@
-# WP-SSL-Bootstrap V3.2.1 — 全新建站参数指南
-# WP-SSL-Bootstrap V3.2.1 — New Site Deployment Guide
+# WP-SSL-Bootstrap V3.2.2 — 全新建站参数指南
+# WP-SSL-Bootstrap V3.2.2 — New Site Deployment Guide
 
 ---
 
@@ -25,7 +25,7 @@ Confirm the following before running the script — these cannot be automated:
 > 输入 `www.example.com` 时脚本自动归一为 `example.com`，`www` 作为别名写入证书。子域名（如 `blog.example.com`）自动跳过 `www` 变体。  
 > Input `www.example.com` is auto-normalized to `example.com`; `www` is added as a certificate alias. Subdomains (e.g. `blog.example.com`) automatically skip the `www` variant.
 
-> **💡 单站点自动推断 / Single-Site Auto Inference** *(V3.2.1 新增 / New)*  
+> **💡 单站点自动推断 / Single-Site Auto Inference** *(V3.2.1+ 起 / Since V3.2.1)*  
 > 除 `deploy` 外的子命令，若未指定 `--domain` 且服务器上仅有一个已部署站点，脚本自动使用该域名，无需重复输入。  
 > For non-deploy subcommands, if `--domain` is omitted and only one site is deployed, the script auto-selects it.
 
@@ -81,6 +81,7 @@ python3 wp_ssl_bootstrap.py deploy \
   --cache   fastcgi \
   --redis \
   --optimize \
+  --http3 \
   --cloudflare \
   --wp-auto-install \
   --persist-root-pwd \
@@ -93,6 +94,7 @@ python3 wp_ssl_bootstrap.py deploy \
 |---|---|
 | `--redis` | 启用 Redis 对象缓存，与 FastCGI 页面缓存**叠加**：FastCGI 缓存完整 HTML，Redis 缓存数据库查询；已登录用户（绕过 FastCGI 缓存）同样受益。<br>Enables Redis object cache on top of FastCGI page cache. FastCGI caches full HTML; Redis caches DB queries. Logged-in users (who bypass FastCGI) also benefit. |
 | `--optimize` | 启用 Nginx `open_file_cache`（`max=10000 inactive=60s`），减少静态文件密集请求时的内核 `stat()` 调用。<br>Enables Nginx `open_file_cache` (`max=10000 inactive=60s`), reducing kernel `stat()` calls for static-asset-heavy traffic. |
+| `--http3` | *(V3.2.2 新增 / New)* 启用 HTTP/3 QUIC 协议（需 Nginx 支持 `http_v3` 模块）。自动开放 UDP 443 防火墙端口，多站点自动共享 `reuseport`。Nginx 不支持时静默忽略。<br>Enables HTTP/3 QUIC protocol (requires Nginx `http_v3` module). Auto-opens UDP 443 firewall port; shares `reuseport` across sites. Silently ignored if Nginx lacks support. |
 | `--cloudflare` | 自动从 Cloudflare API 拉取最新 IP 段，写入全局 `real_ip_from` + `CF-Connecting-IP` 配置，确保日志和 Fail2Ban 记录访客真实 IP 而非 CF 节点 IP；获取失败时回退内置默认值。<br>Auto-fetches Cloudflare IP ranges and writes a global `real_ip_from` + `CF-Connecting-IP` config so logs and Fail2Ban see visitor IPs, not Cloudflare node IPs. Falls back to built-in defaults on fetch failure. |
 | `--notify-webhook` | 续期失败时发送 Webhook 通知（Slack / 飞书 / 企微等）。仅允许 HTTPS URL，内网地址会被安全策略拒绝。<br>Sends a Webhook notification on renewal failure (Slack / Lark / WeCom). HTTPS only; internal URLs are blocked by security policy. |
 
@@ -155,8 +157,12 @@ python3 wp_ssl_bootstrap.py deploy \
 调试完成后执行一次不带 `--staging` 的 `deploy` 或 `renew --force --no-staging` 替换为正式证书。Staging 证书不受浏览器信任，仅用于流程验证。  
 Once debugging is complete, run `deploy` (or `renew --force --no-staging`) without `--staging` to replace it with a trusted certificate. Staging certificates are not browser-trusted.
 
-> **`--no-staging`** *(V3.2.1 新增 / New)* — 显式覆盖从已有定时器继承的 `--staging` 标志，强制切换回生产 CA。  
+> **`--no-staging`** *(V3.2.1+ 起 / Since V3.2.1)* — 显式覆盖从已有定时器继承的 `--staging` 标志，强制切换回生产 CA。  
 > Explicitly overrides `--staging` inherited from existing timer config, forcing production CA.
+
+> **💡 自动配置探测 / Automatic Config Detection** *(V3.2.2 新增 / New)*
+> `update` / `enable-ssl` / `restore` 子命令会自动从现有 Nginx 配置和 `wp-config.php` 中探测 `cache` / `redis` / `optimize` / `http3` / `cloudflare` / `allow_xmlrpc` 等设置，无需每次重复传参。若需显式**关闭**某项自动探测到的功能，使用 `--no-*` 反向开关（如 `--no-http3`、`--no-redis`）。
+> `update` / `enable-ssl` / `restore` automatically detect `cache`/`redis`/`optimize`/`http3`/`cloudflare`/`allow_xmlrpc` from existing Nginx config and `wp-config.php` — no need to re-pass flags each time. To explicitly **disable** an auto-detected feature, use `--no-*` reverse flags (e.g. `--no-http3`, `--no-redis`).
 
 ---
 
@@ -247,8 +253,8 @@ python3 wp_ssl_bootstrap.py enable-ssl \
 | `--skip-ssl` | 跳过 SSL 签发，生成完整的 HTTP 生产 Nginx 配置。`wp-config.php` 中 `FORCE_SSL_ADMIN` 设为 `false`。<br>Skips SSL issuance; generates a full HTTP production Nginx config. `FORCE_SSL_ADMIN` is set to `false` in `wp-config.php`. |
 | `enable-ssl` | 新子命令：为已有 HTTP 站点签发证书并切换至 HTTPS。自动恢复 `FORCE_SSL_ADMIN`、更新 siteurl/home、安装 systemd 续期定时器。<br>New subcommand: signs a certificate for an existing HTTP site and switches to HTTPS. Auto-restores `FORCE_SSL_ADMIN`, updates siteurl/home, installs systemd renewal timer. |
 
-> **注意 / Note**：`enable-ssl` 支持与 `deploy` 相同的 `--cache` / `--redis` / `--cloudflare` / `--optimize` / `--wp-auto-install` / `--notify-webhook` 标志。  
-> `enable-ssl` supports the same `--cache` / `--redis` / `--cloudflare` / `--optimize` / `--wp-auto-install` / `--notify-webhook` flags as `deploy`.
+> **注意 / Note**：`enable-ssl` 支持与 `deploy` 相同的 `--cache` / `--redis` / `--cloudflare` / `--optimize` / `--http3` / `--wp-auto-install` / `--notify-webhook` 标志，以及 `--no-*` 反向开关。
+> `enable-ssl` supports the same `--cache` / `--redis` / `--cloudflare` / `--optimize` / `--http3` / `--wp-auto-install` / `--notify-webhook` flags as `deploy`, plus `--no-*` reverse switches.
 
 ---
 
@@ -362,6 +368,18 @@ python3 wp_ssl_bootstrap.py update \
   --cache  fastcgi \
   --redis
 
+# 切换到 Redis 全页缓存（替代 FastCGI，V3.2.2 新增）
+# Switch to Redis full-page cache (replaces FastCGI, new in V3.2.2)
+python3 wp_ssl_bootstrap.py update \
+  --domain example.com \
+  --cache  redis
+
+# 事后开启 HTTP/3（V3.2.2 新增）
+# Enable HTTP/3 after the fact (new in V3.2.2)
+python3 wp_ssl_bootstrap.py update \
+  --domain example.com \
+  --http3
+
 # 从备份恢复 / Restore from backup
 python3 wp_ssl_bootstrap.py restore \
   --domain example.com
@@ -378,10 +396,11 @@ python3 wp_ssl_bootstrap.py self-update
 |---|---|---|---|
 | `--domain` | 字符串 / string | `$WP_DOMAIN` | 全部 / all |
 | `--email` | 字符串 / string | `$WP_EMAIL` | `deploy` / `enable-ssl` / `renew` / `update` / `restore` |
-| `--cache` | `none` / `fastcgi` | `none` | `deploy` / `update` / `enable-ssl` / `restore` |
+| `--cache` | `none` / `fastcgi` / `redis` | `none` | `deploy` / `update` / `enable-ssl` / `restore` |
 | `--redis` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` / `restore` |
 | `--optimize` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` / `restore` |
 | `--cloudflare` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` / `restore` |
+| `--http3` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` / `restore` |
 | `--wp-auto-install` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` / `restore` |
 | `--persist-root-pwd` | 开关 / flag | 关 / off | `deploy` / `enable-ssl` / `backup` / `restore` |
 | `--skip-ssl` | 开关 / flag | 关 / off | `deploy` / `restore` |
@@ -399,6 +418,11 @@ python3 wp_ssl_bootstrap.py self-update
 | `--keep` | 整数 / integer | `5` | `backup` |
 | `--staging` | 开关 / flag | 关 / off | `deploy` / `enable-ssl` |
 | `--no-staging` | 开关 / flag | 关 / off | `renew` / `update` / `restore` / `enable-ssl` |
+| `--no-redis` | 开关 / flag | 关 / off | `update` / `enable-ssl` / `restore` |
+| `--no-optimize` | 开关 / flag | 关 / off | `update` / `enable-ssl` / `restore` |
+| `--no-cloudflare` | 开关 / flag | 关 / off | `update` / `enable-ssl` / `restore` |
+| `--no-http3` | 开关 / flag | 关 / off | `update` / `enable-ssl` / `restore` |
+| `--no-allow-xmlrpc` | 开关 / flag | 关 / off | `update` / `enable-ssl` / `restore` |
 | `--dry-run` | 开关 / flag | 关 / off | 全部 / all |
 | `--force` | 开关 / flag | 关 / off | `renew` |
 | `--purge` | 开关 / flag | 关 / off | `uninstall` |

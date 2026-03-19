@@ -4,6 +4,148 @@ All notable changes to WP-SSL-Bootstrap are documented in this file.
 本文件记录 WP-SSL-Bootstrap 的所有重要变更。
 ---
 
+## [V3.2.2]
+
+> **升级说明 / Upgrade note**
+> V3.2.2 是 V3.2.1 之后经过 44 轮内部迭代 + 8 轮独立深度审计的功能与稳定性强化版本。
+> 新增 HTTP/3 QUIC 支持、Redis 全页缓存（srcache）、`--no-*` 反向开关；
+> 累计修复 40+ 项缺陷，涵盖崩溃安全、凭据继承、配置探测一致性、跨路径对齐等。
+> 从 V3.2.1 升级时，直接替换脚本文件并执行 `update` 子命令即可。
+>
+> V3.2.2 is a feature and stability hardening release after V3.2.1, refined through
+> 44 internal iterations plus 8 independent deep audit rounds. Adds HTTP/3 QUIC,
+> Redis full-page cache (srcache), and `--no-*` reverse switches; fixes 40+ defects
+> across crash safety, credential inheritance, config detection, and cross-path alignment.
+> To upgrade from V3.2.1, replace the script and run the `update` subcommand.
+
+---
+
+### ✨ 新功能 / New Features
+
+- **HTTP/3 QUIC 支持 (`--http3`)** — 自动探测 Nginx `http_v3` 模块，生成 QUIC `listen` 指令和 `Alt-Svc` 响应头；自动开放 UDP 443 防火墙端口（firewalld / ufw / iptables）；多站点共享 `reuseport` 避免冲突；Nginx 不支持时静默忽略。交互式向导根据 Nginx 能力自动推荐。
+  **HTTP/3 QUIC support (`--http3`)** — Auto-detects Nginx `http_v3` module; generates QUIC `listen` directives and `Alt-Svc` headers; auto-opens UDP 443 firewall port; shares `reuseport` across multi-site; silently ignored when Nginx lacks support. Interactive wizard auto-recommends based on Nginx capability.
+
+- **Redis 全页缓存 (`--cache redis`)** — 基于 srcache-nginx-module 的 Redis 全页缓存，自动编译 5 个 OpenResty 动态模块（ngx_devel_kit / set-misc / echo / redis2 / srcache），ABI 完整性预检 + 运行时 worker 存活验证；编译失败自动降级为 FastCGI 缓存；Redis 不可用时自动安装并启动，启动失败再降级；nginx-helper 插件自动适配缓存清理协议。
+  **Redis full-page cache (`--cache redis`)** — srcache-nginx-module based Redis page cache; auto-compiles 5 OpenResty dynamic modules with ABI pre-check and runtime worker survival verification; auto-degrades to FastCGI on compile failure; auto-installs Redis if unavailable; nginx-helper plugin auto-adapts cache purge protocol.
+
+- **`--no-*` 反向开关** — `update` / `enable-ssl` / `restore` 新增 `--no-redis` / `--no-optimize` / `--no-cloudflare` / `--no-http3` / `--no-allow-xmlrpc` 反向开关，显式禁用自动探测到的功能，阻止 `_apply_auto_detected_config()` 覆盖用户降级意图。
+  **`--no-*` reverse switches** — New `--no-redis` / `--no-optimize` / `--no-cloudflare` / `--no-http3` / `--no-allow-xmlrpc` flags for `update`/`enable-ssl`/`restore` to explicitly disable auto-detected features.
+
+- **跨子命令自动配置探测** — `update` / `enable-ssl` / `restore` 通过 `_apply_auto_detected_config()` 从现有 Nginx 配置和 `wp-config.php` 自动继承 `cache` / `redis` / `optimize` / `http3` / `cloudflare` / `allow_xmlrpc`，无需每次重复传参。
+  **Cross-subcommand auto config detection** — `_apply_auto_detected_config()` auto-inherits settings from existing Nginx config and `wp-config.php`, eliminating the need to re-pass flags on every run.
+
+- **FastCGI 缓存 WooCommerce 智能排除** — 检测 WooCommerce 购物车/结账/我的账户页面和会话 Cookie，自动跳过缓存，防止购物车内容串用户。
+  **FastCGI cache WooCommerce smart exclusion** — Detects WooCommerce cart/checkout/my-account pages and session cookies; auto-bypasses cache to prevent cart data leaking across users.
+
+- **FastCGI 缓存大小动态计算** — `max_size` 按系统内存分级：≤1 GB→64m，≤2 GB→128m，≤4 GB→256m，>4 GB→512m，替代原硬编码 200m。
+  **Dynamic FastCGI cache sizing** — `max_size` tiered by system RAM (64m–512m), replacing hardcoded 200m.
+
+- **交互式向导增强** — 部署向导根据系统内存自动推荐 FastCGI（<512 MB）或 Redis srcache（≥512 MB）缓存策略；更新向导支持 Redis srcache 与 FastCGI 互斥 toggle；缓存模式、HTTP/3 等选项按环境能力动态推荐。
+  **Enhanced interactive wizard** — Deploy wizard auto-recommends cache strategy by RAM; update wizard supports mutually exclusive Redis srcache / FastCGI toggle; options dynamically recommended by environment capability.
+
+---
+
+### 🔒 安全增强 / Security Enhancements
+
+- **EAB/Webhook 凭据移入 EnvironmentFile** — ZeroSSL EAB 凭据和 Webhook URL 从 systemd ExecStart 移至 `.env` 文件（0o600），防止 `/proc/<pid>/cmdline` 泄露。argparse `default=os.environ.get()` 透明读取。
+  **EAB/webhook credentials moved to EnvironmentFile** — Moved from systemd ExecStart to `.env` file (0o600) to prevent `/proc/<pid>/cmdline` exposure. argparse `default=os.environ.get()` reads transparently.
+
+- **继承参数校验** — `setup_systemd()` 从已有 timer 继承 email / webhook / EAB 时，执行 SiteConfig 同等格式校验（email 正则 + 长度 + `..` 检测、webhook SSRF 校验、EAB 白名单校验），拒绝恶意注入。
+  **Inherited parameter validation** — Timer parameter inheritance now validates email (regex + length + `..`), webhook (SSRF check), and EAB (charset whitelist) before accepting inherited values.
+
+- **PHP 注释感知 `define()` 检测** — `inject_wp_hardening()` / `_set_force_ssl_admin()` 排除 PHP `//` 和 `/* */` 注释中的 `define()` 调用，防止注释残留的旧常量干扰注入逻辑。
+  **PHP comment-aware `define()` detection** — Excludes `define()` calls inside PHP comments from detection, preventing stale commented-out constants from interfering with injection logic.
+
+- **Webhook 通知脚本 POSIX 兼容** — 续期失败通知脚本改用 POSIX sh 兼容语法（`case` 替代 bash `=~`），支持 Alpine / BusyBox 环境。运行时 DNS 重解析 + CDN IP 轮换安全放行 + 私有 IP 阻断。
+  **Webhook notification script POSIX compatible** — Rewritten in POSIX sh (Alpine/BusyBox safe) with runtime DNS re-resolve, CDN IP rotation allowance, and private IP blocking.
+
+- **srcache 动态模块 ABI 验证** — 编译后执行 `nginx -t` + worker 进程存活探测（两轮，含 HTTP 请求触发），检测模块与 Nginx 二进制的 ABI 不兼容，不兼容时自动回滚并降级 FastCGI。
+  **srcache dynamic module ABI verification** — Post-compile `nginx -t` + two-round worker survival probe (with HTTP request trigger) detects ABI mismatch; auto-rolls back and degrades to FastCGI on mismatch.
+
+---
+
+### 🐛 问题修复 / Bug Fixes
+
+- **[PATCH-165] WP-CLI 更新 + 插件版本检测** — `update` 路径新增 WP-CLI 自身更新检查；nginx-helper / redis-cache 插件区分 "已更新" 和 "已是最新版本"。
+  **WP-CLI update + plugin version detection** — `update` path checks for WP-CLI self-update; plugin messages distinguish "updated" from "already latest".
+
+- **[PATCH-186] mysqldump stderr ERROR 误判** — `mysqldump` exit 0 但 stderr 含 ERROR（如 view 依赖缺失）时原实现忽略，导致损坏的备份被保留。现标记为 partial 备份，阻止旧备份清理。
+  **mysqldump stderr ERROR false negative** — `mysqldump` exit 0 with stderr ERROR (e.g. view dependency) was silently ignored. Now marked as partial backup, blocking old backup cleanup.
+
+- **[PATCH-190] gzip 管道校验 + heredoc 解析** — 备份管道新增 gzip 退出码校验（原仅检查 mysqldump）；PHP `define()` 注入器新增 heredoc/nowdoc 字符串跳过，防止 heredoc 内容被误修改。
+  **gzip pipe verification + heredoc parsing** — Backup pipeline now verifies gzip exit code (was only checking mysqldump); PHP `define()` injector skips heredoc/nowdoc strings.
+
+- **[PATCH-191] MySQL 标识符 64 字符溢出** — `RENAME TABLE` 临时表名生成未考虑 MySQL 64 字符限制，长表名 + `_rt` + 随机后缀溢出导致 `RENAME` 失败。现截断至 45+3+16=64。
+  **MySQL identifier 64-char overflow** — `RENAME TABLE` temp name exceeded 64-char MySQL limit for long table names. Now truncated to 45+3+16=64.
+
+- **[PATCH-192] 备份增强** — `mysqldump` 新增 `--routines` / `--triggers` / `--events` 参数保留存储过程/触发器/事件；DB dump 完整性检查增加 gzip CRC 验证 + `Dump completed` 标记检测。
+  **Backup enhancements** — `mysqldump` now includes `--routines`/`--triggers`/`--events`; DB dump integrity adds gzip CRC verification and `Dump completed` marker detection.
+
+- **[PATCH-195] VIEW 迁移 + Nginx 注释剥离** — `RENAME TABLE` 原子恢复新增 VIEW 迁移支持（VIEW 不支持 `RENAME`，改用 `CREATE VIEW` + `DROP VIEW`）；Nginx 注释剥离器增加 regex location 上下文追踪，防止 `~*` 模式中的 `#` 被误剥离。
+  **VIEW migration + Nginx comment strip** — Atomic `RENAME TABLE` restore now migrates VIEWs (via `CREATE`+`DROP`); Nginx comment stripper tracks regex location context to protect `#` inside `~*` patterns.
+
+- **[PATCH-198] DISABLE_WP_CRON 错误处理** — 3 处 `_write_bytes_to_fd` 写入 `wp-config.php` 失败时原实现 fall-through 到下一分支导致双重注入。现每处失败后立即 `return`。
+  **DISABLE_WP_CRON error handling** — 3 `_write_bytes_to_fd` failure sites in wp-config.php fell through to next branch causing double injection. Now each failure returns immediately.
+
+- **[PATCH-199] select-based 管道 drain** — 备份/恢复管道的 stderr 读取从阻塞式 `pipe.read()` 改为 `select.select()` 非阻塞 drain，子进程退出时可靠检测 EOF，消除 drain 线程残留。
+  **select-based pipe drain** — Backup/restore pipe stderr drain switched from blocking `pipe.read()` to `select.select()` non-blocking drain; reliably detects EOF on child exit.
+
+- **[PATCH-200] 插件更新去重 + 凭据白名单** — `_update_managed_plugins()` 追踪已处理插件，防止下游 `_install_nginx_helper()` / `_setup_redis_cache()` 重复操作；凭据文件恢复密码增加 `_is_safe_password()` 白名单校验。
+  **Plugin update dedup + credential whitelist** — Plugin tracking prevents downstream methods from re-processing; credential file password recovery validates against `_is_safe_password()`.
+
+- **[PATCH-201] 多项安全修复** — `_safe_write_file` 新建路径增加 symlink 二次检查；`_write_mysql_defaults_file` 密码转义增加 `#!$` 特殊字符；`_in_php_comment` 提升为模块级函数消除 5 处重复。
+  **Multiple safety fixes** — `_safe_write_file` adds symlink re-check for new paths; MySQL defaults file escapes `#!$` characters; `_in_php_comment` elevated to module-level eliminating 5 duplicates.
+
+- **[PATCH-202] restore DEFINER 剥离 + 自动探测共享** — `RENAME TABLE` 恢复新增 `DEFINER` 子句剥离（防止跨服务器恢复时权限错误）；`_apply_auto_detected_config()` 提取为共享方法，`enable_ssl` / `update_config` 统一调用。
+  **restore DEFINER strip + auto-detect shared** — `RENAME TABLE` restore strips `DEFINER` clauses for cross-server compatibility; `_apply_auto_detected_config()` extracted as shared method for `enable_ssl`/`update_config`.
+
+---
+
+### 🔍 八轮深度审计修复 (PATCH-203 ~ 208)
+### 🔍 Eight-Round Deep Audit Fix (PATCH-203 ~ 208)
+
+> 基于 build 3.2.202 的八轮系统性代码审计，累计发现并修复 17 项缺陷，净增 131 行。
+> Eight rounds of systematic code audit on build 3.2.202, discovering and fixing 17 defects. Net +131 lines.
+
+**PATCH-203 (6 项 / 6 defects)** — `_restore_post_fixup` 注释剥离统一为 `_strip_nginx_comments_d5`（提升为模块级函数）；`restore` 路径补充 `_apply_auto_detected_config()` 调用；`_detect_site_config` 中 `optimize` / `http3` 探测改用注释剥离后文本。
+Unified comment stripping to module-level `_strip_nginx_comments_d5`; added missing `_apply_auto_detected_config()` to `restore` path; `optimize`/`http3` detection switched to comment-stripped text.
+
+**PATCH-204 (5 项 / 5 defects)** — **`uninstall()` 回退 `DISABLE_WP_CRON=true`**（卸载后 WordPress cron 永久瘫痪）；srcache 降级再生补充 `_align_nginx_with_cert()`；移除冗余 cache_mode 探测块；`allow_xmlrpc` 探测改用注释剥离后文本。
+**`uninstall()` reverts `DISABLE_WP_CRON=true`** (WordPress cron permanently broken after uninstall); srcache degradation regen adds `_align_nginx_with_cert()`; removes duplicate cache_mode block; `allow_xmlrpc` detection uses stripped text.
+
+**PATCH-205 (3 项 / 3 defects)** — **`_ensure_wp_cron_constant_locked` 3 处 O_TRUNC 写入改为原子写入**（OOM Kill 导致 wp-config.php 零字节→白屏 500），新增 `_cron_atomic_write` 辅助函数（tmp+fsync+replace，避免 flock 自阻塞）；`restore` 补充 `_ensure_fastcgi_cache_dir()`；wp-config.php 首次创建改用 `_safe_write_file`。
+**3 O_TRUNC writes in `_ensure_wp_cron_constant_locked` replaced with atomic writes** (OOM kill → zero-byte wp-config.php → white screen 500); new `_cron_atomic_write` helper; `restore` adds `_ensure_fastcgi_cache_dir()`; first-time wp-config.php creation uses `_safe_write_file`.
+
+**PATCH-206 (1 项 / 1 defect)** — PATCH-204 引入回归：`allow_xmlrpc` 块提取使用 `_c.find()` 偏移量（原始文本）与 `_c_no_comments` 触发条件不一致，统一在 `_c_no_comments` 上做全部块提取。
+PATCH-204 regression: `allow_xmlrpc` block extraction offset mismatch between `_c.find()` (raw text) and `_c_no_comments` trigger; unified all extraction on `_c_no_comments`.
+
+**PATCH-207 (1 项 / 1 defect)** — **`_extract_timer_params` 新增 EnvironmentFile 解析**（PATCH-190 将凭据移至 `.env` 但继承逻辑未同步），`update`/`enable-ssl`/`restore` 重建 timer 时不再丢失 ZeroSSL EAB 和 webhook。含 systemd 双引号转义反解析。
+**`_extract_timer_params` adds EnvironmentFile parsing** (PATCH-190 moved credentials to `.env` but inheritance logic not updated); `update`/`enable-ssl`/`restore` no longer lose ZeroSSL EAB and webhook when rebuilding timers.
+
+**PATCH-208 (1 项 / 1 defect)** — `_extract_existing_deploy_params` 域名编码补充 48 字符截断 + MD5 哈希后缀，修复长域名交互式 `update`/`enable-ssl` 静默丢失继承参数。
+`_extract_existing_deploy_params` adds 48-char truncation + MD5 hash suffix for domain encoding, fixing silent param loss for long domains in interactive `update`/`enable-ssl`.
+
+---
+
+### 🔨 工程改进 / Engineering
+
+- **srcache 动态模块编译基础设施** — 完整的 5 模块编译流水线（`_compile_srcache_modules`）：从 Nginx `-V` 提取 configure 参数、`--with-cc-opt` 中的 `-D` 宏、依赖包自动安装、编译产物 `load_module` 注入、旧模块清理。
+  **srcache dynamic module compilation infrastructure** — Full 5-module build pipeline: extracts configure args from `nginx -V`, `-D` macros from `--with-cc-opt`, auto-installs build deps, injects `load_module`, cleans stale modules.
+
+- **Nginx 注释剥离器 (`_strip_nginx_comments_d5`)** — 逐字符扫描，尊重引号内的 `#`（保护 CSP hash 指令等），替代 6 处不一致的 `re.sub(r'#[^\n]*', '')` 正则。提升为模块级函数供 `_detect_site_config` / `_restore_post_fixup` 共用。
+  **Nginx comment stripper (`_strip_nginx_comments_d5`)** — Character-by-character scanner respecting `#` inside quotes (protects CSP hash directives); replaces 6 inconsistent regex substitutions.
+
+- **`select`-based 管道 drain 框架** — 备份/恢复的 Popen stderr 读取从阻塞式线程改为 `select.select()` 非阻塞模式，子进程退出时通过 EOF 可靠检测，消除 drain 线程残留。
+  **`select`-based pipe drain framework** — Backup/restore Popen stderr reads switched from blocking threads to `select.select()` non-blocking mode with reliable EOF detection on child exit.
+
+- **`_in_php_comment()` 模块级函数** — 从 `inject_wp_hardening` / `_set_force_ssl_admin` / `_recover_existing_db_pass` 等 5 处重复的 PHP 注释检测逻辑提取为单一实现。
+  **`_in_php_comment()` module-level function** — Extracted from 5 duplicate PHP comment detection implementations.
+
+- `__version__` 从 `"3.2.1"` 升至 `"3.2.2"`；`__build__` 从 `"3.2.164"` 升至 `"3.2.208"`。
+- PATCH-165 ~ 208 共 44 轮迭代 + 8 轮独立深度审计，累计修复 40+ 项缺陷。
+
+---
+
 ## [V3.2.1]
 
 > **升级说明 / Upgrade note**
