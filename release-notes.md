@@ -1,38 +1,40 @@
-# V3.2.2 — Feature & Stability Hardening Release
+# V3.2.3 — Security & Architecture Hardening Release
 
 One-command WordPress + HTTPS deployment engine for production Linux servers.
 
-## What's New in V3.2.2
+## What's New in V3.2.3
 
-V3.2.2 refines V3.2.1 through 44 internal iterations plus 8 independent deep audit rounds, adding major new features and fixing 40+ defects across crash safety, credential inheritance, config detection, and cross-path alignment.
+V3.2.3 refines V3.2.2 through 10 audit rounds and 51 pattern-verified checks, adding automatic PHP version management, 24 security fixes, git tag-pinned builds, and 6 logic defect fixes. Net +1,126 lines (28,007→29,133).
 
-🚀 **HTTP/3 QUIC (`--http3`)** — auto-detects Nginx `http_v3` module; generates QUIC `listen` directives and `Alt-Svc` headers; auto-opens UDP 443 firewall port (firewalld/ufw/iptables); shares `reuseport` across multi-site; silently ignored when unsupported. Interactive wizard auto-recommends based on Nginx capability.
+🐘 **Automatic PHP upgrade** — detects installed PHP version; auto-upgrades to 8.4 when below 8.3 minimum. EL via EPEL + Remi repo + `dnf module enable php:remi-8.4` + `dnf update php*`; Ubuntu via Ondrej PPA; Debian via Sury DPA (DEB822). Migrates custom `php.ini` settings (`upload_max_filesize`, `post_max_size`, `memory_limit`, `max_execution_time`) post-upgrade, disables old PHP-FPM service, restarts new service. Covers 7 distros: EL8/9 (Remi), EL10 (native), Ubuntu 22.04 (Ondrej), Ubuntu 24.04 (native), Debian 12 (Sury), Debian 13 (native). `--php-version` now forces version switch even when installed PHP meets minimum.
 
-🗄️ **Redis full-page cache (`--cache redis`)** — srcache-nginx-module based Redis page cache; auto-compiles 5 OpenResty dynamic modules (ngx_devel_kit / set-misc / echo / redis2 / srcache) with ABI pre-check and runtime worker survival verification; auto-degrades to FastCGI on compile failure; auto-installs Redis if unavailable; nginx-helper plugin auto-adapts cache purge protocol.
+📌 **Git tag-pinned module builds** — 5 OpenResty modules for srcache/Brotli compilation switched from commit hashes to git tags (`v0.3.4` / `v0.33` / `v0.64` / `v0.15` / `v0.33`), fixing GitHub shallow-clone rejection. ngx_brotli uses HEAD clone (v1.0.0rc from 2018 fails on GCC 13+). echo-nginx-module upgraded v0.63→v0.64.
 
-🔀 **`--no-*` reverse switches** — new `--no-redis` / `--no-optimize` / `--no-cloudflare` / `--no-http3` / `--no-allow-xmlrpc` flags for `update`/`enable-ssl`/`restore` to explicitly disable auto-detected features and prevent `_apply_auto_detected_config()` from overriding user intent.
+🛡️ **4 unified security entry-point functions** — `_safe_rmtree` (parent whitelist + symlink block + `../` filter), `_safe_copy2` (bidirectional symlink check on src and dst), `_safe_mkstemp` (`O_NOFOLLOW` + `fchmod` dual protection), `_verify_gzip_integrity` (pre-extract CRC check). All 45 call sites unified through these entry points.
 
-🔍 **Auto config detection** — `update`/`enable-ssl`/`restore` automatically inherit `cache`/`redis`/`optimize`/`http3`/`cloudflare`/`allow_xmlrpc` from existing Nginx config and `wp-config.php` — no need to re-pass flags each time.
+🔒 **Secure tar extraction (`_safe_extract_tar`)** — enforces `--no-same-owner --no-same-permissions`, path traversal detection (`..` / absolute paths / symlink member filtering), output directory whitelist, extraction timeout, artifact verification. Covers WordPress, WP-CLI, Nginx source, and compiled artifacts (6 sites).
 
-🛒 **WooCommerce cache exclusion** — FastCGI cache automatically detects WooCommerce cart/checkout/my-account pages and session cookies; bypasses cache to prevent cart data leaking across users.
+💣 **Gzip bomb protection** — all `.tar.gz` / `.sql.gz` files validated via `gzip -t` integrity check before extraction. Covers WordPress download, backup restore, and WP-CLI extraction.
 
-🔒 **EAB/webhook credentials secured** — ZeroSSL EAB and webhook URL moved from systemd ExecStart to EnvironmentFile (0o600), preventing `/proc/<pid>/cmdline` exposure. Timer parameter inheritance now reads from EnvironmentFile with systemd double-quote unescape.
+🔗 **Destination symlink attack prevention (FIX-B2)** — `_safe_copy2` now checks final destination path (including dir+basename join) for symlinks, preventing attacker-planted symlinks from redirecting file writes.
 
-💥 **Crash-safe wp-config writes** — 3 O_TRUNC write sites in `_ensure_wp_cron_constant_locked` replaced with atomic tmp+fsync+replace, preventing zero-byte wp-config.php on OOM kill (white screen 500).
+🐛 **clean+redeploy PHP bypass fix (PATCH-261d)** — `_all_critical_deps_present()` previously only checked if `php` binary existed, not its version. After `clean`→`redeploy`, PHP 8.0 remained and was never upgraded. Now checks PHP ≥8.3 (aligned with Nginx ≥1.26 check pattern).
 
-🔧 **`uninstall` cron fix** — `uninstall` now reverts `DISABLE_WP_CRON=true` in wp-config.php; previously WordPress built-in cron was permanently broken after uninstall (auto-updates, scheduled posts, trash cleanup all disabled).
+🐛 **`--php-version` skip-path fix (PATCH-261e)** — `--php-version 8.5` was silently ignored when PHP 8.4 was already installed (≥8.3 triggered fast-skip). Now compares requested version against installed and forces install path when different.
 
-🔗 **EnvironmentFile inheritance** — `_extract_timer_params` now reads credentials from `.env` files (PATCH-190 moved them from ExecStart but inheritance was not updated); `update`/`enable-ssl`/`restore` no longer silently lose ZeroSSL CA failover and webhook notifications.
+🐛 **`php-redis` version prefix fix (PATCH-261f)** — apt path used unversioned `php-redis` which could install the Redis extension for the wrong PHP version in Ondrej parallel-install environments. Now builds versioned package name (e.g. `php8.4-redis`).
 
-📊 **8-round deep audit** — 17 defects found and fixed across comment stripping consistency, xmlrpc detection regression, fastcgi cache dir alignment, long-domain systemd prefix truncation, and more.
+🐛 **EL in-place PHP-FPM restart (FIX-A6)** — EL PHP upgrade keeps the same service name (`php-fpm`→`php-fpm`); `systemctl enable --now` doesn't restart an already-running service. Now issues explicit `systemctl restart` for same-name upgrades.
 
 ## Highlights
 
 🚀 **Full-stack deployment** — Nginx, PHP-FPM, MariaDB, WordPress, SSL certificate, systemd auto-renewal, Fail2Ban, logrotate, OS auto-security-updates — all from a single `deploy` command.
 
-🔒 **Production-grade security** — zero CLI password leakage, atomic config writes with symlink protection, wp-config hardening, Nginx defense-in-depth, certbot error circuit-breaker with multi-CA failover, supply-chain protection via dual-source cross-verification.
+🔒 **Production-grade security** — 24 new security fixes in this release; zero CLI password leakage, atomic config writes with symlink protection, wp-config hardening, Nginx defense-in-depth, certbot error circuit-breaker with multi-CA failover, supply-chain protection via dual-source cross-verification.
 
-🌐 **Multi-distro** — tested on EL7–10 (RHEL / CentOS / AlmaLinux / Rocky / Alibaba Cloud Linux), Ubuntu 20.04–24.04, Debian 11–12.
+🐘 **PHP lifecycle management** — automatic version detection, repository setup (Remi/Ondrej/Sury), in-place upgrade with `php.ini` migration, old service cleanup. Future PHP bumps require only constant changes (`_PHP_MIN_VERSION`, `_PHP_DEFAULT_VERSION`).
+
+🌐 **Multi-distro** — tested on EL7–10 (RHEL / CentOS / AlmaLinux / Rocky / Alibaba Cloud Linux), Ubuntu 20.04–24.04, Debian 11–13.
 
 ⚡ **Performance options** — FastCGI page cache, Redis full-page cache (srcache), Redis object cache (with source-compile fallback + Valkey support), HTTP/3 QUIC, Brotli compression, ECDSA certificates (all optional, composable).
 
@@ -76,6 +78,15 @@ sudo python3 wp_ssl_bootstrap.py update --domain example.com --no-redis
 
 See [deploy-guide.md](./deploy-guide.md) for scenario-based examples and [README.md](./README.md) for full documentation.
 
+## Upgrade from V3.2.2
+
+```bash
+# Replace script file, then:
+sudo python3 wp_ssl_bootstrap.py update --domain example.com
+```
+
+PHP auto-upgrade activates automatically on next deploy/redeploy — if installed PHP is below 8.3, it will be upgraded to 8.4 via Remi (EL) or Ondrej/Sury (Deb/Ubuntu). Existing sites with PHP ≥8.3 are unaffected. All 24 security fixes (safe rmtree/copy/mkstemp/tar, gzip validation, symlink protection) apply immediately.
+
 ## Upgrade from V3.2.1
 
 ```bash
@@ -83,7 +94,7 @@ See [deploy-guide.md](./deploy-guide.md) for scenario-based examples and [README
 sudo python3 wp_ssl_bootstrap.py update --domain example.com
 ```
 
-New features (HTTP/3, Redis srcache, auto config detection, `--no-*` switches, WooCommerce cache exclusion) activate automatically. Existing timers inherit parameters from EnvironmentFile — no manual reconfiguration needed. PATCH-203~208 fixes (crash-safe wp-config writes, uninstall cron revert, credential inheritance) apply immediately.
+All V3.2.2 + V3.2.3 features activate automatically. Existing timers inherit parameters from EnvironmentFile — no manual reconfiguration needed.
 
 ## Upgrade from V3.2.0
 
@@ -92,7 +103,7 @@ New features (HTTP/3, Redis srcache, auto config detection, `--no-*` switches, W
 sudo python3 wp_ssl_bootstrap.py update --domain example.com
 ```
 
-All V3.2.1 + V3.2.2 features activate automatically. Existing SSL timers inherit parameters from previous unit files.
+All V3.2.1 + V3.2.2 + V3.2.3 features activate automatically. Existing SSL timers inherit parameters from previous unit files.
 
 ## Upgrade from V3.1.x
 
@@ -101,22 +112,25 @@ All V3.2.1 + V3.2.2 features activate automatically. Existing SSL timers inherit
 sudo python3 wp_ssl_bootstrap.py update --domain example.com
 ```
 
-All V3.2.0 + V3.2.1 + V3.2.2 configs (Brotli / Cloudflare / Fail2Ban / logrotate / systemd timers / webhook / HTTP/3 / srcache) rebuild automatically.
+All V3.2.x configs (Brotli / Cloudflare / Fail2Ban / logrotate / systemd timers / webhook / HTTP/3 / srcache / PHP upgrade) rebuild automatically.
 
-## Key Bug Fixes (V3.2.2)
+## Key Bug Fixes (V3.2.3)
 
-- **Crash-safe wp-config writes** — 3 O_TRUNC sites replaced with atomic tmp+fsync+replace (OOM kill no longer produces zero-byte file)
-- **`uninstall` cron revert** — `DISABLE_WP_CRON=true` now reverted on uninstall (WordPress cron no longer permanently broken)
-- **EnvironmentFile credential inheritance** — ZeroSSL EAB and webhook no longer silently lost when timers are rebuilt
-- **xmlrpc detection regression** — `allow_xmlrpc` no longer false-negative when Nginx comments contain `xmlrpc` far from actual location block
-- **restore path alignment** — `_apply_auto_detected_config()`, `_ensure_fastcgi_cache_dir()`, `_align_nginx_with_cert()` all added to restore path
-- **Long-domain systemd prefix** — interactive `update`/`enable-ssl` no longer silently loses inherited params for domains >48 chars after encoding
-- **mysqldump stderr ERROR** — exit 0 with stderr ERROR now detected and marked as partial backup
-- **MySQL identifier overflow** — `RENAME TABLE` temp names truncated to 64-char MySQL limit
-- **VIEW migration in restore** — VIEWs now migrated via `CREATE`+`DROP` (not supported by `RENAME TABLE`)
-- **DEFINER clause stripping** — cross-server restore no longer fails on `DEFINER` permission errors
-- **gzip pipe verification** — backup pipeline now verifies both mysqldump and gzip exit codes
-- **select-based pipe drain** — stderr drain threads no longer leak on child process exit
+- **clean+redeploy PHP bypass (PATCH-261d)** — `_all_critical_deps_present` now checks PHP version (≥8.3), not just binary existence; PHP 8.0 after clean→redeploy is now properly upgraded
+- **`--php-version` skip-path bypass (PATCH-261e)** — `--php-version 8.5` no longer silently ignored when installed PHP 8.4 ≥ 8.3 triggers fast-skip
+- **`php-redis` wrong version (PATCH-261f)** — apt path now uses versioned `php8.4-redis` instead of unversioned `php-redis` in Ondrej parallel-install environments
+- **EL PHP-FPM not restarted (FIX-A6)** — same-name service upgrade (`php-fpm`→`php-fpm`) now triggers explicit restart instead of no-op `enable --now`
+- **PHP repo failure silent continuation (FIX-C5)** — Remi/Ondrej setup failure now properly falls back to system default packages instead of generating non-existent versioned package names
+- **`--php-version` unnecessary upgrade (FIX-A2)** — `--php-version 8.4` on already-installed PHP 8.4 no longer triggers redundant repo setup
+
+## Security Fixes (V3.2.3, PATCH-256~260)
+
+- **`_safe_rmtree`** — parent directory whitelist, root protection, `../` traversal detection, symlink blocking (replaces all `shutil.rmtree` calls)
+- **`_safe_copy2`** — bidirectional symlink check on source AND destination (FIX-B2: attacker-planted dst symlink attack)
+- **`_safe_mkstemp`** — `O_NOFOLLOW` + post-creation `fchmod` dual permission guarantee (Python 3.6 compatible)
+- **`_safe_extract_tar`** — `--no-same-owner --no-same-permissions`, path traversal filtering, output whitelist, timeout, artifact verification (6 extraction sites)
+- **`_verify_gzip_integrity`** — pre-extraction `gzip -t` CRC check for all `.tar.gz` / `.sql.gz` files
+- **Git tag pinning** — 5 OpenResty modules pinned to release tags instead of commit hashes; immune to GitHub shallow-clone restrictions
 
 ## Requirements
 
@@ -124,12 +138,12 @@ All V3.2.0 + V3.2.1 + V3.2.2 configs (Brotli / Cloudflare / Fail2Ban / logrotate
 - Domain with DNS records pointing to your server
 - Ports 80 and 443 open
 
-Everything else is installed automatically.
+Everything else is installed automatically. PHP < 8.3 is automatically upgraded to 8.4.
 
 ## Checksums
 
 ```
-SHA256: <fill after build>  wp_ssl_bootstrap.py
+SHA256: 86121a2efb984bbfe1294e62ec583082c190b648ba8a05be451b65ae9059c9c4  wp_ssl_bootstrap.py
 ```
 
 ## License

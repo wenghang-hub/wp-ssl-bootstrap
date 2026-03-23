@@ -15,9 +15,12 @@ One command to deploy WordPress with HTTPS, auto-renewal, and production-grade s
 - **Two-phase deployment** — `deploy --skip-ssl` for HTTP-only first, then `enable-ssl` when DNS is ready; or full HTTPS in one shot
 - **Interactive wizard** — no subcommand? TTY users get a guided menu for domain, email, SSL policy, and external database
 - **Multi-distro** — EL7–10 (RHEL / CentOS / AlmaLinux / Rocky / Alibaba Cloud Linux) / Ubuntu / Debian; dnf5 (EL10+) auto-detected; Redis/Valkey multi-package fallback
+- **Automatic PHP upgrade** — detects installed PHP version; auto-upgrades to 8.4 when below 8.3 minimum. EL via EPEL + Remi repo + `dnf module enable`; Ubuntu via Ondrej PPA; Debian via Sury DPA. Migrates custom `php.ini` settings, disables old PHP-FPM, restarts new service. Covers EL8–10, Ubuntu 22.04–24.04, Debian 12–13.
 - **Database security** — auth_socket/unix_socket auto-detection; credentials never exposed in process list (`--defaults-extra-file`); admin password via environment variable (not `/proc/cmdline`)
 - **Multi-source download** — Chinese mirror + global fallback with SHA-256 verification; cross-source hash verification for self-update; WP-CLI fallback when tar.gz sources fail
 - **Strict permissions** — wp-config.php locked to 0440 from creation; `O_NOFOLLOW` on all atomic write paths; SELinux booleans auto-configured
+- **Unified security entry points** — `_safe_rmtree` (parent whitelist + symlink block), `_safe_copy2` (bidirectional symlink check), `_safe_mkstemp` (`O_NOFOLLOW` + `fchmod`), `_verify_gzip_integrity` (pre-extract CRC check), `_safe_extract_tar` (path traversal + symlink member + timeout protection). 45 call sites across the script use these entry points.
+- **Git tag-pinned builds** — srcache/Brotli compilation modules pinned to git tags (not commit hashes), immune to GitHub shallow-clone restrictions
 - **Nginx hardening** — rate limiting on wp-login.php + admin-ajax.php, HSTS, CSP enforcement, wp-config/uploads/xmlrpc/wp-includes deny, HTTP method filtering, cert SAN / server_name auto-alignment, FastCGI cache (optional), Redis srcache full-page cache (optional), Brotli (optional), HTTP/3 QUIC (optional)
 - **Fail2Ban** — auto-configured WordPress brute-force protection with progressive banning (24h + escalation)
 - **Auto-renewal** — systemd daily timer with randomized delay, `--cert-name` precision renewal, persistent deploy hook, post-renewal Nginx certificate verification, renewal failure webhook notification
@@ -116,7 +119,7 @@ All other dependencies (Nginx, PHP-FPM, MariaDB, certbot, etc.) are installed au
 --zerossl-eab-hmac-key    ZeroSSL EAB HMAC Key (env: WP_ZEROSSL_EAB_HMAC_KEY)
 --notify-webhook URL      Webhook URL for renewal failure alerts (env: WP_NOTIFY_WEBHOOK)
 --no-pre-backup           Skip automatic pre-operation backup
---php-version X.Y         Force specific PHP-FPM version
+--php-version X.Y         Force specific PHP version (default: auto-upgrade to 8.4 if <8.3)
 --skip-deps               Skip package installation
 --backup-dir PATH         Backup root directory (default: /root/backups)
 --keep N                  Number of backups to retain (backup subcommand)
@@ -212,6 +215,8 @@ sudo python3 wp_ssl_bootstrap.py uninstall --domain example.com --purge
 - **Supply-chain protection** — self-update uses dual hardcoded sources with mandatory cross-source SHA-256 verification
 - **Webhook SSRF protection** — HTTPS enforced; private IPs, internal domains, and IPv4-mapped IPv6 blocked
 - **Backup integrity** — gzip validation, `Dump completed` EOF marker check, path traversal detection in tar archives
+- **Secure tar extraction** — `_safe_extract_tar` enforces `--no-same-owner --no-same-permissions`, filters `..` / absolute paths / symlink members, applies timeout and artifact verification across all 6 extraction sites
+- **Unified `rmtree` / `copy` / `mkstemp`** — all filesystem operations use hardened wrappers with parent-directory whitelists, bidirectional symlink checks, and `O_NOFOLLOW` enforcement
 
 ## Known Limitations
 
@@ -252,9 +257,12 @@ After deployment, credentials are saved to `/root/.wp_credentials_<domain>.txt` 
 - **两阶段部署** — `deploy --skip-ssl` 先部署 HTTP，DNS 就绪后 `enable-ssl` 补签证书；或一步到位全量 HTTPS
 - **交互式向导** — 不指定子命令时自动进入 TTY 引导菜单，选择域名、邮箱、SSL 策略和外置数据库配置
 - **多发行版** — EL7–10（RHEL / CentOS / AlmaLinux / Rocky / Alibaba Cloud Linux）/ Ubuntu / Debian；自动识别 dnf5（EL10+）；Redis/Valkey 多包名自动适配
+- **PHP 自动升级** — 检测已安装 PHP 版本，低于 8.3 时自动升级到 8.4。EL 通过 EPEL + Remi 仓库 + `dnf module enable`；Ubuntu 通过 Ondrej PPA；Debian 通过 Sury DPA。升级后自动迁移自定义 `php.ini` 设置，停用旧版 PHP-FPM，重启新版服务。覆盖 EL8–10、Ubuntu 22.04–24.04、Debian 12–13
 - **数据库安全** — auth_socket/unix_socket 自适应；凭据不暴露于进程列表（`--defaults-extra-file`）；管理员密码通过环境变量传递（不经 `/proc/cmdline`）
 - **多源下载** — 中文镜像 + 全球主源 fallback，SHA-256 校验；self-update 双源交叉哈希验证；WP-CLI 兜底
 - **严格权限** — wp-config.php 创建即 0440；所有原子写入路径 `O_NOFOLLOW` 防符号链接攻击；SELinux 布尔值自动配置
+- **统一安全入口** — `_safe_rmtree`（父目录白名单 + 符号链接阻断）、`_safe_copy2`（双向符号链接检查）、`_safe_mkstemp`（`O_NOFOLLOW` + `fchmod`）、`_verify_gzip_integrity`（解压前 CRC 校验）、`_safe_extract_tar`（路径遍历 + 符号链接成员 + 超时保护）。全脚本 45 处调用统一走安全入口
+- **Git tag 固定构建** — srcache / Brotli 编译模块使用 git tag 固定版本（非 commit hash），不受 GitHub 浅克隆限制
 - **Nginx 加固** — wp-login.php + admin-ajax.php 速率限制、HSTS、CSP 强制执行、wp-config/uploads/xmlrpc/wp-includes 拦截、HTTP 方法过滤、证书 SAN 与 server_name 自动对齐、FastCGI 缓存（可选）、Redis srcache 全页缓存（可选）、Brotli（可选）、HTTP/3 QUIC（可选）
 - **Fail2Ban** — 自动配置 WordPress 暴力破解防护，渐进式封禁（24h + 递增）
 - **自动续期** — systemd 每日定时器，随机延迟，`--cert-name` 精准续期，持久化 deploy hook，续期后自动验证 Nginx 证书加载，失败 Webhook 通知
@@ -353,7 +361,7 @@ sudo python3 wp_ssl_bootstrap.py enable-ssl \
 --zerossl-eab-hmac-key    ZeroSSL EAB HMAC Key（环境变量: WP_ZEROSSL_EAB_HMAC_KEY）
 --notify-webhook URL      续期失败 Webhook 通知 URL（环境变量: WP_NOTIFY_WEBHOOK）
 --no-pre-backup           跳过操作前自动备份
---php-version X.Y         强制指定 PHP-FPM 版本
+--php-version X.Y         强制指定 PHP 版本（默认: < 8.3 时自动升级到 8.4）
 --skip-deps               跳过系统包安装
 --backup-dir PATH         备份根目录（默认: /root/backups）
 --keep N                  备份保留份数（backup 子命令）
@@ -449,6 +457,8 @@ sudo python3 wp_ssl_bootstrap.py uninstall --domain example.com --purge
 - **供应链安全** — self-update 使用硬编码双源 + 强制交叉 SHA-256 校验
 - **Webhook SSRF 防护** — 强制 HTTPS；拒绝私有 IP、内网域名后缀、IPv4-mapped IPv6
 - **备份完整性** — gzip 格式校验、`Dump completed` EOF 标记检测、tar 路径遍历拦截
+- **安全 tar 解压** — `_safe_extract_tar` 强制 `--no-same-owner --no-same-permissions`，过滤 `..` / 绝对路径 / 符号链接成员，超时保护 + 产物验证，覆盖全部 6 处解压场景
+- **统一 `rmtree` / `copy` / `mkstemp`** — 所有文件系统操作使用加固包装器：父目录白名单、双向符号链接检查、`O_NOFOLLOW` 强制
 
 ## 已知限制
 

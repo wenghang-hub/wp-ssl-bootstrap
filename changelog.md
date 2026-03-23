@@ -4,6 +4,95 @@ All notable changes to WP-SSL-Bootstrap are documented in this file.
 本文件记录 WP-SSL-Bootstrap 的所有重要变更。
 ---
 
+## [V3.2.3]
+
+> **升级说明 / Upgrade note**
+> V3.2.3 是 V3.2.2 之后经过 10 轮安全审计 + 51 项模式验证的安全与架构强化版本。
+> 新增 PHP 自动升级管理（≥8.3 最低要求，自动升级到 8.4）、git tag 固定构建、
+> 24 项安全修复（路径遍历 / 符号链接 / gzip 炸弹 / tar 注入等）、4 个统一安全入口函数。
+> 从 V3.2.2 升级时，直接替换脚本文件并执行 `update` 子命令即可。
+>
+> V3.2.3 is a security and architecture hardening release after V3.2.2, validated through
+> 10 audit rounds and 51 pattern checks. Adds automatic PHP upgrade management (≥8.3
+> minimum, auto-upgrades to 8.4), git tag-pinned builds, 24 security fixes (path traversal,
+> symlink attacks, gzip bombs, tar injection, etc.), and 4 unified security entry-point functions.
+> To upgrade from V3.2.2, replace the script and run the `update` subcommand.
+
+---
+
+### ✨ 新功能 / New Features
+
+- **PHP 自动版本管理** — 检测已安装 PHP 版本，低于 8.3 时自动升级到 8.4。EL 系列通过 EPEL + Remi 仓库 + `dnf module enable php:remi-8.4` + `dnf update php*` 原地升级；Ubuntu 通过 Ondrej PPA；Debian 通过 Sury DPA（DEB822 格式）。升级后自动迁移 `php.ini` 自定义设置（`upload_max_filesize` / `post_max_size` / `memory_limit` / `max_execution_time`），停用旧版 PHP-FPM 服务，重启新版服务。`--php-version` 参数现在也能在已装 PHP 满足最低要求时强制触发版本切换。
+  **Automatic PHP version management** — Detects installed PHP version; auto-upgrades to 8.4 when below 8.3 minimum. EL via EPEL + Remi repo + `dnf module enable php:remi-8.4` + `dnf update php*`; Ubuntu via Ondrej PPA; Debian via Sury DPA (DEB822 format). Migrates custom `php.ini` settings post-upgrade, disables old PHP-FPM service, restarts new service. `--php-version` now forces version switch even when installed PHP meets minimum requirements.
+
+- **Git tag 固定模块构建 (`_PINNED_MODULES`)** — srcache / Brotli 编译所需的 5 个 OpenResty 模块从 commit hash 改为 git tag 固定（`v0.3.4` / `v0.33` / `v0.64` / `v0.15` / `v0.33`），解决 GitHub 浅克隆拒绝 commit hash 的问题。ngx_brotli 因 v1.0.0rc（2018）在 GCC 13+ 编译失败，使用 HEAD 克隆。echo-nginx-module 升级 v0.63→v0.64。
+  **Git tag-pinned module builds (`_PINNED_MODULES`)** — 5 OpenResty modules for srcache/Brotli compilation switched from commit hashes to git tags, fixing GitHub shallow clone rejection of commit hashes. ngx_brotli uses HEAD clone due to v1.0.0rc (2018) failing on GCC 13+. echo-nginx-module upgraded v0.63→v0.64.
+
+- **PHP 版本矩阵覆盖 7 种发行版** — EL8/9 (Remi)、EL10 (原生 8.3+)、Ubuntu 22.04 (Ondrej)、Ubuntu 24.04 (原生 8.3+)、Debian 12 (Sury)、Debian 13 (原生 8.4+) 全覆盖；原生满足最低要求的发行版跳过外部仓库。
+  **PHP version matrix covers 7 distros** — EL8/9 (Remi), EL10 (native 8.3+), Ubuntu 22.04 (Ondrej), Ubuntu 24.04 (native 8.3+), Debian 12 (Sury), Debian 13 (native 8.4+) fully covered; distros with native PHP ≥8.3 skip external repos.
+
+---
+
+### 🔒 安全增强 / Security Enhancements (PATCH-256 ~ 260, 24 项 / 24 fixes)
+
+- **4 个统一安全入口函数** — `_safe_rmtree`（父目录白名单 + 符号链接阻断 + `.`/`..` 过滤）、`_safe_copy2`（源 + 目标双向符号链接检查）、`_safe_mkstemp`（`O_NOFOLLOW` + `fchmod` 双重保障）、`_verify_gzip_integrity`（解压前 CRC 完整性校验）。全脚本 45 处调用统一走安全入口。
+  **4 unified security entry-point functions** — `_safe_rmtree` (parent whitelist + symlink block + `../` filter), `_safe_copy2` (bidirectional symlink check on src and dst), `_safe_mkstemp` (`O_NOFOLLOW` + `fchmod` dual protection), `_verify_gzip_integrity` (pre-extract CRC integrity check). All 45 call sites unified through these entry points.
+
+- **tar 安全解压 (`_safe_extract_tar`)** — 强制使用 `--no-same-owner --no-same-permissions`、路径遍历检测（`..` / 绝对路径 / 符号链接成员过滤）、输出目录白名单、解压超时、产物验证。覆盖 WordPress / WP-CLI / Nginx 源码 / 编译产物等 6 处解压场景。
+  **Secure tar extraction (`_safe_extract_tar`)** — Enforces `--no-same-owner --no-same-permissions`, path traversal detection (`..` / absolute paths / symlink member filtering), output directory whitelist, extraction timeout, and artifact verification. Covers 6 extraction sites: WordPress, WP-CLI, Nginx source, and compiled artifacts.
+
+- **gzip 炸弹防护** — 所有 `.tar.gz` / `.sql.gz` 解压前执行 `gzip -t` 完整性校验，失败则中止。覆盖 WordPress 下载、备份恢复、WP-CLI 解压。
+  **Gzip bomb protection** — All `.tar.gz` / `.sql.gz` files validated via `gzip -t` integrity check before extraction. Covers WordPress download, backup restore, and WP-CLI extraction.
+
+- **`_safe_copy2` 目标符号链接攻击防护 (FIX-B2)** — 攻击者在目标路径预先创建符号链接→`shutil.copy2` 跟随→写入任意文件。现检查最终目标路径（含目录+basename 拼接场景）是否为符号链接。
+  **`_safe_copy2` destination symlink attack prevention (FIX-B2)** — Attacker pre-creates symlink at destination → `shutil.copy2` follows → arbitrary file write. Now checks final destination path (including dir+basename join) for symlinks.
+
+- **`shutil.rmtree` 安全替换** — 全脚本 `shutil.rmtree` 调用替换为 `_safe_rmtree`，添加父目录白名单（`/tmp` / `/var/cache` / webroot / build 等合法父目录）、根目录保护（拒绝 `/` / `/etc` / `/usr`）、`.`/`..` 遍历检测。
+  **`shutil.rmtree` security replacement** — All `shutil.rmtree` calls replaced with `_safe_rmtree`; parent directory whitelist, root directory protection, and `../` traversal detection added.
+
+- **`tempfile.mkstemp` 安全替换** — 全部替换为 `_safe_mkstemp`，强制 `O_NOFOLLOW` + 后置 `fchmod` 双重权限保障。兼容 Python 3.6（无 `opener` 参数）。
+  **`tempfile.mkstemp` security replacement** — All calls replaced with `_safe_mkstemp`; enforces `O_NOFOLLOW` + post-creation `fchmod` dual permission guarantee. Python 3.6 compatible.
+
+---
+
+### 🐛 问题修复 / Bug Fixes
+
+- **[PATCH-261d] clean + redeploy PHP 版本绕过** — `_all_critical_deps_present()` 仅检查 `php` 二进制是否存在，不检查版本。clean→redeploy 时 PHP 8.0 仍在→检测通过→跳过 `install_packages()`→PHP 不升级。现新增 PHP ≥8.3 版本检查（与 Nginx ≥1.26 检查对齐）。
+  **clean + redeploy PHP version bypass** — `_all_critical_deps_present()` only checked if `php` binary existed, not its version. After clean→redeploy, PHP 8.0 remained→detection passed→`install_packages()` skipped→PHP stayed at 8.0. Now adds PHP ≥8.3 version check (aligned with Nginx ≥1.26 check pattern).
+
+- **[PATCH-261e] `--php-version` 被快速跳过路径吞掉** — 用户指定 `--php-version 8.5`，已装 PHP 8.4 ≥ 8.3→`_all_critical_deps_present` 返回 True→跳过 `install_packages()`→`--php-version` 被静默忽略。现增加 `cfg.php_version` 与已装版本比对，不同时强制走安装路径。
+  **`--php-version` swallowed by fast-skip path** — User specifies `--php-version 8.5` but installed PHP 8.4 ≥ 8.3→`_all_critical_deps_present` returned True→`install_packages()` skipped→`--php-version` silently ignored. Now compares `cfg.php_version` against installed version; forces install path when different.
+
+- **[PATCH-261f] `php-redis` apt 路径版本前缀缺失** — `_redis_ensure_running` 的 apt 路径使用无版本前缀 `php-redis`，在 Ondrej PHP 并行安装环境下可能装到旧版本 PHP 的 Redis 扩展。现使用 `_detect_installed_php_version()` 构建版本化包名（如 `php8.4-redis`）。
+  **`php-redis` apt path missing version prefix** — `_redis_ensure_running` apt path used unversioned `php-redis`, which could install the Redis extension for the wrong PHP version in Ondrej parallel-install environments. Now uses `_detect_installed_php_version()` to build versioned package name (e.g. `php8.4-redis`).
+
+- **[PATCH-261b FIX-A2] `--php-version` 与已装版本相同时无谓升级** — `_determine_php_target()` 未比对已装版本，`--php-version 8.4` 在已装 8.4 时仍触发 Remi/Ondrej 仓库配置。现先比对，相同则返回空（跳过）。
+  **Unnecessary upgrade when `--php-version` matches installed** — `_determine_php_target()` didn't compare against installed version; `--php-version 8.4` on PHP 8.4 still triggered repo setup. Now compares first and skips when matching.
+
+- **[PATCH-261b FIX-A6] EL 原地升级后 PHP-FPM 未重启** — EL 系列 PHP 升级后服务名不变（`php-fpm`→`php-fpm`），`systemctl enable --now` 不会重启已运行的服务→旧 PHP 8.0 二进制继续服务。现检测同名升级场景并显式 `systemctl restart`。
+  **PHP-FPM not restarted after EL in-place upgrade** — EL PHP upgrade keeps the same service name (`php-fpm`→`php-fpm`); `systemctl enable --now` doesn't restart an already-running service→old PHP 8.0 binary keeps serving. Now detects same-name upgrade and issues explicit `systemctl restart`.
+
+- **[PATCH-261b FIX-C5] PHP 仓库配置失败时静默继续** — `_setup_php_repo` 返回 False（Remi/Ondrej 安装失败）后未将 `_php_target` 重置为空，后续 `_build_php_packages` 生成了不存在的版本化包名→安装失败。现在两条路径（EL + apt）均检查返回值并 fallback 到系统默认。
+  **Silent continuation after PHP repo setup failure** — `_setup_php_repo` returning False didn't reset `_php_target` to empty; subsequent `_build_php_packages` generated non-existent versioned package names→install failure. Both paths (EL + apt) now check return value and fall back to system default.
+
+---
+
+### 🔨 工程改进 / Engineering
+
+- **11 个新方法（PHP 版本管理）** — `_detect_installed_php_version` / `_determine_php_target` / `_setup_php_repo` / `_setup_php_repo_el` / `_setup_php_repo_deb` / `_setup_ondrej_ppa` / `_setup_sury_dpa` / `_build_php_packages` / `_handle_php_version_transition` / `_read_php_ini_values` / `_apply_php_ini_values`。
+  **11 new methods (PHP version management)** — Full lifecycle: detect installed version, determine target, setup repos (EL/Deb dispatchers), build package lists, handle version transition with ini migration.
+
+- **模块级常量** — `_PHP_MIN_VERSION = (8, 3)`、`_PHP_DEFAULT_VERSION = "8.4"`、`_PHP_EXTENSIONS_EL` / `_PHP_EXTENSIONS_DEB_TPL` 集中管理，未来 PHP 版本升级仅需修改常量。
+  **Module-level constants** — `_PHP_MIN_VERSION`, `_PHP_DEFAULT_VERSION`, `_PHP_EXTENSIONS_EL` / `_PHP_EXTENSIONS_DEB_TPL` centralized; future PHP version bumps require only constant changes.
+
+- **31 条新翻译条目** — 所有新增 PHP 管理、git 克隆、tar 安全检查的日志消息均通过 `t()` 翻译系统，提供 zh + en 双语。
+  **31 new translation entries** — All new PHP management, git clone, and tar safety log messages go through the `t()` translation system with zh + en entries.
+
+- `__version__` 从 `"3.2.2"` 升至 `"3.2.3"`；`__build__` 从 `"3.2.255"` 升至 `"3.2.261f"`。净增 1126 行（28,007→29,133），diff 2412 行。
+- PATCH-256 ~ 261f 共 10 轮迭代 + 51 项模式验证，累计修复 24 项安全缺陷 + 6 项逻辑缺陷。
+
+---
+
 ## [V3.2.2]
 
 > **升级说明 / Upgrade note**
@@ -141,7 +230,7 @@ PATCH-204 regression: `allow_xmlrpc` block extraction offset mismatch between `_
 - **`_in_php_comment()` 模块级函数** — 从 `inject_wp_hardening` / `_set_force_ssl_admin` / `_recover_existing_db_pass` 等 5 处重复的 PHP 注释检测逻辑提取为单一实现。
   **`_in_php_comment()` module-level function** — Extracted from 5 duplicate PHP comment detection implementations.
 
-- `__version__` 从 `"3.2.1"` 升至 `"3.2.2"`；`__build__` 从 `"3.2.164"` 升至 `"3.2.208"`。
+- `__version__` 从 `"3.2.1"` 升至 `"3.2.2"`；`__build__` 从 `"3.2.164"` 升至 `"3.2.255"`。
 - PATCH-165 ~ 208 共 44 轮迭代 + 8 轮独立深度审计，累计修复 40+ 项缺陷。
 
 ---

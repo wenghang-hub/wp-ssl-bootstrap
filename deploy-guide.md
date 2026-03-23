@@ -1,5 +1,5 @@
-# WP-SSL-Bootstrap V3.2.2 — 全新建站参数指南
-# WP-SSL-Bootstrap V3.2.2 — New Site Deployment Guide
+# WP-SSL-Bootstrap V3.2.3 — 全新建站参数指南
+# WP-SSL-Bootstrap V3.2.3 — New Site Deployment Guide
 
 ---
 
@@ -94,7 +94,7 @@ python3 wp_ssl_bootstrap.py deploy \
 |---|---|
 | `--redis` | 启用 Redis 对象缓存，与 FastCGI 页面缓存**叠加**：FastCGI 缓存完整 HTML，Redis 缓存数据库查询；已登录用户（绕过 FastCGI 缓存）同样受益。<br>Enables Redis object cache on top of FastCGI page cache. FastCGI caches full HTML; Redis caches DB queries. Logged-in users (who bypass FastCGI) also benefit. |
 | `--optimize` | 启用 Nginx `open_file_cache`（`max=10000 inactive=60s`），减少静态文件密集请求时的内核 `stat()` 调用。<br>Enables Nginx `open_file_cache` (`max=10000 inactive=60s`), reducing kernel `stat()` calls for static-asset-heavy traffic. |
-| `--http3` | *(V3.2.2 新增 / New)* 启用 HTTP/3 QUIC 协议（需 Nginx 支持 `http_v3` 模块）。自动开放 UDP 443 防火墙端口，多站点自动共享 `reuseport`。Nginx 不支持时静默忽略。<br>Enables HTTP/3 QUIC protocol (requires Nginx `http_v3` module). Auto-opens UDP 443 firewall port; shares `reuseport` across sites. Silently ignored if Nginx lacks support. |
+| `--http3` | *(V3.2.2+ 起 / Since V3.2.2)* 启用 HTTP/3 QUIC 协议（需 Nginx 支持 `http_v3` 模块）。自动开放 UDP 443 防火墙端口，多站点自动共享 `reuseport`。Nginx 不支持时静默忽略。<br>Enables HTTP/3 QUIC protocol (requires Nginx `http_v3` module). Auto-opens UDP 443 firewall port; shares `reuseport` across sites. Silently ignored if Nginx lacks support. |
 | `--cloudflare` | 自动从 Cloudflare API 拉取最新 IP 段，写入全局 `real_ip_from` + `CF-Connecting-IP` 配置，确保日志和 Fail2Ban 记录访客真实 IP 而非 CF 节点 IP；获取失败时回退内置默认值。<br>Auto-fetches Cloudflare IP ranges and writes a global `real_ip_from` + `CF-Connecting-IP` config so logs and Fail2Ban see visitor IPs, not Cloudflare node IPs. Falls back to built-in defaults on fetch failure. |
 | `--notify-webhook` | 续期失败时发送 Webhook 通知（Slack / 飞书 / 企微等）。仅允许 HTTPS URL，内网地址会被安全策略拒绝。<br>Sends a Webhook notification on renewal failure (Slack / Lark / WeCom). HTTPS only; internal URLs are blocked by security policy. |
 
@@ -160,7 +160,7 @@ Once debugging is complete, run `deploy` (or `renew --force --no-staging`) witho
 > **`--no-staging`** *(V3.2.1+ 起 / Since V3.2.1)* — 显式覆盖从已有定时器继承的 `--staging` 标志，强制切换回生产 CA。  
 > Explicitly overrides `--staging` inherited from existing timer config, forcing production CA.
 
-> **💡 自动配置探测 / Automatic Config Detection** *(V3.2.2 新增 / New)*
+> **💡 自动配置探测 / Automatic Config Detection** *(V3.2.2+ 起 / Since V3.2.2)*
 > `update` / `enable-ssl` / `restore` 子命令会自动从现有 Nginx 配置和 `wp-config.php` 中探测 `cache` / `redis` / `optimize` / `http3` / `cloudflare` / `allow_xmlrpc` 等设置，无需每次重复传参。若需显式**关闭**某项自动探测到的功能，使用 `--no-*` 反向开关（如 `--no-http3`、`--no-redis`）。
 > `update` / `enable-ssl` / `restore` automatically detect `cache`/`redis`/`optimize`/`http3`/`cloudflare`/`allow_xmlrpc` from existing Nginx config and `wp-config.php` — no need to re-pass flags each time. To explicitly **disable** an auto-detected feature, use `--no-*` reverse flags (e.g. `--no-http3`, `--no-redis`).
 
@@ -368,14 +368,14 @@ python3 wp_ssl_bootstrap.py update \
   --cache  fastcgi \
   --redis
 
-# 切换到 Redis 全页缓存（替代 FastCGI，V3.2.2 新增）
-# Switch to Redis full-page cache (replaces FastCGI, new in V3.2.2)
+# 切换到 Redis 全页缓存（替代 FastCGI，V3.2.2+ 起）
+# Switch to Redis full-page cache (replaces FastCGI, since V3.2.2)
 python3 wp_ssl_bootstrap.py update \
   --domain example.com \
   --cache  redis
 
-# 事后开启 HTTP/3（V3.2.2 新增）
-# Enable HTTP/3 after the fact (new in V3.2.2)
+# 事后开启 HTTP/3（V3.2.2+ 起）
+# Enable HTTP/3 after the fact (since V3.2.2)
 python3 wp_ssl_bootstrap.py update \
   --domain example.com \
   --http3
@@ -405,7 +405,7 @@ python3 wp_ssl_bootstrap.py self-update
 | `--persist-root-pwd` | 开关 / flag | 关 / off | `deploy` / `enable-ssl` / `backup` / `restore` |
 | `--skip-ssl` | 开关 / flag | 关 / off | `deploy` / `restore` |
 | `--allow-xmlrpc` | 开关 / flag | 关（封锁）/ off (blocked) | `deploy` / `update` / `enable-ssl` / `restore` |
-| `--php-version` | `X.Y` | 自动探测最高版本 / auto-detect highest | `deploy` / `update` / `enable-ssl` / `restore` |
+| `--php-version` | `X.Y` | 自动升级到 8.4（已满足 ≥8.3 时跳过）/ auto-upgrade to 8.4 (skipped if ≥8.3) | `deploy` / `update` / `enable-ssl` / `restore` |
 | `--db-host` | 字符串 / string | `localhost` | 全部 / all |
 | `--db-root-pass` | 字符串 / string | `$WP_DB_ROOT_PASS` | 全部 / all |
 | `--no-db-ssl` | 开关 / flag | 关 / off | 全部 / all |
@@ -441,6 +441,7 @@ The following run **unconditionally** during `deploy` without any flags:
 | 功能 / Feature | 说明 / Description |
 |---|---|
 | **Swap 自动创建** / Auto swap creation | 内存 ≤2 GB 且无 Swap 时自动创建 swapfile（≤1 GB RAM→1 GB swap，≤2 GB→2 GB swap）<br>Creates swapfile when RAM ≤2 GB and no swap exists (≤1 GB RAM→1 GB, ≤2 GB RAM→2 GB) |
+| **PHP 自动升级** / Auto PHP upgrade *(V3.2.3 新增 / New)* | 检测已装 PHP < 8.3 时自动升级到 8.4（EL: Remi 仓库；Ubuntu: Ondrej PPA；Debian: Sury DPA）。升级后迁移自定义 `php.ini` 设置，禁用旧版 PHP-FPM，重启新版服务。PHP ≥ 8.3 时跳过。<br>Detects installed PHP < 8.3 and auto-upgrades to 8.4 (EL: Remi repo; Ubuntu: Ondrej PPA; Debian: Sury DPA). Migrates custom `php.ini` settings, disables old PHP-FPM, restarts new service. Skipped when PHP ≥ 8.3. |
 | **PHP-FPM 进程数调优** / PHP-FPM pool tuning | 按内存分级设置 `pm.max_children`，防止小 VPS OOM<br>Sets `pm.max_children` based on RAM tier to prevent OOM kills on small VPS |
 | **MariaDB 缓冲池调优** / MariaDB buffer pool tuning | `innodb_buffer_pool_size` 按内存分级配置<br>Tiers `innodb_buffer_pool_size` according to available RAM |
 | **TCP / BBR 内核调优** / Kernel network tuning | 写入 sysctl drop-in，开启 BBR 拥塞控制（内核 4.9+）<br>Writes sysctl drop-in enabling BBR congestion control (kernel 4.9+) |
