@@ -21,7 +21,7 @@ One command to deploy WordPress with HTTPS, auto-renewal, and production-grade s
 - **Strict permissions** — wp-config.php locked to 0440 from creation; `O_NOFOLLOW` on all atomic write paths; SELinux booleans auto-configured
 - **Unified security entry points** — `_safe_rmtree` (parent whitelist + symlink block), `_safe_copy2` (bidirectional symlink check), `_safe_mkstemp` (`O_NOFOLLOW` + `fchmod`), `_verify_gzip_integrity` (pre-extract CRC check), `_safe_extract_tar` (path traversal + symlink member + timeout protection). 45 call sites across the script use these entry points.
 - **Git tag-pinned builds** — srcache/Brotli compilation modules pinned to git tags (not commit hashes), immune to GitHub shallow-clone restrictions
-- **Nginx hardening** — rate limiting on wp-login.php + admin-ajax.php, HSTS, CSP enforcement, wp-config/uploads/xmlrpc/wp-includes deny, HTTP method filtering, cert SAN / server_name auto-alignment, FastCGI cache (optional), Redis srcache full-page cache (optional), Brotli (optional), HTTP/3 QUIC (optional)
+- **Nginx hardening** — rate limiting on wp-login.php + admin-ajax.php, HSTS, CSP enforcement (`frame-ancestors` / `upgrade-insecure-requests`), wp-config/uploads/xmlrpc/wp-includes deny, HTTP method filtering, cert SAN / server_name auto-alignment, dynamic module load error cascade auto-repair (ABI mismatch → reinstall → remove → orphaned directive cleanup), proactive minor-version upgrades, FastCGI cache (optional), Redis srcache full-page cache (optional), Brotli (optional), HTTP/3 QUIC (optional)
 - **Fail2Ban** — auto-configured WordPress brute-force protection with progressive banning (24h + escalation)
 - **Auto-renewal** — systemd daily timer with randomized delay, `--cert-name` precision renewal, persistent deploy hook, post-renewal Nginx certificate verification, renewal failure webhook notification
 - **Backup & restore** — one-command backup (DB + files + Nginx + Fail2Ban/logrotate + Let's Encrypt certs); atomic DB restore via RENAME TABLE; external DB retry with exponential backoff
@@ -452,7 +452,7 @@ sudo python3 wp_ssl_bootstrap.py uninstall --domain example.com --purge
 - **原子写入** — 所有配置文件使用 `O_NOFOLLOW` + `fsync` + 备份/回滚；拒绝写入符号链接目标
 - **wp-config.php 加固** — `DISALLOW_FILE_EDIT`、`FORCE_SSL_ADMIN`、`DISALLOW_UNFILTERED_HTML` 等
 - **禁用 Core dump** — `RLIMIT_CORE=0` + `PR_SET_DUMPABLE=0`
-- **Nginx 纵深防御** — 隐藏版本号、uploads 禁 PHP、wp-cron 限本机、登录速率限制、证书 SAN 与 server_name 自动对齐
+- **Nginx 纵深防御** — 隐藏版本号、uploads 禁 PHP、wp-cron 限本机、登录速率限制、证书 SAN 与 server_name 自动对齐、CSP 现代化策略（`frame-ancestors` 取代 X-Frame-Options、`upgrade-insecure-requests` 自动升级子资源、移除废弃的 X-XSS-Protection）、动态模块加载错误级联自动修复
 - **certbot 错误熔断** — 非 CA 侧致命错误立即跳出；ECDSA 优先 + 逐 CA RSA 降级；ZeroSSL 自动 fallback
 - **供应链安全** — self-update 使用硬编码双源 + 强制交叉 SHA-256 校验
 - **Webhook SSRF 防护** — 强制 HTTPS；拒绝私有 IP、内网域名后缀、IPv4-mapped IPv6

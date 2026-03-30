@@ -1,5 +1,5 @@
-# WP-SSL-Bootstrap V3.2.3 — 全新建站参数指南
-# WP-SSL-Bootstrap V3.2.3 — New Site Deployment Guide
+# WP-SSL-Bootstrap V3.2.4 — 全新建站参数指南
+# WP-SSL-Bootstrap V3.2.4 — New Site Deployment Guide
 
 ---
 
@@ -441,7 +441,9 @@ The following run **unconditionally** during `deploy` without any flags:
 | 功能 / Feature | 说明 / Description |
 |---|---|
 | **Swap 自动创建** / Auto swap creation | 内存 ≤2 GB 且无 Swap 时自动创建 swapfile（≤1 GB RAM→1 GB swap，≤2 GB→2 GB swap）<br>Creates swapfile when RAM ≤2 GB and no swap exists (≤1 GB RAM→1 GB, ≤2 GB RAM→2 GB) |
-| **PHP 自动升级** / Auto PHP upgrade *(V3.2.3 新增 / New)* | 检测已装 PHP < 8.3 时自动升级到 8.4（EL: Remi 仓库；Ubuntu: Ondrej PPA；Debian: Sury DPA）。升级后迁移自定义 `php.ini` 设置，禁用旧版 PHP-FPM，重启新版服务。PHP ≥ 8.3 时跳过。<br>Detects installed PHP < 8.3 and auto-upgrades to 8.4 (EL: Remi repo; Ubuntu: Ondrej PPA; Debian: Sury DPA). Migrates custom `php.ini` settings, disables old PHP-FPM, restarts new service. Skipped when PHP ≥ 8.3. |
+| **PHP 自动升级** / Auto PHP upgrade *(V3.2.3 新增 / New in V3.2.3)* | 检测已装 PHP < 8.3 时自动升级到 8.4（EL: Remi 仓库；Ubuntu: Ondrej PPA；Debian: Sury DPA）。升级后迁移自定义 `php.ini` 设置，禁用旧版 PHP-FPM，重启新版服务。PHP ≥ 8.3 时跳过。<br>Detects installed PHP < 8.3 and auto-upgrades to 8.4 (EL: Remi repo; Ubuntu: Ondrej PPA; Debian: Sury DPA). Migrates custom `php.ini` settings, disables old PHP-FPM, restarts new service. Skipped when PHP ≥ 8.3. |
+| **Nginx 小版本主动升级** / Proactive Nginx minor upgrade *(V3.2.4 新增 / New in V3.2.4)* | 已安装 Nginx 满足最低版本但低于仓库最新 patch 版本时，主动升级（如 1.28.0→1.28.1），升级后自动走统一验证链（`nginx -t` → 模块修复 → graceful restart）。<br>When installed Nginx meets the minimum but is below the repo's latest patch version, proactively upgrades (e.g. 1.28.0→1.28.1) followed by the unified verification chain (`nginx -t` → module repair → graceful restart). |
+| **Nginx 动态模块自动修复** / Nginx module auto-repair *(V3.2.4 新增 / New in V3.2.4)* | `nginx -t` 检测到动态模块加载失败（ABI 不匹配 / undefined symbol / .so 缺失）时，自动重装→移除→清理孤立指令，多轮迭代直至通过。<br>When `nginx -t` detects dynamic module load failures (ABI mismatch / undefined symbol / missing .so), auto-reinstalls→removes→cleans orphaned directives, iterating until passing. |
 | **PHP-FPM 进程数调优** / PHP-FPM pool tuning | 按内存分级设置 `pm.max_children`，防止小 VPS OOM<br>Sets `pm.max_children` based on RAM tier to prevent OOM kills on small VPS |
 | **MariaDB 缓冲池调优** / MariaDB buffer pool tuning | `innodb_buffer_pool_size` 按内存分级配置<br>Tiers `innodb_buffer_pool_size` according to available RAM |
 | **TCP / BBR 内核调优** / Kernel network tuning | 写入 sysctl drop-in，开启 BBR 拥塞控制（内核 4.9+）<br>Writes sysctl drop-in enabling BBR congestion control (kernel 4.9+) |
@@ -451,7 +453,7 @@ The following run **unconditionally** during `deploy` without any flags:
 | **mysqlcheck 周度优化** / Weekly DB optimize | 每周日 03:00 自动执行碎片回收（外置数据库时跳过）<br>Runs `mysqlcheck --optimize` every Sunday at 03:00; skipped for external databases |
 | **Certbot 持久化 deploy hook** / Persistent certbot hook | 证书续期后自动 reload Nginx，无论由脚本 timer 还是 certbot 自身 timer 触发<br>Reloads Nginx after every renewal regardless of which timer triggered it |
 | **静态资源长缓存** / Static asset caching | 图片 365 天、JS/CSS 30 天、字体 365 天 + CORS<br>Images 365d, JS/CSS 30d, fonts 365d + CORS headers |
-| **安全响应头** / Security headers | HSTS / CSP / X-Content-Type-Options / Referrer-Policy / Permissions-Policy 全套<br>Full suite: HSTS, CSP, X-Content-Type-Options, Referrer-Policy, Permissions-Policy |
+| **安全响应头** / Security headers | HSTS / CSP (`frame-ancestors` / `upgrade-insecure-requests`) / X-Content-Type-Options / Referrer-Policy / Permissions-Policy 全套；已移除废弃的 X-Frame-Options 和 X-XSS-Protection<br>Full suite: HSTS, CSP (`frame-ancestors`, `upgrade-insecure-requests`), X-Content-Type-Options, Referrer-Policy, Permissions-Policy. Deprecated X-Frame-Options and X-XSS-Protection removed. |
 | **OS 自动安全更新** / OS auto security updates | Debian/Ubuntu: unattended-upgrades；RHEL 系: dnf-automatic / yum-cron<br>Debian/Ubuntu: unattended-upgrades; RHEL: dnf-automatic / yum-cron |
 | **操作前自动备份** / Pre-operation backup | `enable-ssl` / `update` / `restore` 执行前自动轻量备份（DB + Nginx 配置），可通过 `--no-pre-backup` 跳过<br>Lightweight auto-backup (DB + Nginx config) before `enable-ssl` / `update` / `restore`; skip with `--no-pre-backup` |
 | **ECC 证书** / ECDSA certificates | 优先使用 ECDSA P-256 密钥签发（TLS 握手更快），certbot 不支持时自动降级 RSA<br>Prefers ECDSA P-256 key type (faster TLS handshake); auto-falls back to RSA if unsupported |

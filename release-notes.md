@@ -1,36 +1,40 @@
-# V3.2.3 — Security & Architecture Hardening Release
+# V3.2.4 — Stability & i18n Hardening Release
 
 One-command WordPress + HTTPS deployment engine for production Linux servers.
 
-## What's New in V3.2.3
+## What's New in V3.2.4
 
-V3.2.3 refines V3.2.2 through 10 audit rounds and 51 pattern-verified checks, adding automatic PHP version management, 24 security fixes, git tag-pinned builds, and 6 logic defect fixes. Net +1,126 lines (28,007→29,133).
+V3.2.4 refines V3.2.3 through 8 patches (PATCH-262–269) plus a comprehensive i18n audit, adding Nginx dynamic module auto-repair, FastCGI snippet deduplication, modernized CSP security policy, proactive Nginx minor-version upgrades, and a full i18n system cleanup. Net +6,946 lines (29,133→36,079).
 
-🐘 **Automatic PHP upgrade** — detects installed PHP version; auto-upgrades to 8.4 when below 8.3 minimum. EL via EPEL + Remi repo + `dnf module enable php:remi-8.4` + `dnf update php*`; Ubuntu via Ondrej PPA; Debian via Sury DPA (DEB822). Migrates custom `php.ini` settings (`upload_max_filesize`, `post_max_size`, `memory_limit`, `max_execution_time`) post-upgrade, disables old PHP-FPM service, restarts new service. Covers 7 distros: EL8/9 (Remi), EL10 (native), Ubuntu 22.04 (Ondrej), Ubuntu 24.04 (native), Debian 12 (Sury), Debian 13 (native). `--php-version` now forces version switch even when installed PHP meets minimum.
+🔧 **Nginx dynamic module auto-repair (PATCH-268)** — when `nginx -t` detects dynamic module load failures (ABI mismatch / undefined symbol / missing .so), automatically attempts reinstall → if that fails, removes .so → cleans orphaned `load_module` directives and module-specific directives, iterating until `nginx -t` passes. srcache compilation now uses full `nginx -V` configure arguments (replacing `--with-compat` fallback) for better ABI compatibility.
 
-📌 **Git tag-pinned module builds** — 5 OpenResty modules for srcache/Brotli compilation switched from commit hashes to git tags (`v0.3.4` / `v0.33` / `v0.64` / `v0.15` / `v0.33`), fixing GitHub shallow-clone rejection. ngx_brotli uses HEAD clone (v1.0.0rc from 2018 fails on GCC 13+). echo-nginx-module upgraded v0.63→v0.64.
+📎 **FastCGI PHP snippet deduplication (PATCH-267)** — extracts repeated 5-line fastcgi configuration from `location ~ \.php$` blocks into `/etc/nginx/snippets/fastcgi-php.conf`; all location blocks reference it via `include`, eliminating cross-block config drift. Auto-cleaned on uninstall.
 
-🛡️ **4 unified security entry-point functions** — `_safe_rmtree` (parent whitelist + symlink block + `../` filter), `_safe_copy2` (bidirectional symlink check on src and dst), `_safe_mkstemp` (`O_NOFOLLOW` + `fchmod` dual protection), `_verify_gzip_integrity` (pre-extract CRC check). All 45 call sites unified through these entry points.
+⬆️ **Proactive Nginx minor-version upgrades (PATCH-268)** — when installed Nginx meets the minimum version but is below the repo's latest patch version, proactively upgrades (e.g. 1.28.0→1.28.1) followed by the unified verification chain (`nginx -t` → module repair → graceful restart).
 
-🔒 **Secure tar extraction (`_safe_extract_tar`)** — enforces `--no-same-owner --no-same-permissions`, path traversal detection (`..` / absolute paths / symlink member filtering), output directory whitelist, extraction timeout, artifact verification. Covers WordPress, WP-CLI, Nginx source, and compiled artifacts (6 sites).
+🛡️ **Modernized CSP security policy (PATCH-268/269)** — removed deprecated `X-Frame-Options` (superseded by `frame-ancestors`) and `X-XSS-Protection` (built into modern browsers; the header can introduce XSS auditing side-channels). CSP relaxed to WordPress-practical policy (`'unsafe-inline'`/`'unsafe-eval'` for theme/plugin compatibility + `img-src data: blob:` for media library). Added `upgrade-insecure-requests` for automatic HTTP→HTTPS sub-resource upgrade. Temporary ACME-challenge Nginx config now includes basic security headers to prevent exposure after interrupted deployments.
 
-💣 **Gzip bomb protection** — all `.tar.gz` / `.sql.gz` files validated via `gzip -t` integrity check before extraction. Covers WordPress download, backup restore, and WP-CLI extraction.
+🌐 **Comprehensive i18n audit** — 15 `_MESSAGES` keys containing Chinese characters renamed to ASCII convention with proper English translations; 3 hardcoded Chinese `logging.warning()` calls routed through `t()` with new bilingual entries; `generate_http_production_config()` docstring documents why `http3=` is intentionally omitted (QUIC requires TLS).
 
-🔗 **Destination symlink attack prevention (FIX-B2)** — `_safe_copy2` now checks final destination path (including dir+basename join) for symlinks, preventing attacker-planted symlinks from redirecting file writes.
+🐛 **Debian ABI-locked module cleanup (PATCH-262 FIX-P5)** — after switching from Debian `nginx-core` to nginx.org packages, residual ABI-locked module packages (`libnginx-mod-*`) caused `nginx -t` failures. Now auto-detects and removes incompatible packages.
 
-🐛 **clean+redeploy PHP bypass fix (PATCH-261d)** — `_all_critical_deps_present()` previously only checked if `php` binary existed, not its version. After `clean`→`redeploy`, PHP 8.0 remained and was never upgraded. Now checks PHP ≥8.3 (aligned with Nginx ≥1.26 check pattern).
+🐛 **Missing fastcgi.conf after nginx.org switch (PATCH-263 FIX-2)** — `_ensure_fastcgi_conf()` now called for all `cache_mode` paths, not just srcache, ensuring the file exists after switching from AppStream `nginx-core`.
 
-🐛 **`--php-version` skip-path fix (PATCH-261e)** — `--php-version 8.5` was silently ignored when PHP 8.4 was already installed (≥8.3 triggered fast-skip). Now compares requested version against installed and forces install path when different.
+🐛 **srcache residual directive cleanup (PATCH-263 FIX-5)** — after srcache compilation failure and degradation, residual `load_module` directives could leave Nginx in a broken state. Now uses aggressive cleanup + snapshot rollback + manual fix hint as three-tier fallback.
 
-🐛 **`php-redis` version prefix fix (PATCH-261f)** — apt path used unversioned `php-redis` which could install the Redis extension for the wrong PHP version in Ondrej parallel-install environments. Now builds versioned package name (e.g. `php8.4-redis`).
+🐛 **EL10 nginx module stream conflict (PATCH-264 FIX-1)** — `dnf module disable nginx` on EL10 prevents module stream conflicts with nginx.org repo, aligned with EL8/EL9 path.
 
-🐛 **EL in-place PHP-FPM restart (FIX-A6)** — EL PHP upgrade keeps the same service name (`php-fpm`→`php-fpm`); `systemctl enable --now` doesn't restart an already-running service. Now issues explicit `systemctl restart` for same-name upgrades.
+🐛 **EL10 pcre-devel removal (PATCH-265 FIX-1)** — EL10+ removed `pcre-devel`; srcache build dependency list now conditionally excludes it based on `_el_major`.
+
+🐛 **Service not-installed status (PATCH-269 FIX-3)** — `status` subcommand now shows "not installed" for missing Nginx/PHP-FPM, distinguishing from "inactive" (installed but stopped).
 
 ## Highlights
 
 🚀 **Full-stack deployment** — Nginx, PHP-FPM, MariaDB, WordPress, SSL certificate, systemd auto-renewal, Fail2Ban, logrotate, OS auto-security-updates — all from a single `deploy` command.
 
-🔒 **Production-grade security** — 24 new security fixes in this release; zero CLI password leakage, atomic config writes with symlink protection, wp-config hardening, Nginx defense-in-depth, certbot error circuit-breaker with multi-CA failover, supply-chain protection via dual-source cross-verification.
+🔒 **Production-grade security** — modernized CSP policy with `frame-ancestors` and `upgrade-insecure-requests`; zero CLI password leakage, atomic config writes with symlink protection, wp-config hardening, Nginx defense-in-depth with dynamic module auto-repair, certbot error circuit-breaker with multi-CA failover, supply-chain protection via dual-source cross-verification.
+
+🔧 **Self-healing Nginx** — dynamic module load errors (ABI mismatch after upgrades, missing .so files, orphaned directives) are automatically diagnosed and repaired through a multi-iteration cascade: reinstall → remove → directive cleanup → `nginx -t` verification. Proactive minor-version upgrades keep Nginx at the latest patch level.
 
 🐘 **PHP lifecycle management** — automatic version detection, repository setup (Remi/Ondrej/Sury), in-place upgrade with `php.ini` migration, old service cleanup. Future PHP bumps require only constant changes (`_PHP_MIN_VERSION`, `_PHP_DEFAULT_VERSION`).
 
@@ -40,7 +44,7 @@ V3.2.3 refines V3.2.2 through 10 audit rounds and 51 pattern-verified checks, ad
 
 📦 **Ops toolkit** — `backup`, `restore`, `update`, `enable-ssl`, `status`, `self-update`, `uninstall` subcommands for day-2 operations — with atomic DB restore, plugin safe-upgrade, and webhook alerting.
 
-🌍 **Bilingual** — full Chinese/English interface, auto-detected from system locale.
+🌍 **Bilingual** — full Chinese/English interface, auto-detected from system locale. V3.2.4 completes the i18n audit: zero hardcoded Chinese in logging paths, all message keys use ASCII naming convention.
 
 ## Quick Start
 
@@ -78,6 +82,15 @@ sudo python3 wp_ssl_bootstrap.py update --domain example.com --no-redis
 
 See [deploy-guide.md](./deploy-guide.md) for scenario-based examples and [README.md](./README.md) for full documentation.
 
+## Upgrade from V3.2.3
+
+```bash
+# Replace script file, then:
+sudo python3 wp_ssl_bootstrap.py update --domain example.com
+```
+
+Nginx module auto-repair activates immediately — any existing dynamic module load errors will be diagnosed and fixed on next `update` or `deploy`. CSP headers are updated automatically. The i18n fixes are transparent: English users who previously saw Chinese log messages in tar backup paths will now see proper English. No manual reconfiguration needed.
+
 ## Upgrade from V3.2.2
 
 ```bash
@@ -85,7 +98,7 @@ See [deploy-guide.md](./deploy-guide.md) for scenario-based examples and [README
 sudo python3 wp_ssl_bootstrap.py update --domain example.com
 ```
 
-PHP auto-upgrade activates automatically on next deploy/redeploy — if installed PHP is below 8.3, it will be upgraded to 8.4 via Remi (EL) or Ondrej/Sury (Deb/Ubuntu). Existing sites with PHP ≥8.3 are unaffected. All 24 security fixes (safe rmtree/copy/mkstemp/tar, gzip validation, symlink protection) apply immediately.
+All V3.2.3 + V3.2.4 features activate automatically. PHP auto-upgrade runs on next deploy/redeploy if installed PHP is below 8.3.
 
 ## Upgrade from V3.2.1
 
@@ -94,7 +107,7 @@ PHP auto-upgrade activates automatically on next deploy/redeploy — if installe
 sudo python3 wp_ssl_bootstrap.py update --domain example.com
 ```
 
-All V3.2.2 + V3.2.3 features activate automatically. Existing timers inherit parameters from EnvironmentFile — no manual reconfiguration needed.
+All V3.2.2 + V3.2.3 + V3.2.4 features activate automatically. Existing timers inherit parameters from EnvironmentFile — no manual reconfiguration needed.
 
 ## Upgrade from V3.2.0
 
@@ -103,7 +116,7 @@ All V3.2.2 + V3.2.3 features activate automatically. Existing timers inherit par
 sudo python3 wp_ssl_bootstrap.py update --domain example.com
 ```
 
-All V3.2.1 + V3.2.2 + V3.2.3 features activate automatically. Existing SSL timers inherit parameters from previous unit files.
+All V3.2.1 + V3.2.2 + V3.2.3 + V3.2.4 features activate automatically. Existing SSL timers inherit parameters from previous unit files.
 
 ## Upgrade from V3.1.x
 
@@ -112,25 +125,29 @@ All V3.2.1 + V3.2.2 + V3.2.3 features activate automatically. Existing SSL timer
 sudo python3 wp_ssl_bootstrap.py update --domain example.com
 ```
 
-All V3.2.x configs (Brotli / Cloudflare / Fail2Ban / logrotate / systemd timers / webhook / HTTP/3 / srcache / PHP upgrade) rebuild automatically.
+All V3.2.x configs (Brotli / Cloudflare / Fail2Ban / logrotate / systemd timers / webhook / HTTP/3 / srcache / PHP upgrade / Nginx module repair) rebuild automatically.
 
-## Key Bug Fixes (V3.2.3)
+## Key Bug Fixes (V3.2.4)
 
-- **clean+redeploy PHP bypass (PATCH-261d)** — `_all_critical_deps_present` now checks PHP version (≥8.3), not just binary existence; PHP 8.0 after clean→redeploy is now properly upgraded
-- **`--php-version` skip-path bypass (PATCH-261e)** — `--php-version 8.5` no longer silently ignored when installed PHP 8.4 ≥ 8.3 triggers fast-skip
-- **`php-redis` wrong version (PATCH-261f)** — apt path now uses versioned `php8.4-redis` instead of unversioned `php-redis` in Ondrej parallel-install environments
-- **EL PHP-FPM not restarted (FIX-A6)** — same-name service upgrade (`php-fpm`→`php-fpm`) now triggers explicit restart instead of no-op `enable --now`
-- **PHP repo failure silent continuation (FIX-C5)** — Remi/Ondrej setup failure now properly falls back to system default packages instead of generating non-existent versioned package names
-- **`--php-version` unnecessary upgrade (FIX-A2)** — `--php-version 8.4` on already-installed PHP 8.4 no longer triggers redundant repo setup
+- **Debian ABI-locked modules (PATCH-262 FIX-P5)** — residual `libnginx-mod-*` packages after nginx-core→nginx.org switch now auto-removed
+- **logrotate postrotate (PATCH-262 FIX-P8)** — standardized to USR1 signal, replacing PID-file-dependent patterns
+- **Missing fastcgi.conf (PATCH-263 FIX-2)** — `_ensure_fastcgi_conf()` now runs for all cache modes, not just srcache
+- **srcache orphaned directives (PATCH-263 FIX-5)** — aggressive cleanup + snapshot rollback + manual fix hint on compilation failure
+- **EL10 nginx module stream (PATCH-264 FIX-1)** — `dnf module disable nginx` prevents repo conflict on EL10
+- **EL10 pcre-devel (PATCH-265 FIX-1)** — removed from srcache build deps on EL10+ (package no longer exists)
+- **Service status display (PATCH-269 FIX-3)** — "not installed" vs "inactive" now correctly distinguished
 
-## Security Fixes (V3.2.3, PATCH-256~260)
+## i18n Fixes (V3.2.4)
 
-- **`_safe_rmtree`** — parent directory whitelist, root protection, `../` traversal detection, symlink blocking (replaces all `shutil.rmtree` calls)
-- **`_safe_copy2`** — bidirectional symlink check on source AND destination (FIX-B2: attacker-planted dst symlink attack)
-- **`_safe_mkstemp`** — `O_NOFOLLOW` + post-creation `fchmod` dual permission guarantee (Python 3.6 compatible)
-- **`_safe_extract_tar`** — `--no-same-owner --no-same-permissions`, path traversal filtering, output whitelist, timeout, artifact verification (6 extraction sites)
-- **`_verify_gzip_integrity`** — pre-extraction `gzip -t` CRC check for all `.tar.gz` / `.sql.gz` files
-- **Git tag pinning** — 5 OpenResty modules pinned to release tags instead of commit hashes; immune to GitHub shallow-clone restrictions
+- **15 Chinese-character keys renamed** — `_MESSAGES` keys like `warn_redis_安装失败_部署将继续_不含_redis` renamed to ASCII convention (`warn_redis_install_failed_continuing_without_redis`); `en` field replaced with actual English translation; all call sites updated
+- **3 hardcoded Chinese `logging.warning()` fixed** — tar backup error messages (`warn_tar_error_detail`, `warn_tar_letsencrypt_error_detail`, `warn_tar_partial_files_changed`) now routed through `t()` with bilingual entries
+- **`--skip-ssl` path documented** — `generate_http_production_config()` docstring explains `http3=` omission (QUIC requires TLS)
+
+## Security Enhancements (V3.2.4)
+
+- **CSP modernization** — removed deprecated `X-Frame-Options` and `X-XSS-Protection`; added `frame-ancestors 'self'`, `upgrade-insecure-requests`; relaxed CSP for WordPress theme/plugin compatibility
+- **Temporary config security headers (PATCH-269)** — ACME challenge phase Nginx config now includes security headers to prevent exposure after deployment interruption
+- **srcache ABI improvement (PATCH-268)** — compilation uses full `nginx -V` configure arguments instead of `--with-compat` fallback
 
 ## Requirements
 
@@ -143,7 +160,7 @@ Everything else is installed automatically. PHP < 8.3 is automatically upgraded 
 ## Checksums
 
 ```
-SHA256: 86121a2efb984bbfe1294e62ec583082c190b648ba8a05be451b65ae9059c9c4  wp_ssl_bootstrap.py
+SHA256: 88210d30acf269bf411e671627482a17712d9aaf3ddb75011e2ca605288fb09d  wp_ssl_bootstrap.py
 ```
 
 ## License

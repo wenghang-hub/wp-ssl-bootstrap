@@ -4,6 +4,100 @@ All notable changes to WP-SSL-Bootstrap are documented in this file.
 本文件记录 WP-SSL-Bootstrap 的所有重要变更。
 ---
 
+## [V3.2.4]
+
+> **升级说明 / Upgrade note**
+> V3.2.4 是 V3.2.3 之后经过 8 轮补丁 + i18n 全面审计的稳定性与国际化强化版本。
+> 新增 Nginx 动态模块加载错误自动级联修复、FastCGI PHP snippet 去重、
+> CSP 安全策略现代化；完成 i18n 系统全面审计：15 个中文 key 重命名 + 英文翻译、
+> 3 处硬编码中文消息修复。
+> 从 V3.2.3 升级时，直接替换脚本文件并执行 `update` 子命令即可。
+>
+> V3.2.4 is a stability and i18n hardening release after V3.2.3, with 8 patches
+> plus a comprehensive i18n audit. Adds Nginx dynamic module load error cascade
+> auto-repair, FastCGI PHP snippet deduplication, modernized CSP security policy;
+> completes full i18n audit: 15 Chinese-character keys renamed with English
+> translations, 3 hardcoded Chinese log messages fixed.
+> To upgrade from V3.2.3, replace the script and run the `update` subcommand.
+
+---
+
+### ✨ 新功能 / New Features
+
+- **Nginx 动态模块加载错误级联自动修复 (PATCH-268)** — `nginx -t` 检测到动态模块加载失败（ABI 不匹配 / undefined symbol / .so 缺失）时，自动尝试重新安装模块包→失败则移除 .so→清理孤立的 `load_module` 指令和模块专属 directive，多轮迭代直至 `nginx -t` 通过。srcache 编译时使用完整 `nginx -V` 编译参数（替代 `--with-compat` 兜底），提升 ABI 兼容性。
+  **Nginx dynamic module load error cascade auto-repair (PATCH-268)** — When `nginx -t` detects dynamic module load failures (ABI mismatch / undefined symbol / missing .so), automatically attempts reinstall→if that fails, removes .so→cleans orphaned `load_module` directives and module-specific directives, iterating until `nginx -t` passes. srcache compilation now uses full `nginx -V` configure arguments (replacing `--with-compat` fallback) for better ABI compatibility.
+
+- **FastCGI PHP snippet 去重 (PATCH-267)** — 将 `location ~ \.php$` 块中重复的 5 行 fastcgi 配置提取到 `/etc/nginx/snippets/fastcgi-php.conf` snippet 文件，所有 location 块通过 `include` 引用，消除跨块配置漂移风险。卸载时自动清理 snippet 文件。
+  **FastCGI PHP snippet deduplication (PATCH-267)** — Extracts repeated 5-line fastcgi configuration from `location ~ \.php$` blocks into a `/etc/nginx/snippets/fastcgi-php.conf` snippet file; all location blocks use `include` to reference it, eliminating cross-block config drift. Snippet auto-cleaned on uninstall.
+
+- **Nginx 小版本主动升级 (PATCH-268)** — 当已安装 Nginx 满足最低版本但低于仓库最新 patch 版本时，主动执行小版本升级（如 1.28.0→1.28.1），升级后走统一验证链（`nginx -t` → 模块修复 → graceful restart）。
+  **Proactive Nginx minor-version upgrades (PATCH-268)** — When installed Nginx meets the minimum version but is below the latest patch version in the repo, proactively upgrades (e.g. 1.28.0→1.28.1) followed by the unified verification chain (`nginx -t` → module repair → graceful restart).
+
+---
+
+### 🔒 安全增强 / Security Enhancements
+
+- **CSP 安全策略现代化 (PATCH-268/269)** — 移除已废弃的 `X-Frame-Options` 响应头（`frame-ancestors` 完全取代）；移除已废弃的 `X-XSS-Protection`（现代浏览器已内置，该头反而可能引入 XSS 审计侧信道）；CSP 放宽为 WordPress 实用策略（允许 `'unsafe-inline'`/`'unsafe-eval'` 兼容主题/插件 + `img-src data: blob:` 兼容媒体库）；新增 `upgrade-insecure-requests` 自动升级 HTTP 子资源。
+  **Modernized CSP security policy (PATCH-268/269)** — Removed deprecated `X-Frame-Options` header (superseded by `frame-ancestors`); removed deprecated `X-XSS-Protection` (built into modern browsers; the header can introduce XSS auditing side-channels); CSP relaxed to WordPress-practical policy (`'unsafe-inline'`/`'unsafe-eval'` for theme/plugin compatibility + `img-src data: blob:` for media library); added `upgrade-insecure-requests` for automatic HTTP→HTTPS sub-resource upgrade.
+
+- **临时 Nginx 配置安全头加固 (PATCH-269)** — ACME challenge 阶段的临时 Nginx 配置现包含基本安全响应头（`X-Content-Type-Options` / `Referrer-Policy` 等），防止部署中断（SIGTERM/SIGKILL）后临时配置长期暴露无安全头的状态。
+  **Security headers in temporary Nginx config (PATCH-269)** — ACME challenge phase temporary Nginx config now includes basic security headers, preventing prolonged exposure without security headers if deployment is interrupted.
+
+---
+
+### 🐛 问题修复 / Bug Fixes
+
+- **[PATCH-262 FIX-P5] Debian ABI 锁定模块清理** — Debian 系统 nginx-core→nginx.org 切换后，残留的 ABI 锁定模块包（如 `libnginx-mod-*`）导致 `nginx -t` 失败。现自动检测并移除不兼容模块包。
+  **Debian ABI-locked module cleanup** — After switching from Debian nginx-core to nginx.org packages, residual ABI-locked module packages caused `nginx -t` failures. Now auto-detects and removes incompatible module packages.
+
+- **[PATCH-262 FIX-P8] logrotate postrotate 标准化** — `/etc/logrotate.d/nginx` 的 `postrotate` 指令统一为 `USR1` 信号，替代可能因 PID 文件路径差异而失效的 `kill -USR1 $(cat /run/nginx.pid)` 模式。
+  **logrotate postrotate normalization** — Standardized postrotate in `/etc/logrotate.d/nginx` to USR1 signal, replacing patterns that could fail due to PID file path differences.
+
+- **[PATCH-263 FIX-2] nginx.org 包缺失 fastcgi.conf** — AppStream `nginx-core` 包含 `fastcgi.conf`，切换到 nginx.org 后该文件可能丢失。`_ensure_fastcgi_conf()` 现在在所有 cache_mode 路径中调用，而非仅 srcache 路径。
+  **Missing fastcgi.conf after nginx.org switch** — `_ensure_fastcgi_conf()` now called for all cache_mode paths, not just srcache, ensuring the file exists after switching from AppStream nginx-core.
+
+- **[PATCH-263 FIX-5] srcache 残留 load_module 指令清理** — `_ensure_srcache_modules` 编译失败降级后，`nginx.conf` 中可能残留 `load_module` 指令导致 `nginx -t` 失败。现激进清理 + 快照回退 + 人工修复提示三级容错。
+  **Residual srcache load_module directive cleanup** — After srcache compilation failure and degradation, residual `load_module` directives could cause `nginx -t` failures. Now uses aggressive cleanup + snapshot rollback + manual fix hint as three-tier fallback.
+
+- **[PATCH-264 FIX-1] EL10 nginx 模块流禁用** — EL10 系统 `dnf module disable nginx` 避免模块流与 nginx.org 仓库冲突，与 EL8/EL9 路径对齐。
+  **EL10 nginx module stream disable** — `dnf module disable nginx` on EL10 to prevent module stream conflicts with nginx.org repo, aligned with EL8/EL9 path.
+
+- **[PATCH-265 FIX-1] EL10 `pcre-devel` 移除** — EL10+ 已移除 `pcre-devel`/`pcre1-devel`，srcache 编译依赖列表现根据 `_el_major` 条件排除，避免 `dnf install` 报错。
+  **EL10 pcre-devel removal** — EL10+ removed `pcre-devel`; srcache build dependency list now conditionally excludes it based on `_el_major`.
+
+- **[PATCH-269 FIX-3] 服务未安装状态文本** — `status` 子命令中 Nginx/PHP-FPM 未安装时显示「未安装」/「not installed」，区别于 `inactive`（已安装但未运行）。
+  **Service not-installed status text** — `status` subcommand now shows "not installed" for missing Nginx/PHP-FPM, distinguishing from "inactive" (installed but stopped).
+
+---
+
+### 🌐 i18n 全面审计 / Comprehensive i18n Audit
+
+- **15 个中文字符 key 重命名** — `_MESSAGES` 字典中 15 个含中文字符的 key（如 `warn_redis_安装失败_部署将继续_不含_redis`）全部重命名为 ASCII 规范命名（如 `warn_redis_install_failed_continuing_without_redis`），同步更新全部调用点。原 `en` 字段从中文改为真正的英文翻译，`zh` 字段保持不变。
+  **15 Chinese-character keys renamed** — 15 `_MESSAGES` keys containing Chinese characters renamed to ASCII-only convention (e.g. `warn_redis_安装失败…` → `warn_redis_install_failed_continuing_without_redis`); all call sites updated. The `en` field replaced with actual English translation; `zh` field unchanged.
+
+- **3 处硬编码中文 `logging.warning()` 修复** — tar 备份路径中 3 处 `logging.warning()` 绕过 `t()` 系统直接写入中文字符串（tar 错误详情 × 2、tar 归档文件变化警告 × 1），英文用户会看到纯中文消息。改为 `t()` 调用，新增 `warn_tar_error_detail` / `warn_tar_letsencrypt_error_detail` / `warn_tar_partial_files_changed` 三个双语条目。
+  **3 hardcoded Chinese `logging.warning()` calls fixed** — 3 `logging.warning()` calls in the tar backup path bypassed `t()` and emitted raw Chinese strings, making them invisible to English users. Routed through `t()` with 3 new bilingual entries: `warn_tar_error_detail`, `warn_tar_letsencrypt_error_detail`, `warn_tar_partial_files_changed`.
+
+- **`--skip-ssl` 路径设计文档补充** — `generate_http_production_config()` 的 docstring 补充说明：该函数故意不接受 `http3=` 参数，因为 HTTP/3 (QUIC) 依赖 TLS，仅在 HTTPS 路径 (`generate_https_config`) 有意义。
+  **`--skip-ssl` path design documentation** — Added docstring note to `generate_http_production_config()` explaining why it intentionally omits the `http3=` parameter: HTTP/3 (QUIC) requires TLS, making it meaningful only in the HTTPS path.
+
+---
+
+### 🔨 工程改进 / Engineering
+
+- **PATCH-265 下载工作流 i18n** — 下载失败时记录每个端点的具体错误原因（DNS/超时/证书/防火墙），便于运维诊断。新增 `_el_major()` 方法从 `/etc/os-release` 提取 EL 系主版本号，替代 `_is_dnf5` 代理判断。
+  **PATCH-265 download workflow i18n** — Download failures now log specific error reasons per endpoint (DNS/timeout/cert/firewall) for ops diagnosis. New `_el_major()` method extracts EL major version from `/etc/os-release`, replacing `_is_dnf5` proxy detection.
+
+- **PATCH-262 PHP 升级后清理** — 新版 PHP-FPM 启动后才清理旧版 PHP 包（保证服务连续性）；升级后验证关键扩展可加载；清除旧版字节码缓存（与新 PHP ABI 不兼容）；SELinux `httpd_cache_t` 上下文自动设置。
+  **PATCH-262 post-PHP-upgrade cleanup** — Old PHP packages cleaned only after new PHP-FPM starts (service continuity); critical extensions verified post-upgrade; stale bytecode cache cleared (ABI incompatible); SELinux `httpd_cache_t` context auto-set.
+
+- **48 条新翻译条目** — PATCH-262 ~ 269 新增的模块修复、PHP 管理、下载诊断、CSP 策略等日志消息均通过 `t()` 翻译系统提供 zh + en 双语。i18n 审计额外修正 15 + 3 = 18 条未国际化条目。
+  **48 new translation entries** — All new module repair, PHP management, download diagnostics, and CSP policy messages from PATCH-262–269 go through `t()` with zh + en. i18n audit additionally fixed 15 + 3 = 18 un-internationalized entries.
+
+- `__version__` 从 `"3.2.3"` 升至 `"3.2.4"`；`__build__` 从 `"3.2.261f"` 升至 `"3.2.269"`。净增 6946 行（29,133→36,079），PATCH-262 ~ 269 + i18n 审计共 8 轮补丁。
+
+---
+
 ## [V3.2.3]
 
 > **升级说明 / Upgrade note**
