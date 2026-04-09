@@ -1,0 +1,79 @@
+# .github/workflows/typecheck.yml
+# PATCH-277: mypy Phase 2 type checking in CI
+#
+# Triggers on push/PR to main branch.
+# Fails the build if any function lacks type annotations
+# or if mypy detects type errors (except union-attr, see mypy.ini).
+
+name: Type Check
+
+on:
+  push:
+    branches: [main, master]
+    paths: ['wp_ssl_bootstrap.py']
+  pull_request:
+    branches: [main, master]
+    paths: ['wp_ssl_bootstrap.py']
+
+jobs:
+  mypy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install mypy
+        run: pip install mypy
+
+      - name: Run mypy (Phase 2 — disallow_untyped_defs)
+        run: mypy --config-file mypy.ini wp_ssl_bootstrap.py
+
+      # Optional: also run pyright for additional checks
+      # - name: Install pyright
+      #   run: pip install pyright
+      # - name: Run pyright
+      #   run: pyright wp_ssl_bootstrap.py
+
+  annotation-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check 100% annotation coverage
+        run: |
+          python3 -c "
+          import ast, sys
+          with open('wp_ssl_bootstrap.py') as f:
+              tree = ast.parse(f.read())
+          total = full = 0
+          for n in ast.walk(tree):
+              if isinstance(n, ast.FunctionDef):
+                  total += 1
+                  ns = [a for a in n.args.args + n.args.kwonlyargs if a.arg not in ('self','cls')]
+                  if n.returns and all(a.annotation for a in ns):
+                      full += 1
+          pct = 100 * full // total if total else 0
+          print(f'Type annotation coverage: {full}/{total} ({pct}%)')
+          if full < total:
+              print(f'ERROR: {total - full} functions missing annotations')
+              for n in ast.walk(tree):
+                  if isinstance(n, ast.FunctionDef):
+                      ns = [a for a in n.args.args + n.args.kwonlyargs if a.arg not in ('self','cls')]
+                      ua = [a.arg for a in ns if not a.annotation]
+                      if ua or not n.returns:
+                          print(f'  L{n.lineno} {n.name}: ret={bool(n.returns)} untyped={ua}')
+              sys.exit(1)
+          print('OK: 100% coverage')
+          "

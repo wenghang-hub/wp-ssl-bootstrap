@@ -1,5 +1,5 @@
-# WP-SSL-Bootstrap V3.2.4 — 全新建站参数指南
-# WP-SSL-Bootstrap V3.2.4 — New Site Deployment Guide
+# WP-SSL-Bootstrap V3.2.5 — 全新建站参数指南
+# WP-SSL-Bootstrap V3.2.5 — New Site Deployment Guide
 
 ---
 
@@ -96,7 +96,7 @@ python3 wp_ssl_bootstrap.py deploy \
 | `--optimize` | 启用 Nginx `open_file_cache`（`max=10000 inactive=60s`），减少静态文件密集请求时的内核 `stat()` 调用。<br>Enables Nginx `open_file_cache` (`max=10000 inactive=60s`), reducing kernel `stat()` calls for static-asset-heavy traffic. |
 | `--http3` | *(V3.2.2+ 起 / Since V3.2.2)* 启用 HTTP/3 QUIC 协议（需 Nginx 支持 `http_v3` 模块）。自动开放 UDP 443 防火墙端口，多站点自动共享 `reuseport`。Nginx 不支持时静默忽略。<br>Enables HTTP/3 QUIC protocol (requires Nginx `http_v3` module). Auto-opens UDP 443 firewall port; shares `reuseport` across sites. Silently ignored if Nginx lacks support. |
 | `--cloudflare` | 自动从 Cloudflare API 拉取最新 IP 段，写入全局 `real_ip_from` + `CF-Connecting-IP` 配置，确保日志和 Fail2Ban 记录访客真实 IP 而非 CF 节点 IP；获取失败时回退内置默认值。<br>Auto-fetches Cloudflare IP ranges and writes a global `real_ip_from` + `CF-Connecting-IP` config so logs and Fail2Ban see visitor IPs, not Cloudflare node IPs. Falls back to built-in defaults on fetch failure. |
-| `--notify-webhook` | 续期失败时发送 Webhook 通知（Slack / 飞书 / 企微等）。仅允许 HTTPS URL，内网地址会被安全策略拒绝。<br>Sends a Webhook notification on renewal failure (Slack / Lark / WeCom). HTTPS only; internal URLs are blocked by security policy. |
+| `--notify-webhook` | 续期失败时发送 Webhook 通知（Slack / 飞书 / 企微等）。仅允许 HTTPS URL，内网地址会被安全策略拒绝。**未配置时**脚本自动安装 journal/email 兜底通知（CRIT 级别写 journal + 尝试 `mail` 发邮件给 root），确保续期失败永不静默。<br>Sends a Webhook notification on renewal failure (Slack / Lark / WeCom). HTTPS only; internal URLs are blocked by security policy. **When not configured**, the script auto-installs a journal/email fallback notification (CRIT-level journal entry + email attempted via `mail(1)` to root), ensuring renewal failures are never silent. |
 
 > **注意 / Note**：`--cloudflare` 写入全局 Nginx 配置，同台服务器多个域名共享，只需在**首个域名**部署时加，后续域名无需重复。  
 > `--cloudflare` writes a global Nginx config shared across all domains on the server. Only add it when deploying the **first domain**; subsequent domains on the same server do not need it.
@@ -448,7 +448,10 @@ The following run **unconditionally** during `deploy` without any flags:
 | **MariaDB 缓冲池调优** / MariaDB buffer pool tuning | `innodb_buffer_pool_size` 按内存分级配置<br>Tiers `innodb_buffer_pool_size` according to available RAM |
 | **TCP / BBR 内核调优** / Kernel network tuning | 写入 sysctl drop-in，开启 BBR 拥塞控制（内核 4.9+）<br>Writes sysctl drop-in enabling BBR congestion control (kernel 4.9+) |
 | **Fail2Ban** | 自动配置 WordPress 暴力破解防护，封禁时间 24h + 递增封禁<br>Configures WordPress brute-force protection with 24h ban duration and progressive escalation |
-| **systemd 续期定时器** / Certificate renewal timer | 每天检查证书到期，到期前 30 天自动续期<br>Checks certificate expiry daily; auto-renews from 30 days before expiry |
+| **systemd 续期定时器** / Certificate renewal timer | 定时器频率随证书寿命自适应：标准 90 天证书每日检查；LE 2027 年 47 天证书每 8 小时；2028 年 6 天证书每 4 小时。续期成功后自动检测寿命变化并热更新 timer。<br>Timer frequency auto-adapts to certificate lifetime: daily for standard 90-day certs; every 8h for LE 2027 47-day certs; every 4h for 2028 6-day certs. Auto-detects lifetime changes after renewal and hot-updates the timer. |
+| **续期失败兜底通知** / Renewal failure fallback *(V3.2.5 新增 / New in V3.2.5)* | 未配置 `--notify-webhook` 时，自动安装 systemd OnFailure 服务：续期失败写 journal（CRIT）+ syslog + 尝试 `mail` 发邮件给 root。确保证书到期风险永不静默。<br>When no `--notify-webhook` is configured, auto-installs a systemd OnFailure service: renewal failures logged to journal (CRIT) + syslog + email attempted via `mail(1)` to root. Ensures certificate expiry risk is never silent. |
+| **自愈引擎** / Self-healing engine *(V3.2.5 新增 / New in V3.2.5)* | 14 种常见故障自动诊断修复：缺失 logrotate/curl 自动安装、DB 超时自动重启、`nginx -t` 错误自动修复（失效 include / 重复 default_server）、文件删除失败自动清除 immutable 位重试、PHP-FPM/Redis 故障自动诊断（配置测试 + journal 检查）。<br>14 common failure scenarios auto-diagnosed and repaired: missing logrotate/curl auto-installed, DB timeout auto-restarted, `nginx -t` errors auto-fixed (stale includes / duplicate default_server), file deletion retried with `chattr -i`, PHP-FPM/Redis failures auto-diagnosed via config test and journal inspection. |
+| **组件生命周期管理** / Component lifecycle *(V3.2.5 新增 / New in V3.2.5)* | Certbot: snap 迁移 + pip venv 兜底（EFF 官方 6 步流程）；Redis/Valkey: 版本感知升级 + EL10 Valkey 自动切换；WP-CLI: 版本检测 + 自动更新 + SHA-512 校验；fail2ban: 版本探测 + 0.11 以下旧版兼容。<br>Certbot: snap migration + pip venv fallback (EFF official 6-step); Redis/Valkey: version-aware upgrades + EL10 Valkey auto-switch; WP-CLI: version detection + auto-update + SHA-512 verification; fail2ban: version probing + legacy compat below 0.11. |
 | **WP-Cron 定时器** / WP-Cron systemd timer | 15 分钟 systemd timer 替代 HTTP 触发，消除每次请求触发 wp-cron 的性能开销<br>15-minute systemd timer replaces HTTP-triggered wp-cron, eliminating per-request overhead |
 | **mysqlcheck 周度优化** / Weekly DB optimize | 每周日 03:00 自动执行碎片回收（外置数据库时跳过）<br>Runs `mysqlcheck --optimize` every Sunday at 03:00; skipped for external databases |
 | **Certbot 持久化 deploy hook** / Persistent certbot hook | 证书续期后自动 reload Nginx，无论由脚本 timer 还是 certbot 自身 timer 触发<br>Reloads Nginx after every renewal regardless of which timer triggered it |

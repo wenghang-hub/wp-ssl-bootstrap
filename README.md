@@ -23,7 +23,7 @@ One command to deploy WordPress with HTTPS, auto-renewal, and production-grade s
 - **Git tag-pinned builds** — srcache/Brotli compilation modules pinned to git tags (not commit hashes), immune to GitHub shallow-clone restrictions
 - **Nginx hardening** — rate limiting on wp-login.php + admin-ajax.php, HSTS, CSP enforcement (`frame-ancestors` / `upgrade-insecure-requests`), wp-config/uploads/xmlrpc/wp-includes deny, HTTP method filtering, cert SAN / server_name auto-alignment, dynamic module load error cascade auto-repair (ABI mismatch → reinstall → remove → orphaned directive cleanup), proactive minor-version upgrades, FastCGI cache (optional), Redis srcache full-page cache (optional), Brotli (optional), HTTP/3 QUIC (optional)
 - **Fail2Ban** — auto-configured WordPress brute-force protection with progressive banning (24h + escalation)
-- **Auto-renewal** — systemd daily timer with randomized delay, `--cert-name` precision renewal, persistent deploy hook, post-renewal Nginx certificate verification, renewal failure webhook notification
+- **Auto-renewal** — systemd timer with frequency auto-tuned to certificate lifetime (daily for 90-day, every 8h for 47-day, every 4h for 6-day certs), `--cert-name` precision renewal, persistent deploy hook, post-renewal Nginx certificate verification; renewal failure notification via `--notify-webhook` or auto-installed journal/email fallback (never silent)
 - **Backup & restore** — one-command backup (DB + files + Nginx + Fail2Ban/logrotate + Let's Encrypt certs); atomic DB restore via RENAME TABLE; external DB retry with exponential backoff
 - **Config hot-update** — `update` subcommand applies new templates without touching data; managed plugin safe-upgrade with health-check rollback
 - **Redis object cache** — optional `--redis`, composable with FastCGI page cache; PHP Redis source-compile fallback; Valkey (EL10+) auto-detection
@@ -31,6 +31,8 @@ One command to deploy WordPress with HTTPS, auto-renewal, and production-grade s
 - **HTTP/3 QUIC** — optional `--http3`; auto-detects Nginx `http_v3` module; auto-opens UDP 443 firewall port; multi-site `reuseport` sharing; silently ignored when unsupported
 - **`--no-*` reverse switches** — `--no-redis` / `--no-optimize` / `--no-cloudflare` / `--no-http3` / `--no-allow-xmlrpc` to explicitly disable auto-detected features during `update`/`enable-ssl`/`restore`
 - **Performance tuning** — PHP-FPM pool auto-sized by RAM, MariaDB InnoDB tuning, BBR + TCP sysctl, swap auto-creation, Nginx `open_file_cache` (`--optimize`)
+- **Self-healing** — 14 common failure scenarios auto-diagnosed and repaired: missing logrotate/curl auto-installed, failed DB auto-restarted, `nginx -t` errors auto-fixed (stale includes, duplicate default_server), uninstall file deletion retried with `chattr -i`, PHP-FPM/Redis failures auto-diagnosed via config test and journal inspection
+- **Component lifecycle** — Certbot snap migration with pip venv fallback; Redis/Valkey version-aware upgrades; WP-CLI auto-update with SHA-512 verification; fail2ban version detection with legacy compat; short-lived certificate auto-detection with timer frequency adjustment
 - **WordPress Cron offload** — systemd 15-min timer replaces per-request wp-cron.php
 - **Bilingual UI** — Chinese/English; auto-detected from locale, persistable via `--lang`
 - **Smart domain handling** — `www.example.com` auto-normalized to `example.com`; subdomains skip `www` variant; single-site auto domain inference
@@ -265,7 +267,7 @@ After deployment, credentials are saved to `/root/.wp_credentials_<domain>.txt` 
 - **Git tag 固定构建** — srcache / Brotli 编译模块使用 git tag 固定版本（非 commit hash），不受 GitHub 浅克隆限制
 - **Nginx 加固** — wp-login.php + admin-ajax.php 速率限制、HSTS、CSP 强制执行、wp-config/uploads/xmlrpc/wp-includes 拦截、HTTP 方法过滤、证书 SAN 与 server_name 自动对齐、FastCGI 缓存（可选）、Redis srcache 全页缓存（可选）、Brotli（可选）、HTTP/3 QUIC（可选）
 - **Fail2Ban** — 自动配置 WordPress 暴力破解防护，渐进式封禁（24h + 递增）
-- **自动续期** — systemd 每日定时器，随机延迟，`--cert-name` 精准续期，持久化 deploy hook，续期后自动验证 Nginx 证书加载，失败 Webhook 通知
+- **自动续期** — systemd 定时器频率随证书寿命自适应（90 天每日、47 天每 8 小时、6 天每 4 小时），`--cert-name` 精准续期，持久化 deploy hook，续期后自动验证 Nginx 证书加载；失败通知：`--notify-webhook` 或自动安装的 journal/email 兜底（永不静默）
 - **备份恢复** — 一键备份（数据库 + 文件 + Nginx + Fail2Ban/logrotate + Let's Encrypt 证书）；RENAME TABLE 原子恢复；外置 DB 指数退避重试
 - **配置热更新** — `update` 子命令应用新模板，不触碰数据；托管插件安全升级 + 健康检查回滚
 - **Redis 对象缓存** — 可选 `--redis`，可与 FastCGI 页面缓存叠加；PHP Redis 源码编译兜底；Valkey（EL10+）自动检测
@@ -273,6 +275,8 @@ After deployment, credentials are saved to `/root/.wp_credentials_<domain>.txt` 
 - **HTTP/3 QUIC** — 可选 `--http3`；自动探测 Nginx `http_v3` 模块；自动开放 UDP 443 防火墙端口；多站点共享 `reuseport`；不支持时静默忽略
 - **`--no-*` 反向开关** — `--no-redis` / `--no-optimize` / `--no-cloudflare` / `--no-http3` / `--no-allow-xmlrpc` 可在 `update`/`enable-ssl`/`restore` 中显式禁用自动探测到的功能
 - **性能调优** — PHP-FPM 按内存动态调参、MariaDB InnoDB 调优、BBR + TCP sysctl、Swap 自动创建、Nginx `open_file_cache`（`--optimize`）
+- **自愈能力** — 14 种常见故障场景自动诊断修复：缺失 logrotate/curl 自动安装、DB 超时自动重启、`nginx -t` 错误自动修复（失效 include / 重复 default_server）、卸载删除失败自动 `chattr -i` 重试、PHP-FPM/Redis 故障自动诊断（配置测试 + journal 检查）
+- **组件生命周期** — Certbot snap 迁移 + pip venv 兜底；Redis/Valkey 版本感知升级；WP-CLI 自动更新 + SHA-512 校验；fail2ban 版本探测 + 旧版兼容；短寿命证书自动检测 + timer 频率调整
 - **WordPress Cron 卸载** — systemd 15 分钟定时器替代每请求触发 wp-cron.php
 - **双语界面** — 中英文自动切换，`--lang` 持久化
 - **域名智能处理** — 输入 `www.example.com` 自动归一为 `example.com`；子域名自动跳过 `www` 变体；单站点自动推断域名

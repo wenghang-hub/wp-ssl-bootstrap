@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/pyright/main/packages/vscode-pyright/schemas/pyrightconfig.schema.json",
+
+  "pythonVersion": "3.8",
+  "pythonPlatform": "Linux",
+  "include": ["wp_ssl_bootstrap.py"],
+
+  "typeCheckingMode": "standard",
+
+  "reportMissingImports": true,
+  "reportMissingModuleSource": false,
+  "reportOptionalMemberAccess": "warning",
+  "reportOptionalSubscript": "warning",
+  "reportGeneralTypeIssues": "warning",
+  "reportUnusedImport": "warning",
+  "reportUnusedVariable": "information"
+}

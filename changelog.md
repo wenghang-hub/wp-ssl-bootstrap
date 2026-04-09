@@ -4,6 +4,103 @@ All notable changes to WP-SSL-Bootstrap are documented in this file.
 本文件记录 WP-SSL-Bootstrap 的所有重要变更。
 ---
 
+## [V3.2.5]
+
+> **升级说明 / Upgrade note**
+> V3.2.5 是 V3.2.4 之后经过 11 轮补丁的自动化与韧性强化版本。
+> 核心主题：将脚本从「遇到异常→警告→放弃」升级为「遇到异常→诊断→自动修复→重试」。
+> 通过对全部 507 个 `logging.warning` 的穷举审计，为 14 类 warn-and-bail 模式增加了自动修复；
+> 新增短寿命证书自动检测与 timer 频率调整（适配 LE 2027/2028 47天/6天证书）、
+> 续期失败 journal/email 兜底通知、组件版本全生命周期管理（Certbot snap 迁移 / Redis 版本升级 /
+> WP-CLI 版本检测 / fail2ban 版本兼容）；修复了 MariaDB 调优配置「自锁」bug 和 5 处
+> Nginx 配置注释行误匹配问题。
+> 从 V3.2.4 升级时，直接替换脚本文件并执行 `update` 子命令即可。
+>
+> V3.2.5 is an automation and resilience hardening release after V3.2.4, with 11 patches.
+> Core theme: upgrading the script from "warn and bail" to "diagnose, auto-fix, retry".
+> An exhaustive audit of all 507 `logging.warning` calls yielded 14 warn-and-bail patterns
+> with new auto-remediation; adds short-lived certificate auto-detection with dynamic timer
+> frequency (for LE 2027/2028 47-day/6-day certs), journal/email fallback notification for
+> renewal failures, full component lifecycle management (Certbot snap migration / Redis
+> version upgrades / WP-CLI version checks / fail2ban version compat); fixes MariaDB tuning
+> config "self-lock" bug and 5 Nginx config comment false-match issues.
+> To upgrade from V3.2.4, replace the script and run the `update` subcommand.
+
+---
+
+### ✨ 新功能 / New Features
+
+- **短寿命证书自动检测 + timer 频率动态调整 (PATCH-277)** — 读取当前证书的总有效期（Not After − Not Before），动态决定 systemd timer 的 OnCalendar 和 RandomizedDelaySec。标准 90 天证书使用每日 timer；LE 2027 年 47 天证书切换为每 8 小时；2028 年 6 天证书切换为每 4 小时。续期成功后自动检测证书寿命变化，必要时热更新 timer 频率，无需人工干预。
+  **Short-lived certificate auto-detection + dynamic timer frequency (PATCH-277)** — Reads current certificate total lifetime (Not After − Not Before) and dynamically adjusts systemd timer OnCalendar and RandomizedDelaySec. Standard 90-day certs use daily timer; LE 2027 47-day certs switch to every 8 hours; 2028 6-day certs switch to every 4 hours. Auto-detects certificate lifetime changes after renewal and hot-updates timer frequency without manual intervention.
+
+- **续期失败 journal/email 兜底通知 (PATCH-278)** — 未配置 `--notify-webhook` 时，自动安装 systemd OnFailure 服务：续期失败写入 journal（CRIT 级别）+ `logger` 写 syslog + 尝试通过 `mail` 命令发邮件给 root。确保续期失败永远不会完全静默。
+  **Journal/email fallback notification for renewal failures (PATCH-278)** — When no `--notify-webhook` is configured, auto-installs a systemd OnFailure service: renewal failures are logged to journal (CRIT priority) + syslog via `logger` + email attempted via `mail(1)` to root. Ensures renewal failures are never completely silent.
+
+- **14 类 warn-and-bail 自动修复 (PATCH-279)** — 对全部 507 个 `logging.warning` 穷举审计，为以下场景增加自动修复能力：
+  **14 warn-and-bail auto-remediation patterns (PATCH-279)** — Exhaustive audit of all 507 `logging.warning` calls; auto-fix added for:
+
+  | 场景 / Scenario | 自动修复 / Auto-fix |
+  |---|---|
+  | `logrotate` 未安装 (日志无限增长) | 自动安装 logrotate 包 + mkdir |
+  | `curl` 未安装 (健康检查/WP-CLI 下载跳过) | 自动安装 curl |
+  | MariaDB 等待超时 (后续 DB 操作全挂) | 自动 `systemctl restart` + 15 秒二次等待 (含 mysqladmin/mysql 双路径) |
+  | `nginx -t` 失败 (reload 被跳过) | 捕获错误输出，自动修复 stale include / duplicate default_server（修改前自动备份 .bak279） |
+  | 卸载时文件删除失败 ×9 处 | `_force_unlink()`: 失败后 `chattr -i` 清除 immutable 位再重试 |
+  | `DROP DATABASE/USER` 失败 | 自动重启 DB 服务 + 3 秒等待 + 重新尝试两种认证方式 |
+  | PHP-FPM 重启失败 | `php-fpm -t` 诊断：修复不存在的用户/组、kill 残留进程 |
+  | Redis 启动失败 | 读 journal 诊断：端口冲突→kill 残留进程；配置错误→备份坏配置 |
+  | Redis ping 无响应 | 自动 `systemctl restart` + 重新 ping 验证 |
+  | MariaDB conf.d 目录不存在 | 自动创建 + `!includedir` 追加到 my.cnf |
+  | Nginx 小版本升级失败 | EL: `yum clean all`+重试 / Debian: `apt --fix-broken`+`apt update`+重试 |
+  | redis-cache 插件安装失败 | 追加 `--force` 重试 |
+  | nginx.list 写入失败 | 自动创建父目录 + 重试 |
+
+- **组件版本全生命周期管理 (PATCH-270)** — Certbot: snap 检测→版本门控→pip venv 迁移（6 步 EFF 官方流程）；Redis/Valkey: 版本检测→小版本升级→EL10+ Valkey 自动切换；WP-CLI: 版本检测→自动更新→SHA-512 校验；fail2ban: 版本探测→旧版兼容适配（0.11 以下）。
+  **Full component lifecycle management (PATCH-270)** — Certbot: snap detection → version gating → pip venv migration (6-step EFF official procedure); Redis/Valkey: version detection → minor upgrades → EL10+ Valkey auto-switch; WP-CLI: version detection → auto-update → SHA-512 verification; fail2ban: version probing → legacy compat (below 0.11).
+
+- **脚本分发镜像 (PATCH-271)** — `--serve-dist` 在站点 webroot 创建脚本分发目录，提供 SHA-256 哈希校验。systemd path unit 监听脚本变更自动同步，可作为 self-update 国内备源。
+  **Script distribution mirror (PATCH-271)** — `--serve-dist` creates a script distribution directory under the site webroot with SHA-256 hashes. A systemd path unit watches for script changes and auto-syncs, serving as a domestic mirror for self-update.
+
+---
+
+### 🔒 安全增强 / Security Enhancements
+
+- **MariaDB GPG 四级密钥容灾 (PATCH-275)** — Debian/Ubuntu 上 MariaDB 仓库 GPG 密钥导入现有 4 级容灾：① 直连 supplychain.mariadb.com + mariadb.org ② GPG keyserver（ubuntu keyserver → openpgp.org）③ 脚本内嵌 ASCII-armored 公钥 ④ 旧系统 apt-key 兜底。与 Nginx 密钥容灾对齐。
+  **MariaDB GPG 4-level key fallback (PATCH-275)** — MariaDB repo GPG key import on Debian/Ubuntu now has 4 fallback levels, aligned with the existing Nginx key fallback: ① direct download from supplychain.mariadb.com + mariadb.org ② GPG keyserver (ubuntu keyserver → openpgp.org) ③ script-embedded ASCII-armored public key ④ legacy apt-key fallback.
+
+- **APT pinning 对齐 nginx.org 官方格式 (PATCH-272)** — `/etc/apt/preferences.d/99nginx` 完全对齐 nginx.org 官方推荐格式（含 `release o=nginx`），修复原双行 `Pin:` 语法非法被 apt 忽略的问题。
+  **APT pinning aligned with nginx.org official format (PATCH-272)** — `/etc/apt/preferences.d/99nginx` now fully matches the nginx.org recommended format (including `release o=nginx`), fixing the invalid dual-line `Pin:` syntax that apt silently ignored.
+
+---
+
+### 🐛 问题修复 / Bug Fixes
+
+- **[PATCH-280] MariaDB 调优配置「自锁」bug** — 脚本生成的 `.cnf` 文件中说明注释 `# add a line containing '# User-modified'` 本身就包含标记字符串 `# User-modified`，导致子串匹配命中自己→调优永远被跳过→RAM 变化 / 版本升级后参数不会更新。修复：① 检测逻辑改为行级正则 `^\s*#\s*User-modified\s*$` ② 模板文字改为不含标记原文的说明。
+  **MariaDB tuning config "self-lock" bug** — The generated `.cnf` file's instructional comment `# add a line containing '# User-modified'` contained the marker string itself, causing the substring check to always match → tuning perpetually skipped. Fix: ① detection changed to line-level regex ② template text reworded to not embed the literal marker.
+
+- **[PATCH-280] Nginx 配置注释行误匹配 ×5 处** — 5 处对 Nginx 配置原文做 `"directive" in raw_content` 子串检查的代码会命中注释行（如 `# srcache_fetch ...`），导致：status 显示错误缓存模式、日志级别误判、注释行被当作 SSL block。修复：3 处改用 `_strip_nginx_comments_d5()` 剥离注释后检查；1 处增加 `startswith("#")` 跳过；模板注释文字调整。
+  **Nginx config comment false-match ×5** — 5 substring `"directive" in raw_content` checks on Nginx config could match commented-out lines (e.g. `# srcache_fetch ...`), causing wrong cache mode in status, incorrect log levels, or commented lines treated as SSL blocks. Fix: 3 sites now use `_strip_nginx_comments_d5()` before checking; 1 site adds `startswith("#")` skip; template comment text adjusted.
+
+- **[PATCH-276] 大规模异常安全加固 (270 处)** — 全脚本 `except Exception` 路径审计：补充缺失的 `logging.debug` 异常记录、修复未捕获的 `subprocess.TimeoutExpired`、确保 `finally` 块清理不因二次异常递归、修复 quiet 模式下命令失败完全静默的问题。
+  **Massive exception safety sweep (270 sites)** — Full-script `except Exception` path audit: added missing `logging.debug` for exception recording, caught unhandled `subprocess.TimeoutExpired`, ensured `finally` blocks don't recurse on secondary exceptions, fixed command failures being completely silent in quiet mode.
+
+- **[PATCH-272] EL7 EOL 优雅降级** — EL7 已于 2024-06 EOL。Certbot/PHP/MariaDB/Nginx/Redis 升级路径在 EL7 上优雅跳过并记录警告，而非因仓库不可用而报错。
+  **EL7 EOL graceful degradation** — Certbot/PHP/MariaDB/Nginx/Redis upgrade paths on EL7 (EOL 2024-06) now gracefully skip with logged warnings instead of failing due to unavailable repos.
+
+---
+
+### 🔨 工程改进 / Engineering
+
+- **类型注解 (PATCH-277)** — 439 个函数 100% 返回类型注解覆盖。支持 `mypy --config-file mypy.ini` 和 `pyright` 检查。
+  **Type annotations (PATCH-277)** — 100% return-type annotation coverage across all 439 functions. Supports `mypy` and `pyright` checking.
+
+- **社区最佳实践合入 (PATCH-275)** — certbot 升级后 symlink 验证（`/usr/local/bin/certbot` 实际指向）、`run_cmd` quiet 模式 stderr 兜底记录、gpg 临时 keyring 清理、certbot snap 首次安装检测优化。
+  **Community best practices merge (PATCH-275)** — certbot symlink verification post-upgrade, `run_cmd` quiet-mode stderr fallback logging, gpg temporary keyring cleanup, certbot snap fresh-install detection optimization.
+
+- `__version__` 从 `"3.2.4"` 升至 `"3.2.5"`；`__build__` 从 `"3.2.269"` 升至 `"3.2.280"`。净增约 4,054 行（36,079→40,133），PATCH-270 ~ 280 共 11 轮补丁。
+
+---
+
 ## [V3.2.4]
 
 > **升级说明 / Upgrade note**

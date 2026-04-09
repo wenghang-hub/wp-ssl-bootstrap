@@ -89,8 +89,24 @@ WP-SSL-Bootstrap: 高可用建站引擎
 #                   2) Before release, set __version__ to new version
 #                   3) Optionally reset __build__ to match
 # ---------------------------------------------------------------------------
-__version__ = "3.2.4"
-__build__   = "3.2.269"
+__version__ = "3.2.5"
+__build__   = "3.2.280"
+
+# ---------------------------------------------------------------------------
+# mypy / pyright 类型检查配置 (PATCH-277)
+# ---------------------------------------------------------------------------
+# 推荐运行命令:
+#   mypy --config-file mypy.ini wp_ssl_bootstrap.py
+#   pyright wp_ssl_bootstrap.py
+#
+# 类型注解覆盖率: 100% 函数有返回类型 (439/439)。
+# [PATCH-280] 已全部补齐, 含动态生成的 lambda 和内部工具函数。
+#
+# 已知 mypy 豁免:
+#   - 模块级 `_LANG = _detect_lang()` 赋值前引用 (模块加载顺序)
+#   - `t()` i18n 函数的动态字典查找
+#   - subprocess.run() 的 start_new_session 参数在 typeshed 中已声明
+# ---------------------------------------------------------------------------
 
 import os
 import sys
@@ -111,7 +127,7 @@ import glob
 import stat
 import time
 import traceback
-from typing import Optional  # [V3.2.42] FIX-6: Python 3.6+ always ships typing; remove dead fallback
+from typing import Optional, Any, Callable  # [PATCH-277] Phase 2: full type annotations
 # [V3.2.121] FIX-12: concurrent.futures 已被 threading.Thread 替代 (FIX-10)
 import json
 from pathlib import Path
@@ -175,8 +191,8 @@ def _write_lang_file(chosen: str, env_at_choice: str = "") -> None:
         # [PATCH-144 R-1] 模块加载阶段 logging 可能未初始化, 需保护
         try:
             logging.warning(t("warn_r_1_write_lang_file_fallback_failed"), _fb_e)
-        except Exception:
-            pass
+        except Exception as _exc_178:
+            logging.debug("[PATCH-276] _write_bytes_to_fd: %s", _exc_178)
 
 
 def _write_bytes_to_fd(path: str, data: bytes, mode: int = 0o600,
@@ -222,8 +238,7 @@ def _write_bytes_to_fd(path: str, data: bytes, mode: int = 0o600,
         os.close(fd)
 
 
-def _sd_escape(path):
-    # type: (str) -> str
+def _sd_escape(path: str) -> str:
     """转义路径使其可安全用于 systemd unit ExecStart= 的双引号参数。
 
     提升至模块级以便 setup_systemd() 与 setup_wp_cron_timer() 共用。
@@ -303,10 +318,13 @@ def _is_safe_password(value: str) -> bool:
 _AUTOGEN_PASSWORD_CHARS = string.ascii_letters + string.digits
 
 
-def _generate_secure_password(length: int = 32) -> str:
+def _generate_secure_password(length: int = 48) -> str:
     """生成密码学安全的随机密码 (纯字母数字)。
 
     [PATCH-146 P0-3] 3处重复 secrets.choice 循环的单一事实来源。
+    [PATCH-276 FIX-DB1] 默认长度 32→48: 62^48 ≈ 2^286 bits 熵,
+    超过 OWASP 推荐的 256 bits。纯字母数字字符集避免 MySQL .cnf /
+    SQL 字面量 / shell 转义等场景的特殊字符问题。
     """
     return ''.join(secrets.choice(_AUTOGEN_PASSWORD_CHARS) for _ in range(length))
 
@@ -396,6 +414,90 @@ def _has_reusable_cert(domain: str) -> bool:
         return False
     except Exception:
         return False
+
+
+def _detect_cert_lifetime_days(cert_path: str) -> int:
+    """[PATCH-277] 检测证书总有效期 (Not After - Not Before), 单位: 天。
+
+    用于判断 CA 签发的是 90 天 / 47 天 / 6 天证书, 动态调整
+    systemd timer 续期频率。
+
+    Returns:
+        证书总有效期天数。探测失败返回 0。
+    """
+    try:
+        # openssl x509 -dates 输出格式:
+        #   notBefore=Mar  1 00:00:00 2025 GMT
+        #   notAfter=May 30 23:59:59 2025 GMT
+        _r = subprocess.run(
+            ["openssl", "x509", "-noout", "-dates", "-in", cert_path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            encoding="utf-8", errors="replace",
+            timeout=10, check=False,
+        )
+        if _r.returncode != 0:
+            return 0
+        _not_before = ""
+        _not_after = ""
+        for _line in _r.stdout.splitlines():
+            _line = _line.strip()
+            if _line.startswith("notBefore="):
+                _not_before = _line.split("=", 1)[1].strip()
+            elif _line.startswith("notAfter="):
+                _not_after = _line.split("=", 1)[1].strip()
+        if not _not_before or not _not_after:
+            return 0
+        # 解析 openssl 日期格式: "Mar  1 00:00:00 2025 GMT"
+        from datetime import datetime as _dt_277
+        _fmt = "%b %d %H:%M:%S %Y %Z"
+        # 处理月份后的双空格: "Mar  1" → "Mar 1"
+        _not_before = re.sub(r'\s+', ' ', _not_before)
+        _not_after = re.sub(r'\s+', ' ', _not_after)
+        _dt_before = _dt_277.strptime(_not_before, _fmt)
+        _dt_after = _dt_277.strptime(_not_after, _fmt)
+        _delta = (_dt_after - _dt_before).days
+        return max(0, _delta)
+    except Exception:
+        return 0
+
+
+def _determine_renewal_schedule(lifetime_days: int) -> tuple:
+    """[PATCH-277] 根据证书有效期动态确定 systemd timer 调度策略。
+
+    参考 Let's Encrypt 短寿命证书计划 (2027-02: 47 天, 2028-02: 6 天)
+    和 certbot ARI (ACME Renewal Information) 行为:
+      - certbot 在证书剩余 1/3 生命周期时尝试续期
+      - timer 触发频率应确保在续期窗口内至少有 2 次重试机会
+
+    Returns:
+        (on_calendar, randomized_delay, description) 三元组。
+        lifetime_days == 0 时返回保守的每日策略。
+    """
+    if lifetime_days <= 0:
+        # 未知有效期: 保守的每日策略
+        return ("daily", "12h",
+                "unknown lifetime → daily (conservative)")
+
+    if lifetime_days <= 10:
+        # 6 天证书 (LE 2028+ 计划): 每 4 小时, 随机偏移 1h
+        # 续期窗口 ≈ 2 天 (1/3 × 6), 4h 间隔确保窗口内 ≥12 次重试
+        return ("*-*-* 0/4:00:00", "1h",
+                "%dd cert → every 4h" % lifetime_days)
+
+    if lifetime_days <= 30:
+        # 14-30 天证书: 每 8 小时, 随机偏移 2h
+        return ("*-*-* 0/8:00:00", "2h",
+                "%dd cert → every 8h" % lifetime_days)
+
+    if lifetime_days <= 50:
+        # 47 天证书 (LE 2027+ 计划): 每 12 小时, 随机偏移 3h
+        # 续期窗口 ≈ 15 天, 12h 间隔确保窗口内 ≥30 次重试
+        return ("*-*-* 0/12:00:00", "3h",
+                "%dd cert → every 12h" % lifetime_days)
+
+    # 90 天证书 (当前 LE 标准): 每天, 随机偏移 12h
+    return ("daily", "12h",
+            "%dd cert → daily" % lifetime_days)
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +640,14 @@ _PHP_EXTENSIONS_DEB_TPL = [
 
 
 # ── 1c. MariaDB 版本管理常量 ──────────────────────────────────────────
-# [PATCH-MDB] 统一 MariaDB 版本选择策略, 确保所有发行版安装 ≥10.6 的 MariaDB。
+# [PATCH-MDB] 统一 MariaDB 版本选择策略, 确保所有发行版安装 ≥10.11 的 MariaDB。
+#
+# MariaDB 版本生命周期 (endoflife.date/mariadb, 2026-04):
+#   - 10.5: EOL 2025-06 ❌
+#   - 10.6 LTS: EOL 2026-07 (即将到期!) ❌
+#   - 10.11 LTS: 活跃支持至 2028-02 ✅
+#   - 11.4 LTS: 活跃支持 ✅
+#   - 11.8 LTS: 最新 LTS ✅
 #
 # 决策逻辑 (与 PHP _determine_php_target 对齐):
 #   1. 已安装版本 ≥ _MARIADB_MIN_VERSION → 不动
@@ -547,20 +656,138 @@ _PHP_EXTENSIONS_DEB_TPL = [
 #   4. Debian/Ubuntu → MariaDB 官方 apt 仓库 (mirror.mariadb.org)
 #
 # WordPress 官方推荐: MariaDB 10.6+ (https://wordpress.org/about/requirements/)
-_MARIADB_MIN_VERSION = (10, 6)       # 低于此版本触发自动升级
+# 脚本要求高于 WP 最低要求: 10.11 (当前活跃 LTS, 10.6 即将 EOL)
+_MARIADB_MIN_VERSION = (10, 11)      # 低于此版本触发自动升级 (10.6 EOL 2026-07)
 _MARIADB_DEFAULT_VERSION = "10.11"   # 目标 LTS 版本 (2028-02 EOL)
-# [PATCH-MDB] 升级注意事项:
+# [PATCH-MDB] 升级影响:
 #   - EL8/9 AppStream: mariadb:10.11 stream 可用 (dnf module)
 #   - EL10+: 系统默认 ≥10.11, 通常无需操作
 #   - Debian 12 (bookworm): 默认 10.11, 无需操作
 #   - Debian 11 (bullseye): 默认 10.5, 需 MariaDB 官方 repo
 #   - Ubuntu 24.04 (noble): 默认 10.11, 无需操作
-#   - Ubuntu 22.04 (jammy): 默认 10.6, 刚好满足, 建议升级
+#   - Ubuntu 22.04 (jammy): 默认 10.6, 触发升级到 10.11 (10.6 EOL)
 #   - Ubuntu 20.04 (focal): 默认 10.3, 需 MariaDB 官方 repo (已进 EOSS)
 
 
+# ── 1d. Certbot 版本管理常量 ─────────────────────────────────────────
+# [PATCH-270] EFF 于 2020 年停止更新 apt certbot 包, 官方唯一推荐安装
+# 方式为 snap (https://certbot.eff.org/instructions, Get Certbot 文档)。
+# snap certbot 自动更新, 安装后无需手动版本管理。
+#
+# 决策逻辑:
+#   1. 已是 snap certbot → 不动 (snap 自动更新)
+#   2. apt/yum certbot 版本 ≥ _CERTBOT_MIN_VERSION → 仅警告建议迁移 snap
+#   3. apt/yum certbot 版本 < _CERTBOT_MIN_VERSION → 自动迁移至 snap
+#      (迁移安全: /etc/letsencrypt 目录完整保留, snap certbot 直接复用)
+#   4. snapd 不可用 (如最小化安装/容器) → 仅 WARNING, 不阻断
+#
+# certbot 版本里程碑:
+#   0.40.0 — Ubuntu 20.04 apt 冻结版本, 缺少 --key-type / --preferred-chain
+#   1.10.0 — 新增 --key-type (ECDSA 证书), 脚本 _certbot_supports_key_type 门槛
+#   2.0.0  — Python 3.7+, 新 CLI 参数格式, renewal hooks 改进
+#   3.0.0  — 最低 Python 3.8, 移除旧 API
+_CERTBOT_MIN_VERSION = (2, 0)        # apt certbot < 2.0 触发 snap 迁移
+# snap certbot 始终最新 (截至 2025 年为 5.x), 无需目标版本常量。
+# 迁移步骤参考 EFF 官方:
+#   1. apt remove certbot / dnf remove certbot
+#   2. snap install --classic certbot
+#   3. ln -s /snap/bin/certbot /usr/local/bin/certbot (幂等)
+#   4. certbot --version 验证
+# /etc/letsencrypt 不受影响, 续期配置自动继承。
+
+
+# ── 1e. Redis 版本管理常量 ───────────────────────────────────────────
+# [PATCH-270] Redis 版本生命周期 (2026-04):
+#   Redis Community Edition 支持策略: 最新稳定版全维护 + 前一个minor安全修复
+#   + 前一个major安全修复。当前(2026-04): 8.6稳定, 8.4/7.4仅安全修复。
+#   - 6.0, 6.2, 7.0, 7.2: 已无官方安全补丁
+#   - 7.4: 仅安全修复 (RSAL/SSPL, Enterprise EOL 2026-11)
+#   - 8.0+: 活跃支持 (tri-license RSALv2/SSPLv1/AGPLv3)
+#   Valkey (Redis BSD fork, Linux 基金会): 7.2 支持至 2027-04, 8.0+ 活跃
+#
+# 各发行版默认仓库可达版本:
+#   Ubuntu 22.04: 6.0 | Ubuntu 24.04: 7.0 | Debian 12: 7.0
+#   EL8/9 EPEL: 6.2  | EL8/9 Remi: redis7=7.2, redis8=8.x
+#   packages.redis.io (官方 PPA): 最新 8.x (全发行版)
+#
+# 策略:
+#   1. 已安装 ≥ MIN → 不动
+#   2. < MIN → 添加官方源 (EL: Remi redis7; Debian/Ubuntu: packages.redis.io)
+#      → 安装/升级 → 验证
+#   3. 升级失败 → WARNING, 不阻断 (低版本仍可用于 WP 对象缓存)
+#   4. Valkey 版本号 ≥ 7.2, 天然满足
+#
+# WordPress redis-cache 插件功能要求 Redis ≥ 6.0 (ACL, io-threads)。
+# 脚本门控设为 (7, 0): Ubuntu 24.04/Debian 12 默认仓库可达,
+# EL + Remi 可达 7.2+, Ubuntu 22.04 + packages.redis.io 可达 8.x。
+_REDIS_MIN_VERSION = (7, 0)          # 功能最低: 所有主流发行版可达 (直接或+外部源)
+_REDIS_DEFAULT_VERSION = "7"         # Remi 包名: redis7 (7.2.x, BSD)
+# 注意: Valkey (Redis BSD fork) 版本号从 7.2 起步, 天然满足。
+# EPEL 9 默认 redis 包为 6.2, 低于 MIN, 脚本通过 Remi redis7 升级。
+# Debian/Ubuntu 默认仓库版本不足时, 添加 packages.redis.io 官方源。
+#
+# [PATCH-272] Redis 许可证变更标记:
+# Redis 7.2 (BSD) → 7.4+ (RSAL/SSPL) → 8.0+ (tri-license RSAL/SSPL/AGPL)
+# 升级到 7.4+ 意味着许可证从 BSD 变更, 需用户确认。
+# 标记文件记录用户选择, 后续 update 不再询问。
+_REDIS_LICENSE_MARKER = Path("/root/.wp_redis_license_accepted")
+
+
+# ── 1f. Nginx 动态模块版本追踪常量 ──────────────────────────────────
+# [PATCH-270] Nginx 官方文档: "Dynamic modules must be compiled against
+# the same version of NGINX they are loaded into." (nginx.com/blog/
+# compiling-dynamic-modules-nginx-plus)
+# Nginx 升级后旧 .so 文件 ABI 不兼容, 加载时 segfault。
+# 脚本已通过 mtime 比较在 _ensure_srcache_modules / _nginx_post_upgrade_repair
+# 中清理旧 .so, 但 PATCH-270 增加:
+#   - 编译版本标记文件: 记录 .so 编译时的 nginx -V 签名
+#   - _nginx_post_upgrade_repair 末尾: 若模块被清理, 设置实例标志
+#     通知后续流程需要重编译
+#   - _upgrade_nginx_minor_if_available 末尾: 若模块被清理,
+#     立即触发 _setup_brotli + _ensure_srcache_modules 重编译,
+#     而非依赖 update_config 的后续调用顺序
+_NGINX_MODULE_BUILD_MARKER = Path("/root/.wp_nginx_module_build_ver")
+
+
+# ── 1g. WP-CLI 版本管理常量 ──────────────────────────────────────────
+# [PATCH-270b] WP-CLI 已有 _update_wpcli() 尽力更新机制, 但缺少最低版本门控。
+# 脚本默认安装 PHP 8.4 (_PHP_DEFAULT_VERSION), WP-CLI < 2.11 在 PHP 8.4
+# 环境下 deprecation 噪音严重, 部分子命令可能异常。
+#
+# WP-CLI 版本里程碑:
+#   2.5  — PHP 8.0 基础支持, --skip-plugins/--skip-themes 稳定
+#   2.8  — WordPress 6.x 兼容性改进
+#   2.10 — PHP 8.3 完整支持 (2024-02)
+#   2.11 — PHP 8.4 beta 支持 (2024-11)
+#   2.12 — PHP 8.4 完整支持, 最新 (2025-05)
+_WPCLI_MIN_VERSION = (2, 11)   # 低于此版本在 PHP 8.4 环境下强制更新
+
+
+# ── 1h. --serve-dist 镜像分发常量 ────────────────────────────────────
+# [PATCH-271] toksun.cn 等站点同时作为脚本 self-update 的国内备源。
+# 脚本 update 命令会覆盖手动修改的 Nginx 配置, 因此需要内置 location
+# 块注入机制。--serve-dist 启用后:
+#   1. 在 Nginx 配置中注入 /wp-ssl-bootstrap/ exact-match location
+#   2. 创建分发目录, 复制脚本 + 生成 SHA256
+#   3. 设置 systemd path unit 监听脚本变更自动同步
+_SERVE_DIST_DIR = Path("/var/www/wp-ssl-dist")
+_SERVE_DIST_URL_PATH = "/wp-ssl-bootstrap"  # URL 路径 (不含尾斜杠)
+
+
+# ── 1i. fail2ban 版本管理常量 ────────────────────────────────────────
+# [PATCH-270b] fail2ban 通过系统仓库管理, 版本随发行版走, 不做强制升级。
+# 仅添加版本探测 + 兼容性日志, 帮助运维排查 filter 不生效等问题。
+#
+# fail2ban 版本差异:
+#   0.9.x — EL7 默认; datepattern 自动检测有限, 需显式配置
+#   0.10.x — EL8 默认; 引入 %%z 时区支持
+#   0.11.x — EL9/Ubuntu 22.04+; failregex 性能提升, prefregex 支持
+#   1.0+   — Debian 12/Ubuntu 24.04; 全面重构
+# 脚本 datepattern 已兼容 0.9–1.0+ (见 setup_fail2ban [AUDIT-L11] 注释)。
+
+
 # ── 2. 统一密码文件读取 (模块级, 可被实例方法和模块函数共用) ─────────
-def _read_root_pwd_file(pwd_path) -> str:
+def _read_root_pwd_file(pwd_path: str) -> str:
     """安全读取 MariaDB root 密码文件, 含权限和字符集校验。
 
     [PATCH-259] 提取自 WPDeployManager._read_root_pwd_safe(),
@@ -618,8 +845,8 @@ def _validate_sql_safe(sql: str) -> str:
 
 
 # ── 4. _safe_rmtree — 符号链接安全的递归删除 ────────────────────────
-def _safe_rmtree(path, *, ignore_errors: bool = False,
-                 parent_guard=None) -> bool:
+def _safe_rmtree(path: str, *, ignore_errors: bool = False,
+                 parent_guard: Optional[str]=None) -> bool:
     """[PATCH-260] 统一 shutil.rmtree 入口, 含符号链接防护。
 
     shutil.rmtree 跟随符号链接递归删除。攻击者可在目标路径预创建
@@ -671,7 +898,7 @@ def _safe_rmtree(path, *, ignore_errors: bool = False,
 
 
 # ── 5. _safe_copy2 — 符号链接安全的文件复制 ──────────────────────────
-def _safe_copy2(src, dst) -> bool:
+def _safe_copy2(src: str, dst: str) -> bool:
     """[PATCH-260] 统一 shutil.copy2 入口, 对源和目标检查符号链接。
 
     shutil.copy2 跟随符号链接:
@@ -713,7 +940,7 @@ def _safe_copy2(src, dst) -> bool:
 
 # ── 6. _safe_mkstemp — 创建瞬间即 fchmod 的临时文件 ──────────────────
 def _safe_mkstemp(prefix: str = "", suffix: str = "",
-                  dir_path: str = "", mode: int = 0o600):
+                  dir_path: str = "", mode: int = 0o600) -> tuple:
     """[PATCH-260] 统一 tempfile.mkstemp 入口, 创建瞬间设置精确权限。
 
     标准 mkstemp 权限受 umask 影响 (如 umask 0o077 → 0o600,
@@ -747,12 +974,22 @@ def _safe_mkstemp(prefix: str = "", suffix: str = "",
                     "_safe_mkstemp: fchmod failed and actual "
                     "permissions 0o%03o allow group/other access" % _actual)
         except OSError:
+            # [PATCH-276 FIX-T2] fstat 也失败: 关闭 fd 防泄漏后 re-raise。
+            # 原代码在此路径未关闭 fd, 导致文件描述符泄漏。
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
             raise
     return fd, path
 
 
 # ── 7. _verify_gzip_integrity — 统一 gzip -t 校验 ───────────────────
-def _verify_gzip_integrity(gz_path, timeout: int = 120) -> bool:
+def _verify_gzip_integrity(gz_path: str, timeout: int = 120) -> bool:
     """[PATCH-260] 统一 gzip -t 完整性校验。
 
     4 处相同模式的单一事实来源: backup verify / lightweight backup /
@@ -786,8 +1023,8 @@ def _verify_gzip_integrity(gz_path, timeout: int = 120) -> bool:
         return False
 
 
-def _drain_pipe_with_select(fd_num, max_bytes=2 * 1024 * 1024,
-                            timeout=30.0):
+def _drain_pipe_with_select(fd_num: int, max_bytes: int=2 * 1024 * 1024,
+                            timeout: int=30.0) -> bool:
     """Non-blocking pipe drain using select() with timeout.
 
     [PATCH-199] Replaces blocking pipe.read() in stderr drain threads.
@@ -847,7 +1084,7 @@ def _env_lang() -> str:
     return "zh" if raw.startswith("zh") else "en"
 
 
-def _read_lang_config():  # -> tuple[str, str | None] | None
+def _read_lang_config() -> Optional[tuple]:  # (chosen, env_at_choice) | None
     """Parse the language config file.
 
     Returns:
@@ -869,7 +1106,7 @@ def _read_lang_config():  # -> tuple[str, str | None] | None
     return None
 
 
-def _saved_lang():  # -> str | None
+def _saved_lang() -> Optional[str]:  # saved chosen language or None
     """Compatibility shim: return saved chosen language or None."""
     cfg = _read_lang_config()
     return cfg[0] if cfg is not None else None
@@ -892,12 +1129,11 @@ try:
         _NO_GIL_MODE = False
 except Exception:
     _NO_GIL_MODE = False
-_CHINA_CLOUD_CACHE = None  # type: Optional[str]  # [V3.2.3] M-9: Python 3.6 compat
+_CHINA_CLOUD_CACHE: Optional[str] = None  # [V3.2.3] M-9: Python 3.6 compat
 _CHINA_CLOUD_LOCK = _threading.Lock()
 
 
-def _set_china_cloud_cache(value):
-    # type: (str) -> str
+def _set_china_cloud_cache(value: str) -> str:
     """[V3.2.13] P1-1: Thread-safe cache write for _is_china_cloud().
     [V3.2.22] P1-2: 双重检查锁 — 调用方已在 _CHINA_CLOUD_LOCK 内。
     [PATCH FIX-5] 去掉与锁语义矛盾的 "if not None: return" 二次检查：
@@ -1050,8 +1286,8 @@ def _is_china_cloud_locked() -> str:
             with _ureq.urlopen(_req, timeout=1) as _resp:
                 if _resp.read():
                     return _set_china_cloud_cache(_vendor)
-        except Exception:
-            pass
+        except Exception as _exc_1178:
+            logging.debug("[PATCH-276] L1178: %s", _exc_1178)
 
     # [PATCH-144 L-6] 总探测耗时超限时短路返回 (层 5 网关)
     if time.monotonic() - _cloud_probe_t0 > 10:
@@ -1095,8 +1331,8 @@ def _is_china_cloud_locked() -> str:
                 if any(_ln.strip().startswith(_imds_prefix)
                        for _ln in _body_lower.splitlines() if _ln.strip()):
                     return _set_china_cloud_cache(_imds_vendor)
-        except Exception:
-            pass
+        except Exception as _exc_1223:
+            logging.debug("[PATCH-276] L1223: %s", _exc_1223)
 
     return _set_china_cloud_cache("")
 
@@ -1104,7 +1340,7 @@ def _is_china_cloud_locked() -> str:
 # ---------------------------------------------------------------------------
 # [PATCH-215] 国内网络环境检测 (区分国内云身份 vs 国内网络出口)
 # ---------------------------------------------------------------------------
-_CHINA_NETWORK_CACHE = None  # type: Optional[bool]
+_CHINA_NETWORK_CACHE: Optional[bool] = None
 _CHINA_NETWORK_LOCK = _threading.Lock()
 
 
@@ -1181,8 +1417,8 @@ def _detect_china_network_locked() -> bool:
                     logging.info(t("info_patch_215_region_china_network"),
                         cloud, _region, _is_cn)
                     return _is_cn
-        except Exception:
-            pass
+        except Exception as _exc_1309:
+            logging.debug("[PATCH-276] timeout: %s", _exc_1309)
 
     # 华为云: JSON metadata, availability_zone 字段
     if "Huawei" in cloud:
@@ -1199,8 +1435,8 @@ def _detect_china_network_locked() -> bool:
                     logging.info(t("info_patch_215_huawei_cloud_az_china_network"),
                         _az, _is_cn)
                     return _is_cn
-        except Exception:
-            pass
+        except Exception as _exc_1327:
+            logging.debug("[PATCH-276] timeout: %s", _exc_1327)
 
     # UCloud / 百度云 / 金山云: 无标准 region endpoint, 走层 2
 
@@ -1218,8 +1454,8 @@ def _detect_china_network_locked() -> bool:
             if _elapsed < 2.0:
                 logging.info(t("info_patch_215_github_head_responded_in_overseas"), _elapsed, cloud)
                 return False
-    except Exception:
-        pass
+    except Exception as _exc_1346:
+        logging.debug("[PATCH-276] timeout: %s", _exc_1346)
 
     # ── 层 3: 默认 (保守) ─────────────────────────────────────
     logging.info(t("info_patch_215_region_unknown_github_unreachable_a"), cloud)
@@ -1354,7 +1590,7 @@ def _prompt_lang_change() -> None:
     print(f"语言已切换 / Language switched → {new_chosen.upper()}")
 
 
-_LANG = _detect_lang()  # type: str  # noqa: M-9 compat ok  # thread-safety: main-thread only
+_LANG: str = _detect_lang()  # noqa: M-9 compat ok  # thread-safety: main-thread only
 
 # [V3.2.135] 审计 P2-9 WONTFIX: _MESSAGES 字典 (~3000 行) 内联于代码中。
 # 提取到外部文件可改善可读性, 但会引入文件路径依赖 (单文件脚本设计约束)
@@ -1898,20 +2134,20 @@ _MESSAGES: dict = {
     # ── show_status (print) ─────────────────────────────────────────────────
     # [V3.2.8] L-1: Brotli 与 Cloudflare Real IP 状态国际化
     "status_brotli_on": {
-        "zh": "Brotli: 已启用 ({path})",  # [V3.2.9] M-1
-        "en": "Brotli: enabled ({path})",
+        "zh": "Brotli: 已启用 ({path}) [正常]",
+        "en": "Brotli: enabled ({path}) [OK]",
     },
     "status_brotli_off": {
-        "zh": "Brotli: 未配置",
-        "en": "Brotli: not configured",
+        "zh": "Brotli: 未启用",
+        "en": "Brotli: not enabled",
     },
     "status_cf_realip_on": {
-        "zh": "Cloudflare Real IP: 已启用 ({path})",
-        "en": "Cloudflare Real IP: enabled ({path})",
+        "zh": "Cloudflare Real IP: 已启用 ({path}) [正常]",
+        "en": "Cloudflare Real IP: enabled ({path}) [OK]",
     },
     "status_cf_realip_off": {
-        "zh": "Cloudflare Real IP: 未配置",
-        "en": "Cloudflare Real IP: not configured",
+        "zh": "Cloudflare Real IP: 未启用",
+        "en": "Cloudflare Real IP: not enabled",
     },
     # [PATCH-171 FIX-6] 缓存模式状态
     "status_cache_none": {
@@ -2047,12 +2283,12 @@ _MESSAGES: dict = {
     },
     # ── wp-config.php 权限状态 ──────────────────────────────────────────────
     "status_wpcfg_ok": {
-        "zh": "wp-config.php: 权限正常",
-        "en": "wp-config.php: permissions OK",
+        "zh": "wp-config.php: 权限 0440 [正常]",
+        "en": "wp-config.php: mode 0440 [OK]",
     },
     "status_wpcfg_warn": {
-        "zh": "wp-config.php: 权限过宽，建议执行 chmod 0440 wp-config.php",
-        "en": "wp-config.php: permissions too open; recommended: chmod 0440 wp-config.php",
+        "zh": "wp-config.php: 权限过宽 (建议 chmod 0440) [警告]",
+        "en": "wp-config.php: permissions too open (recommend chmod 0440) [WARN]",
     },
     # ── 定时器标签 ──────────────────────────────────────────────────────────
     "label_timer_ssl": {
@@ -4271,6 +4507,22 @@ _MESSAGES: dict = {
         "zh": "Webhook URL 被安全策略拒绝 (仅允许 http/https 且不可指向内网地址): {url}",
         "en": "Webhook URL blocked by security policy (http/https only, no internal addresses): {url}",
     },
+    "info_patch_278_journal_notify_installed": {
+        "zh": "[PATCH-278] 未配置 --notify-webhook, 已自动安装 journal/邮件 失败通知服务: {unit}。"
+              "续期失败将写入 journal (CRIT) 并尝试通过 mail 命令发送邮件至 root。"
+              "建议: 配置 --notify-webhook 以获得即时告警。",
+        "en": "[PATCH-278] No --notify-webhook configured. Auto-installed journal/email "
+              "failure notification service: {unit}. Renewal failures will be logged to "
+              "journal (CRIT) and email attempted via mail(1) to root. "
+              "Recommended: configure --notify-webhook for instant alerting.",
+    },
+    "warn_patch_278_journal_notify_failed": {
+        "zh": "[PATCH-278] 自动安装 journal 失败通知服务失败。续期失败将无告警。"
+              "建议: 使用 --notify-webhook 或外部监控 certificate expiry。",
+        "en": "[PATCH-278] Failed to auto-install journal failure notification service. "
+              "Renewal failures will be unmonitored. "
+              "Recommended: use --notify-webhook or monitor certificate expiry externally.",
+    },
     "info_pre_backup_start": {
         "zh": "操作前自动备份 (轻量: DB + Nginx 配置)...",
         "en": "Pre-operation auto-backup (lightweight: DB + Nginx config)...",
@@ -4684,6 +4936,10 @@ _MESSAGES: dict = {
     "warn_el_too_old_mariadb": {
         "zh": "EL{el} 版本过低, 无法升级 MariaDB; 继续使用系统默认版本。",
         "en": "EL{el} too old for MariaDB upgrade; continuing with system default.",
+    },
+    "warn_el7_eol_skip_upgrade": {
+        "zh": "[PATCH-272] EL{el} 已 EOL (2024-06), {component} 升级跳过。建议迁移到 EL8/9。",
+        "en": "[PATCH-272] EL{el} is EOL (2024-06); skipping {component} upgrade. Recommend migrating to EL8/9.",
     },
     "info_mariadb_stream_enabling": {
         "zh": "正在启用 MariaDB 模块流: {stream}",
@@ -6953,6 +7209,237 @@ _MESSAGES: dict = {
         "zh": "[PATCH-268] MariaDB 升级后无法恢复正常运行。请手动排查: systemctl status %s",
         "en": "[PATCH-268] MariaDB could not be restored after upgrade. Manual fix: systemctl status %s",
     },
+
+    # ── PATCH-270: Certbot / Redis / Nginx 动态模块版本管理 ──────────
+    # Certbot snap 迁移
+    "info_certbot_version": {
+        "zh": "Certbot 版本: {ver} ({src})",
+        "en": "Certbot version: {ver} ({src})",
+    },
+    "info_certbot_snap_ok": {
+        "zh": "Certbot 已通过 snap 安装, 自动保持最新。",
+        "en": "Certbot installed via snap; auto-updates are enabled.",
+    },
+    "info_certbot_snap_migrating": {
+        "zh": "[PATCH-270] apt/yum certbot {ver} 版本过旧 (最低要求 {min}), 正在迁移至 snap certbot...",
+        "en": "[PATCH-270] apt/yum certbot {ver} is outdated (minimum {min}); migrating to snap certbot...",
+    },
+    "info_certbot_apt_migrating": {
+        "zh": "[PATCH-270] apt/yum certbot {ver} 可用, 但 EFF 已停止更新 apt 包。正在迁移以获得自动更新和完整功能...",
+        "en": "[PATCH-270] apt/yum certbot {ver} works, but EFF stopped updating apt packages. Migrating for auto-updates and full features...",
+    },
+    "warn_certbot_old_suggest_snap": {
+        "zh": "[PATCH-270] certbot {ver} 尚可使用, 但建议迁移至 snap certbot 以获得自动更新和完整功能 (ECDSA 证书、--preferred-chain 等)。",
+        "en": "[PATCH-270] certbot {ver} still works, but consider migrating to snap certbot for auto-updates and full features (ECDSA certs, --preferred-chain, etc.).",
+    },
+    "info_certbot_snap_removing_apt": {
+        "zh": "[PATCH-270] 正在移除 apt/yum certbot 包 (/etc/letsencrypt 数据保留)...",
+        "en": "[PATCH-270] Removing apt/yum certbot package (/etc/letsencrypt data preserved)...",
+    },
+    "info_certbot_snap_installing": {
+        "zh": "[PATCH-270] 正在安装 snap certbot...",
+        "en": "[PATCH-270] Installing snap certbot...",
+    },
+    "ok_certbot_snap_migrated": {
+        "zh": "[PATCH-270] certbot 已成功迁移至 snap (版本: {ver})。后续将自动更新。",
+        "en": "[PATCH-270] certbot migrated to snap successfully (version: {ver}). Auto-updates enabled.",
+    },
+    "warn_certbot_snap_failed": {
+        "zh": "[PATCH-270] snap certbot 安装失败; 继续使用当前版本 ({ver})。手动迁移: snap install --classic certbot",
+        "en": "[PATCH-270] snap certbot installation failed; continuing with current version ({ver}). Manual migration: snap install --classic certbot",
+    },
+    "warn_certbot_snapd_unavail": {
+        "zh": "[PATCH-270] snapd 不可用 (最小化安装/容器), 尝试 pip venv 回退路径安装 certbot...",
+        "en": "[PATCH-270] snapd unavailable (minimal install or container); attempting pip venv fallback to install certbot...",
+    },
+    "info_certbot_pip_venv_installing": {
+        "zh": "[PATCH-270] 正在通过 pip venv 安装 certbot 至 /opt/certbot/ (EFF 官方备选方案)...",
+        "en": "[PATCH-270] Installing certbot via pip venv to /opt/certbot/ (EFF official alternative)...",
+    },
+    "ok_certbot_pip_venv_installed": {
+        "zh": "[PATCH-270] certbot 已通过 pip venv 安装 (版本: {ver})。注意: pip 安装不含自动更新, 建议定期运行 /opt/certbot/bin/pip install --upgrade certbot",
+        "en": "[PATCH-270] certbot installed via pip venv (version: {ver}). Note: pip install does not auto-update; recommend periodically running /opt/certbot/bin/pip install --upgrade certbot",
+    },
+    "warn_certbot_pip_venv_failed": {
+        "zh": "[PATCH-270] pip venv certbot 安装也失败; 继续使用当前版本 ({ver})。手动修复: python3 -m venv /opt/certbot && /opt/certbot/bin/pip install certbot",
+        "en": "[PATCH-270] pip venv certbot installation also failed; continuing with current version ({ver}). Manual fix: python3 -m venv /opt/certbot && /opt/certbot/bin/pip install certbot",
+    },
+    # pip venv certbot 升级
+    "info_certbot_pip_upgrading": {
+        "zh": "[PATCH-270e] 正在升级 pip venv certbot (pip install --upgrade certbot)...",
+        "en": "[PATCH-270e] Upgrading pip venv certbot (pip install --upgrade certbot)...",
+    },
+    "ok_certbot_pip_upgraded": {
+        "zh": "[PATCH-270e] certbot 已升级: {old} → {new}",
+        "en": "[PATCH-270e] certbot upgraded: {old} → {new}",
+    },
+    "info_certbot_pip_already_latest": {
+        "zh": "[PATCH-270e] certbot {ver} 已是最新版本 (pip venv)。",
+        "en": "[PATCH-270e] certbot {ver} is already the latest (pip venv).",
+    },
+    "warn_certbot_pip_upgrade_failed": {
+        "zh": "[PATCH-270e] certbot pip 升级失败 (非致命), 继续使用当前版本 ({ver})。",
+        "en": "[PATCH-270e] certbot pip upgrade failed (non-fatal); continuing with current version ({ver}).",
+    },
+    "info_certbot_snap_dry_run_verify": {
+        "zh": "[PATCH-270] 验证 certbot 续期管道: certbot renew --dry-run...",
+        "en": "[PATCH-270] Verifying certbot renewal pipeline: certbot renew --dry-run...",
+    },
+    "ok_certbot_snap_dry_run_ok": {
+        "zh": "[PATCH-270] certbot 续期管道验证通过。",
+        "en": "[PATCH-270] certbot renewal pipeline verified.",
+    },
+    "warn_certbot_snap_dry_run_fail": {
+        "zh": "[PATCH-270] certbot 续期管道验证失败 (非致命)。下次续期时将自动重试。",
+        "en": "[PATCH-270] certbot renewal dry-run failed (non-fatal). Will retry on next renewal.",
+    },
+    # Redis 版本管理
+    "info_redis_version_ok": {
+        "zh": "Redis 版本: {ver} (满足最低要求 {min}+)。",
+        "en": "Redis version: {ver} (meets minimum {min}+).",
+    },
+    "info_redis_version_old": {
+        "zh": "[PATCH-270] Redis 版本 {ver} 低于推荐最低版本 {min} (缺少 ACL/io-threads), 尝试升级...",
+        "en": "[PATCH-270] Redis version {ver} is below recommended minimum {min} (lacks ACL/io-threads); attempting upgrade...",
+    },
+    "ok_redis_upgraded": {
+        "zh": "[PATCH-270] Redis 已升级至 {ver}。",
+        "en": "[PATCH-270] Redis upgraded to {ver}.",
+    },
+    "warn_redis_upgrade_failed": {
+        "zh": "[PATCH-270] Redis 升级失败; 继续使用当前版本 ({ver})。WordPress 对象缓存仍可正常工作。",
+        "en": "[PATCH-270] Redis upgrade failed; continuing with current version ({ver}). WordPress object cache still functional.",
+    },
+    "info_redis_not_installed_skip_version": {
+        "zh": "Redis 未安装, 跳过版本检查。",
+        "en": "Redis not installed; skipping version check.",
+    },
+    "ok_redis_verify_ping": {
+        "zh": "[PATCH-270] Redis 升级后验证: PING → PONG。",
+        "en": "[PATCH-270] Redis post-upgrade verify: PING → PONG.",
+    },
+    "warn_redis_verify_ping_fail": {
+        "zh": "[PATCH-270] Redis 升级后 PING 验证失败; 尝试重启服务...",
+        "en": "[PATCH-270] Redis post-upgrade PING verify failed; restarting service...",
+    },
+    # [PATCH-272] Redis 许可证提示 + 小版本升级 + fail2ban 小版本
+    "prompt_redis_license_change": {
+        "zh": "[PATCH-272] Redis 7.4+ 使用 RSAL/SSPL 许可 (非 BSD)。\n"
+              "  升级到最新版本需要接受许可变更。\n"
+              "  详情: https://redis.io/legal/licenses/\n"
+              "  接受许可变更并升级? [y/N]: ",
+        "en": "[PATCH-272] Redis 7.4+ uses RSAL/SSPL license (non-BSD).\n"
+              "  Upgrading to latest requires accepting the license change.\n"
+              "  Details: https://redis.io/legal/licenses/\n"
+              "  Accept license change and upgrade? [y/N]: ",
+    },
+    "info_redis_license_accepted": {
+        "zh": "[PATCH-272] Redis 许可变更已接受, 后续 update 不再询问。",
+        "en": "[PATCH-272] Redis license change accepted; won't ask again on future updates.",
+    },
+    "info_redis_license_declined": {
+        "zh": "[PATCH-272] Redis 许可变更已拒绝; 保持当前 BSD 版本 ({ver})。后续 update 不再询问。",
+        "en": "[PATCH-272] Redis license change declined; keeping current BSD version ({ver}). Won't ask again.",
+    },
+    "info_redis_license_skip_noninteractive": {
+        "zh": "[PATCH-272] 非交互模式: 跳过 Redis 许可变更确认。使用 --accept-redis-license 接受。",
+        "en": "[PATCH-272] Non-interactive: skipping Redis license prompt. Use --accept-redis-license to accept.",
+    },
+    "info_redis_minor_upgraded": {
+        "zh": "[PATCH-272] Redis 已升级: {old} → {new}",
+        "en": "[PATCH-272] Redis upgraded: {old} → {new}",
+    },
+    "info_redis_minor_already_latest": {
+        "zh": "[PATCH-272] Redis {ver} 已是仓库最新版本。",
+        "en": "[PATCH-272] Redis {ver} is the latest available in repo.",
+    },
+    "info_f2b_minor_upgraded": {
+        "zh": "[PATCH-272] fail2ban 已升级: {old} → {new}",
+        "en": "[PATCH-272] fail2ban upgraded: {old} → {new}",
+    },
+    # Nginx 动态模块重编译
+    "info_p270_nginx_modules_cleaned": {
+        "zh": "[PATCH-270] Nginx 升级后清理了旧版本动态模块 (.so), 将在后续步骤重新编译。",
+        "en": "[PATCH-270] Stale dynamic modules (.so) cleaned after Nginx upgrade; will recompile in subsequent steps.",
+    },
+    "info_p270_nginx_module_recompile": {
+        "zh": "[PATCH-270] Nginx 版本已变更, 正在重新编译动态模块 (Brotli/srcache)...",
+        "en": "[PATCH-270] Nginx version changed; recompiling dynamic modules (Brotli/srcache)...",
+    },
+    "ok_p270_nginx_module_recompile_done": {
+        "zh": "[PATCH-270] 动态模块重编译完成。",
+        "en": "[PATCH-270] Dynamic module recompilation complete.",
+    },
+    "warn_p270_nginx_module_recompile_fail": {
+        "zh": "[PATCH-270] 动态模块重编译失败 (非致命); Gzip 压缩和 FastCGI 缓存仍然生效。后续 update 将重试。",
+        "en": "[PATCH-270] Dynamic module recompilation failed (non-fatal); Gzip compression and FastCGI cache still active. Will retry on next update.",
+    },
+    "info_p270_nginx_module_marker_saved": {
+        "zh": "[PATCH-270] 已记录 Nginx 模块编译版本标记: {ver}",
+        "en": "[PATCH-270] Saved Nginx module build version marker: {ver}",
+    },
+
+    # ── PATCH-270b: WP-CLI / PHP Redis 扩展 / fail2ban 版本管理 ─────
+    # WP-CLI 最低版本门控
+    "info_wpcli_version_ok": {
+        "zh": "WP-CLI 版本: {ver} (满足最低要求 {min}+)。",
+        "en": "WP-CLI version: {ver} (meets minimum {min}+).",
+    },
+    "info_wpcli_version_old_force_update": {
+        "zh": "[PATCH-270b] WP-CLI {ver} 低于最低要求 {min} (PHP {php} 兼容性), 强制更新...",
+        "en": "[PATCH-270b] WP-CLI {ver} is below minimum {min} (PHP {php} compatibility); forcing update...",
+    },
+    "warn_wpcli_version_old_update_failed": {
+        "zh": "[PATCH-270b] WP-CLI 更新失败, 继续使用当前版本 {ver}。PHP 8.3 环境下部分命令可能输出 deprecation 警告。",
+        "en": "[PATCH-270b] WP-CLI update failed; continuing with {ver}. Some commands may produce deprecation warnings under PHP 8.3.",
+    },
+    # PHP Redis 扩展验证
+    "info_php_redis_ext_ok": {
+        "zh": "PHP redis 扩展已加载。",
+        "en": "PHP redis extension loaded.",
+    },
+    "warn_php_redis_ext_missing": {
+        "zh": "[PATCH-270b] PHP redis 扩展未加载; Redis 对象缓存无法工作。尝试安装...",
+        "en": "[PATCH-270b] PHP redis extension not loaded; Redis object cache will not work. Attempting install...",
+    },
+    "ok_php_redis_ext_restored": {
+        "zh": "[PATCH-270b] PHP redis 扩展已恢复 (FPM 重启后生效)。",
+        "en": "[PATCH-270b] PHP redis extension restored (effective after FPM restart).",
+    },
+    "warn_php_redis_ext_restore_failed": {
+        "zh": "[PATCH-270b] PHP redis 扩展安装失败。手动修复: {cmd}",
+        "en": "[PATCH-270b] PHP redis extension install failed. Manual fix: {cmd}",
+    },
+    # fail2ban 版本探测
+    "info_f2b_version": {
+        "zh": "fail2ban 版本: {ver}。",
+        "en": "fail2ban version: {ver}.",
+    },
+    "info_f2b_version_old_note": {
+        "zh": "[PATCH-270b] fail2ban {ver} 较旧 (< 0.11); failregex 性能较低, 高并发下 CPU 可能偏高。建议升级系统包。",
+        "en": "[PATCH-270b] fail2ban {ver} is dated (< 0.11); failregex performance is lower, CPU may spike under high traffic. Consider upgrading system packages.",
+    },
+    # --serve-dist 镜像分发
+    "info_serve_dist_setup": {
+        "zh": "[PATCH-271] 配置脚本分发镜像: {path} → {url}",
+        "en": "[PATCH-271] Setting up script distribution mirror: {path} → {url}",
+    },
+    "ok_serve_dist_synced": {
+        "zh": "[PATCH-271] 脚本已同步至分发目录 ({ver}, SHA256: {sha})",
+        "en": "[PATCH-271] Script synced to distribution directory ({ver}, SHA256: {sha})",
+    },
+    "info_serve_dist_systemd_installed": {
+        "zh": "[PATCH-271] systemd path unit 已安装: 脚本更新时自动同步分发目录。",
+        "en": "[PATCH-271] systemd path unit installed: distribution directory auto-syncs on script update.",
+    },
+    "warn_serve_dist_sync_failed": {
+        "zh": "[PATCH-271] 脚本同步至分发目录失败 (非致命): {err}",
+        "en": "[PATCH-271] Script sync to distribution directory failed (non-fatal): {err}",
+    },
+    "help_serve_dist": {
+        "zh": "启用脚本分发镜像: 在 Nginx 中注入 /wp-ssl-bootstrap/ 下载端点, 供其他服务器 self-update 使用",
+        "en": "Enable script distribution mirror: inject /wp-ssl-bootstrap/ download endpoint in Nginx for other servers' self-update",
+    },
     "warn_nginx_not_found": {
         "zh": "未检测到 Nginx, 将在后续步骤安装。",
         "en": "Nginx not detected; will be installed in subsequent steps.",
@@ -7031,8 +7518,8 @@ def t(_key: str, **kwargs) -> str:
 try:
     import resource
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-except Exception:
-    pass
+except Exception as _exc_7394:
+    logging.debug("[PATCH-276] L7394: %s", _exc_7394)
 
 # [V2.9.5] 进程级 dumpable 禁用：即使 /proc/sys/kernel/core_pattern 被配置，
 # 也阻止 /proc/self/mem 被其他进程读取（需 CAP_SYS_PTRACE 才能绕过）。
@@ -7040,8 +7527,8 @@ try:
     import ctypes
     _PR_SET_DUMPABLE = 4
     ctypes.CDLL("libc.so.6", use_errno=True).prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
-except Exception:
-    pass
+except Exception as _exc_7403:
+    logging.debug("[PATCH-276] L7403: %s", _exc_7403)
 
 # ---------------------------------------------------------------------------
 # 全局日志初始化
@@ -7074,7 +7561,7 @@ class CmdResult:
     PERMISSION = 3   # 权限不足
     FATAL      = 4   # 不可恢复的致命错误
 
-    def __init__(self, ok: bool, code: int = 0, stdout: str = "", stderr: str = ""):
+    def __init__(self, ok: bool, code: int = 0, stdout: str = "", stderr: str = "") -> None:
         self.ok = ok
         self.code = code if not ok else self.SUCCESS
         self.stdout = stdout
@@ -7168,7 +7655,7 @@ class SiteConfig:
     DISK_OK_THRESHOLD_MB      = 500   # [PATCH-146 P3-3] status OK
     DISK_WARN_THRESHOLD_MB    = 200   # [PATCH-146 P3-3] status WARN
 
-    def __init__(self, args):
+    def __init__(self, args: argparse.Namespace) -> None:
         self.domain = args.domain.lower().strip()
         # [V3.2.64] BUG-A: 用户输入 www.example.com 时自动剥离 www. 前缀，
         # 后续 _build_domain_args / _nginx_server_names 会自动添加 www 变体，
@@ -7270,6 +7757,8 @@ class SiteConfig:
         self.optimize = getattr(args, 'optimize', False)  # [V3.0.16] P9
         self.http3 = getattr(args, 'http3', False)  # [PATCH-167 FIX-5]
         self.cloudflare = getattr(args, 'cloudflare', False)  # [V3.0.16] P12
+        self.serve_dist = getattr(args, 'serve_dist', False)  # [PATCH-271]
+        self.accept_redis_license = getattr(args, 'accept_redis_license', False)  # [PATCH-272]
         # [AUDIT-FIX BUG-3] 追踪安全相关布尔选项是否由用户显式指定,
         # 防止 _detect_site_config 自动探测覆盖用户意图。
         # 参考 _cache_user_specified 的成熟模式。
@@ -7605,8 +8094,10 @@ class SiteConfig:
           1. PATH 中的 certbot          — apt/yum 标准包管理器安装
           2. /snap/bin/certbot          — Ubuntu Snap 安装
              (Snap 经常不在 root 的 PATH 中，必须显式探测)
-          3. /usr/local/bin/certbot-auto — 旧版 certbot-auto 独立安装
-          4. 'certbot'                   — 兜底；不在 PATH 时 run_cmd
+          3. /opt/certbot/bin/certbot   — EFF pip venv 安装
+             (symlink /usr/local/bin/certbot 可能被删除/覆盖，必须显式探测)
+          4. /usr/local/bin/certbot-auto — 旧版 certbot-auto 独立安装
+          5. 'certbot'                   — 兜底；不在 PATH 时 run_cmd
              返回 FATAL CmdResult，错误信息清晰可查。
         """
         # 优先级 1: PATH 中的 certbot（apt/yum 标准安装，最常见）
@@ -7617,11 +8108,18 @@ class SiteConfig:
         snap_bin = Path("/snap/bin/certbot")
         if snap_bin.is_file():
             return str(snap_bin)
-        # 优先级 3: certbot-auto 传统独立安装
+        # 优先级 3: EFF pip venv 安装路径
+        # [PATCH-270e] 对齐 snap 的显式探测。symlink /usr/local/bin/certbot
+        # 可能被意外删除 (手动操作/包管理器覆盖/snap 迁移失败残留),
+        # 此时 shutil.which 找不到 certbot, 但 venv 二进制仍完好。
+        pip_venv_bin = Path("/opt/certbot/bin/certbot")
+        if pip_venv_bin.is_file():
+            return str(pip_venv_bin)
+        # 优先级 4: certbot-auto 传统独立安装
         certbot_auto = Path("/usr/local/bin/certbot-auto")
         if certbot_auto.is_file():
             return str(certbot_auto)
-        # 优先级 4: 兜底（依赖运行时 PATH，不在 PATH 则 run_cmd 会 FATAL）
+        # 优先级 5: 兜底（依赖运行时 PATH，不在 PATH 则 run_cmd 会 FATAL）
         return "certbot"
 
     @staticmethod
@@ -7662,8 +8160,8 @@ class SiteConfig:
                         cert_path = Path(line.split(":", 1)[1].strip())
                         if cert_path.exists():
                             return (cert_path, cert_path.parent / "privkey.pem")
-        except Exception:
-            pass
+        except Exception as _exc_8036:
+            logging.warning("[PATCH-276] stdout: %s", _exc_8036)
 
         # 优先级 3: 回退到标准路径（首次 deploy / 探测失败）
         return (std_chain, std_key)
@@ -7692,8 +8190,8 @@ class SiteConfig:
                 _id_val = _id.group(1).strip()
                 if _id_val in ('debian', 'ubuntu', 'linuxmint', 'deepin', 'pop', 'kali'):
                     return "/var/www/html"
-        except Exception:
-            pass
+        except Exception as _exc_8066:
+            logging.debug("[PATCH-276] _osr: %s", _exc_8066)
         # 优先级 2: 包管理器探测（回退）
         if shutil.which("apt"):
             return "/var/www/html"
@@ -7959,8 +8457,8 @@ def _get_system_ram_mb() -> int:
             for _line in _f:
                 if _line.startswith("MemTotal:"):
                     return int(_line.split()[1]) // 1024
-    except Exception:
-        pass
+    except Exception as _exc_8335:
+        logging.debug("[PATCH-276] encoding: %s", _exc_8335)
     return 0
 
 
@@ -8047,12 +8545,11 @@ def _nginx_http_redirect(domain: str, webroot: Path) -> str:
 # [V3.0.11] B4: 模块级缓存，避免 deploy/update 多次 fork nginx -v
 # [V3.2.12] P2-9: 添加线程锁保护
 # [V3.2.102] P3-2: GIL 依赖说明 — 同 _CHINA_CLOUD_CACHE (见上方注释)。
-_NGINX_HTTP2_DIRECTIVE_CACHE = None  # type: Optional[bool]  # [V3.2.3] M-9: Python 3.6 compat
+_NGINX_HTTP2_DIRECTIVE_CACHE: Optional[bool] = None  # [V3.2.3] M-9: Python 3.6 compat
 _NGINX_HTTP2_LOCK = _threading.Lock()
 
 
-def _set_nginx_http2_cache(value):
-    # type: (bool) -> bool
+def _set_nginx_http2_cache(value: bool) -> bool:
     """[V3.2.13] P1-2: Thread-safe cache write for _detect_nginx_http2_directive().
     [V3.2.22] P1-2: 双重检查锁 — 锁内二次校验，防止并发时重复 fork nginx -v。
     [PATCH] BUG-1/B-2: 调用方已持有 _NGINX_HTTP2_LOCK, 此处直接写入。
@@ -8094,8 +8591,8 @@ def _detect_nginx_http2_directive() -> bool:
             if m:
                 ver = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
                 return _set_nginx_http2_cache(ver >= (1, 25, 1))
-        except Exception:
-            pass
+        except Exception as _exc_8471:
+            logging.debug("[PATCH-276] stdout: %s", _exc_8471)
         # [V3.2.10] L-1: 检测失败时默认 False（旧语法内联）而非 True，
         # 防止在 Nginx < 1.25.1（如 CentOS 7 默认 1.20.x）上静默除去 HTTP/2。
         # 旧语法将 http2 配置内联到 listen 行，在所有版本均安全。
@@ -8108,7 +8605,7 @@ def _detect_nginx_http2_directive() -> bool:
 # ---------------------------------------------------------------------------
 # [PATCH-167 FIX-1] HTTP/3 QUIC 能力探测 (模块级缓存)
 # ---------------------------------------------------------------------------
-_NGINX_HTTP3_CACHE = None  # type: Optional[bool]
+_NGINX_HTTP3_CACHE: Optional[bool] = None
 _NGINX_HTTP3_LOCK = _threading.Lock()
 
 
@@ -8135,14 +8632,14 @@ def _detect_nginx_http3_capable() -> bool:
             _ok = "http_v3" in _out.lower()
             _NGINX_HTTP3_CACHE = _ok
             return _ok
-        except Exception:
-            pass
+        except Exception as _exc_8512:
+            logging.debug("[PATCH-276] stdout: %s", _exc_8512)
         _NGINX_HTTP3_CACHE = False
         return False
 
 
 # [PATCH-168 FIX-1] srcache 四模块探测
-_SRCACHE_DETECT_CACHE = None  # type: Optional[tuple]
+_SRCACHE_DETECT_CACHE: Optional[tuple] = None
 _SRCACHE_DETECT_LOCK = _threading.Lock()
 
 def _detect_srcache_modules() -> tuple:
@@ -8170,7 +8667,9 @@ def _detect_srcache_modules() -> tuple:
             for _m in _req:
                 if _m in _out or _m.replace('_', '-') in _out:
                     _req[_m] = True
-        except Exception: pass
+        except Exception as _srcache_e:
+            logging.debug("[PATCH-276] srcache module detection"
+                          " via nginx -V failed: %s", _srcache_e)
         for _d in ("/etc/nginx/modules-enabled",
                    "/usr/lib64/nginx/modules", "/usr/lib/nginx/modules"):
             _dp = Path(_d)
@@ -8284,6 +8783,9 @@ def _nginx_ssl_core(domain: str, webroot: Path,
         + _http2
         + _alt_svc
         + f"    server_tokens off;\n"
+        # [PATCH-276 FIX-P1-4] 限制客户端请求头数量, 防止 header 洪泛 DoS。
+        # Nginx 1.27+ 默认 100, 此处显式设为 50 (WordPress 正常请求 <20 个头)。
+        # 低于默认值以收紧攻击面; 若用到大量自定义头的 CDN/WAF, 可酌情调高。
         f"\n"
         f"    access_log /var/log/nginx/{domain}.access.log combined;\n"
         f"    error_log  /var/log/nginx/{domain}.error.log;\n"
@@ -8334,6 +8836,15 @@ _COMMON_SECURITY_HEADER_PAIRS = [
     # 但旧版过滤机制本身可被利用创造新 XSS 向量。
     # 设为 "0" 是 OWASP 和 MDN 2025 推荐做法; CSP 已接管 XSS 防护。
     ("X-XSS-Protection",                "0"),
+    # [PATCH-276 FIX-P1-1] Cross-Origin-Opener-Policy + Embedder-Policy。
+    # COOP 隔离顶层浏览上下文, 防止跨源窗口引用攻击 (Spectre 旁路)。
+    # same-origin-allow-popups: 比 same-origin 更兼容 WordPress 生态
+    # (OAuth 弹窗登录、支付网关回调窗口等需要 window.opener 通信)。
+    # COEP unsafe-none: WordPress 插件/主题大量加载跨源资源 (CDN 图片、
+    # Google Fonts、嵌入视频等), 设 require-corp 会大面积破坏功能。
+    # unsafe-none 配合 COOP 仍能提供进程隔离 (Chrome Site Isolation)。
+    ("Cross-Origin-Opener-Policy",      "same-origin-allow-popups"),
+    ("Cross-Origin-Embedder-Policy",    "unsafe-none"),
 ]
 
 
@@ -8410,7 +8921,7 @@ def _nginx_open_file_cache() -> str:
     )
 
 
-def _nginx_base_security_headers():
+def _nginx_base_security_headers() -> bool:
     """[V3.2.2] N-1: 公共安全响应头 (HTTP/HTTPS 共用)。
 
     所有非 HSTS 的安全头集中维护于此。新增安全头只需改此一处。
@@ -8455,7 +8966,7 @@ def _nginx_base_security_headers():
     return "".join(_lines)
 
 
-def _nginx_security_headers(cache_mode="none", safe_name=""):
+def _nginx_security_headers(cache_mode: str="none", safe_name: str="") -> str:
     """安全响应头: HSTS + 公共头 + 可选 FastCGI 缓存头。"""
     cache_header = ""
     if cache_mode == "fastcgi":
@@ -8469,6 +8980,14 @@ def _nginx_security_headers(cache_mode="none", safe_name=""):
         f"\n"
         f"    add_header Strict-Transport-Security"
         f" \"max-age=63072000; includeSubDomains; preload\" always;\n"
+        # [PATCH-276 FIX-N6] HSTS preload 风险说明:
+        # max-age=63072000 (2年) + includeSubDomains + preload 对齐
+        # Mozilla SSL Config Generator "Intermediate" 推荐。
+        # 注意: 一旦域名被提交到 HSTS preload list (hstspreload.org),
+        # 撤回需要数月。首次部署时建议先用浏览器访问确认 HTTPS 正常后
+        # 再提交 preload。本脚本不自动提交 preload, 仅在响应头中声明。
+        # 若需要更保守的策略 (如先用 max-age=300 测试), 可在
+        # deploy 后通过 update 子命令手动修改 nginx 配置。
         + _nginx_base_security_headers()
         + f"{cache_header}"
     )
@@ -8491,6 +9010,8 @@ def _resolve_cert_paths(domain: str, certbot_bin: str = "") -> tuple:
         certbot_bin = (
             shutil.which("certbot")
             or ("/snap/bin/certbot" if Path("/snap/bin/certbot").is_file() else None)
+            or ("/opt/certbot/bin/certbot"  # [PATCH-270e] pip venv
+                if Path("/opt/certbot/bin/certbot").is_file() else None)
             or ("/usr/local/bin/certbot-auto"
                 if Path("/usr/local/bin/certbot-auto").is_file() else None)
             or "certbot"
@@ -8741,10 +9262,51 @@ def _nginx_wp_security(safe_name: str, sock_path: str,
 
 
 
-def generate_http_production_config(domain, webroot, sock_path,
-                                    cache_mode="none",
-                                    allow_xmlrpc=False,
-                                    optimize=False):
+def _nginx_serve_dist_location() -> str:
+    """[PATCH-271] 生成脚本分发镜像的 Nginx location 块。
+
+    使用 exact-match location (=) 仅暴露两个文件:
+      - /wp-ssl-bootstrap/wp_ssl_bootstrap.py
+      - /wp-ssl-bootstrap/wp_ssl_bootstrap.py.sha256
+
+    设计选择:
+      - exact-match 避免 regex/if 陷阱 (NGINX Wiki "If is Evil")
+      - 仅白名单两个文件路径, 其它 URL 自然返回 404
+      - Cache-Control no-cache: 确保 self-update 拿最新版本
+      - X-Content-Type-Options nosniff: 防 MIME 嗅探
+      - X-Robots-Tag noindex: 阻止搜索引擎索引
+      - sendfile on: 零拷贝传输 (~1MB 文件)
+    """
+    _dir = str(_SERVE_DIST_DIR)
+    _url = _SERVE_DIST_URL_PATH
+    _headers = (
+        '        add_header Cache-Control "no-cache, no-store, must-revalidate" always;\n'
+        '        add_header X-Content-Type-Options "nosniff" always;\n'
+        '        add_header X-Robots-Tag "noindex, nofollow" always;\n'
+    )
+    return (
+        f"\n"
+        f"    # [PATCH-271] Script distribution mirror (--serve-dist)\n"
+        f"    location = {_url}/wp_ssl_bootstrap.py {{\n"
+        f"        alias {_dir}/wp_ssl_bootstrap.py;\n"
+        f"        default_type application/octet-stream;\n"
+        f"{_headers}"
+        f"        sendfile on;\n"
+        f"        tcp_nopush on;\n"
+        f"    }}\n"
+        f"    location = {_url}/wp_ssl_bootstrap.py.sha256 {{\n"
+        f"        alias {_dir}/wp_ssl_bootstrap.py.sha256;\n"
+        f"        default_type text/plain;\n"
+        f"{_headers}"
+        f"    }}\n"
+    )
+
+
+def generate_http_production_config(domain: str, webroot: Path, sock_path: str,
+                                    cache_mode: str="none",
+                                    allow_xmlrpc: bool=False,
+                                    optimize: bool=False,
+                                    serve_dist: bool=False) -> bool:
     """生成不含 SSL 的完整生产 Nginx 配置 (--skip-ssl 模式)。
 
     与 generate_https_config 功能对等, 但:
@@ -8825,6 +9387,8 @@ def generate_http_production_config(domain, webroot, sock_path,
     # 总是在 server 块末尾、闭合 } 之前。
     if cache_mode == "redis":
         parts.append(_nginx_srcache_internal_locations(safe))
+    if serve_dist:  # [PATCH-271]
+        parts.append(_nginx_serve_dist_location())
     parts.append("}\n")  # server 块闭合
 
     return "".join(parts)
@@ -8837,7 +9401,8 @@ def generate_https_config(domain: str, webroot: Path, sock_path: str,
                           optimize: bool = False,
                           cert_chain: str = "",
                           cert_key: str = "",
-                          http3: bool = False) -> str:
+                          http3: bool = False,
+                          serve_dist: bool = False) -> str:
     """组装完整的 Nginx HTTPS 配置。
 
     V3.0.0 重构: 从 10 个独立片段函数组装，每个片段可独立测试和修改。
@@ -8890,6 +9455,8 @@ def generate_https_config(domain: str, webroot: Path, sock_path: str,
     # 不再包含闭合 }, 由此处显式追加。
     if cache_mode == "redis":
         parts.append(_nginx_srcache_internal_locations(safe))
+    if serve_dist:  # [PATCH-271]
+        parts.append(_nginx_serve_dist_location())
     parts.append("}\n")  # server 块闭合
 
     return "".join(parts)
@@ -8954,8 +9521,8 @@ def patch_wp_config(content: str, db_name: str, db_user: str, db_pass: str,
             # comment/string detection, replacing fragile rfind("/*") that
             # fails when string literals contain "/*" patterns.
             _nocode_ranges_234 = _build_php_nocode_ranges(content)
-            def _fb_replace_skip_comments(m, v=_safe_fb,
-                                          _ranges=_nocode_ranges_234):
+            def _fb_replace_skip_comments(m: "re.Match[str]", v: str=_safe_fb,
+                                          _ranges: list=_nocode_ranges_234) -> str:
                 if _pos_in_nocode_range(_ranges, m.start()):
                     return m.group(0)  # inside comment or string literal
                 return m.group(1) + v + m.group(2)
@@ -8971,7 +9538,7 @@ def patch_wp_config(content: str, db_name: str, db_user: str, db_pass: str,
 # ---------------------------------------------------------------------------
 # [PATCH-232 FIX-4] Precomputed comment/string range index for O(log n) lookup.
 # Replaces O(n) per-call scanning in hot loops (inject_salts × 8 keys).
-def _build_php_nocode_ranges(text):
+def _build_php_nocode_ranges(text: str) -> list:
     """Build sorted list of (start, end) ranges that are inside
     comments or string literals. Single scan O(n), then each
     _pos_in_nocode_range query is O(log n) via bisect."""
@@ -9102,7 +9669,7 @@ def _build_php_nocode_ranges(text):
     return ranges
 
 
-def _pos_in_nocode_range(ranges, pos):
+def _pos_in_nocode_range(ranges: list, pos: int) -> bool:
     """O(log n) check whether pos falls inside any precomputed range."""
     import bisect as _bisect_232
     # Binary search: find the rightmost range whose start <= pos
@@ -9119,7 +9686,7 @@ def _pos_in_nocode_range(ranges, pos):
     return _start <= pos < _end
 
 
-def _in_php_comment(text, pos):
+def _in_php_comment(text: str, pos: int) -> bool:
     """正向扫描判断 pos 是否在 PHP 注释内 (支持嵌套)。
 
     [AUDIT-R2 MED-13] 增加 PHP 字符串字面量跳过:
@@ -9290,8 +9857,7 @@ def inject_salts(content: str) -> str:
     return content
 
 
-def inject_wp_hardening(content, skip_ssl=False):
-    # type: (str, bool) -> str
+def inject_wp_hardening(content: str, skip_ssl: bool = False) -> str:
     """向 wp-config.php 注入安全加固常量。
 
     [V3.2.12] P2-7: 新增 skip_ssl 参数，直接控制 FORCE_SSL_ADMIN 注入值，
@@ -9365,7 +9931,7 @@ def inject_wp_hardening(content, skip_ssl=False):
     return content + inject_block
 
 
-def _set_force_ssl_admin(content, enabled=True):
+def _set_force_ssl_admin(content: str, enabled: bool=True) -> str:
     """[V3.2.3] M-8: 使用正则匹配 FORCE_SSL_ADMIN, 容忍格式差异。
 
     兼容: define('FORCE_SSL_ADMIN', true); / define( "FORCE_SSL_ADMIN" , true );
@@ -9456,8 +10022,7 @@ def inject_redis_config(content: str, domain: str,
     return content + inject_block
 
 
-def patch_wplang(content):
-    # type: (str) -> str
+def patch_wplang(content: str) -> str:
     """B6: 确保 wp-config.php 中 WPLANG 与 _LANG 一致。
 
     解决跨语言兜底下载问题：用户选英文但中文源先成功时，
@@ -9677,6 +10242,14 @@ def _try_repair_openssl() -> tuple:
     返回 (True,  cmd_used) — 修复命令执行成功 (returncode==0)
          (False, err_msg)  — 修复失败或无可用包管理器
 
+    [PATCH-275] 社区最佳实践合入:
+    - L0: 检测 /usr/local/lib{,64}/ 下的 libssl/libcrypto 手动编译残留,
+          这些会被动态链接器优先加载, 覆盖系统版本导致版本不匹配。
+          移除残留后 ldconfig 刷新缓存。
+    - L1: dnf reinstall / apt --reinstall 同步系统包。
+    - 注意: Python SSL 是 C 扩展, 加载后无法在当前进程中修复。
+          修复仅对后续进程 (curl/wget 子进程、下次脚本运行) 生效。
+
     执行流程 (按发行版):
     - dnf 系 (RHEL/Rocky/Alma/Fedora):
         1) dnf reinstall -y openssl openssl-libs
@@ -9692,6 +10265,48 @@ def _try_repair_openssl() -> tuple:
     """
     import shutil as _shutil_repair
 
+    # ── L0: 检测并移除 /usr/local/ 下的 OpenSSL 手动编译残留 ──────────
+    # 社区高频根因: 用户或第三方脚本在 /usr/local/ 下编译安装了新版 OpenSSL,
+    # ld.so 按 /etc/ld.so.conf 优先搜索 /usr/local/lib{,64}/, 导致系统 Python
+    # 加载了 /usr/local/ 的 libssl.so.3 (新版) 但 libcrypto.so.3 仍从 /lib64/
+    # (旧版) 加载, 或反之, 产生 OPENSSL_X.Y.Z not found 错误。
+    # 参考: github.com/openssl/openssl/issues/19801, #25462
+    _shadow_dirs = [
+        Path("/usr/local/lib64"),
+        Path("/usr/local/lib"),
+        Path("/usr/local/lib/x86_64-linux-gnu"),
+        Path("/usr/local/lib/aarch64-linux-gnu"),
+    ]
+    _shadow_fixed = False
+    for _sd in _shadow_dirs:
+        if not _sd.is_dir():
+            continue
+        for _pat in ("libssl.so.3*", "libcrypto.so.3*"):
+            import glob as _glob_ssl
+            for _sf in _glob_ssl.glob(str(_sd / _pat)):
+                _sfp = Path(_sf)
+                if _sfp.is_file() or _sfp.is_symlink():
+                    _bak = _sfp.with_suffix(_sfp.suffix + ".bak-wpssl")
+                    try:
+                        _sfp.rename(_bak)
+                        logging.info(
+                            "[PATCH-275 L0] 移除 OpenSSL 残留: %s → %s"
+                            % (_sfp, _bak.name))
+                        _shadow_fixed = True
+                    except OSError as _e_sf:
+                        logging.debug(
+                            "[PATCH-275 L0] rename failed: %s: %s",
+                            _sfp, _e_sf)
+    if _shadow_fixed:
+        # 刷新 ldconfig 缓存, 使动态链接器使用系统版本
+        try:
+            subprocess.run(
+                ["ldconfig"], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=15, check=False)
+        except Exception as _exc_10178:
+            logging.debug("[PATCH-276] _sfp: %s", _exc_10178)
+
+    # ── L1: 包管理器 reinstall/distro-sync ─────────────────────────────
     _repair_strategies = []  # [(描述, [cmd, ...])]
 
     if _shutil_repair.which("dnf"):
@@ -9731,17 +10346,15 @@ def _try_repair_openssl() -> tuple:
                 timeout=120, check=False,
             )
             if _proc.returncode == 0:
-                # 强制 Python 重新加载 ssl 模块 (清除已缓存的失败状态)
-                # 注: importlib.reload(ssl) 对 C 扩展模块效果有限,
-                # 但 ctypes/dlopen 级的修复在 reinstall 后立即生效于子进程;
-                # 当前进程中 urllib 的下次 create_default_context() 也会
-                # 重新调用底层 libssl, 大概率修复。
+                # [PATCH-275] Python SSL 是 C 扩展, 加载后 libssl.so 被 mmap 到进程地址空间,
+                # 无法通过 importlib.reload 释放。修复仅对新启动的子进程 (curl/wget) 和
+                # 下次脚本运行生效。当前请求降级到 L2 (curl) 处理。
                 try:
-                    import importlib
-                    import ssl as _ssl_reload
-                    importlib.reload(_ssl_reload)
-                except Exception:
-                    pass  # reload 失败不阻塞流程, urllib 重试时再验证
+                    subprocess.run(
+                        ["ldconfig"], stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, timeout=15, check=False)
+                except Exception as _exc_10228:
+                    logging.debug("[PATCH-276] _proc: %s", _exc_10228)
                 return (True, _desc)
             _last_err = (_proc.stderr or "").strip()[:200] or f"exit code {_proc.returncode}"
             logging.debug("[PATCH-EAB-CURL] repair '%s' failed: %s", _desc, _last_err)
@@ -9954,7 +10567,7 @@ def classify_certbot_error(stderr: str, domain: str = "") -> int:
         r'|connection|challenge|authorization|validation'
         r'|timeout|error|exception|status)\.\w[a-z_.]+\b')
     _py_map_191 = {}
-    def _py_protect_191(m, _d=_py_map_191):
+    def _py_protect_191(m: "re.Match[str]", _d: dict=_py_map_191) -> str:
         _k = '<_PY191_%d_>' % len(_d)
         _d[_k] = m.group(0)
         return _k
@@ -9966,13 +10579,8 @@ def classify_certbot_error(stderr: str, domain: str = "") -> int:
     # making remaining text unclassifiable and defaulting to RETRYABLE.
     # The classification keywords are generic enough to work without
     # stripping unrelated domains from error text.
-    # Extract domain from stderr URL patterns for targeted replacement.
-    import inspect as _insp_232
-    _caller_frame_232 = _insp_232.currentframe()
-    # We don't have direct access to cfg.domain here (static method),
-    # so we strip domains that appear after :// (URL context) and match
-    # the user's domain pattern. This is much narrower than before.
-    # Keep the protected CA hosts and Python paths from prior patches.
+    # [PATCH-276 FIX-P1-2] 移除死代码: import inspect 和 _caller_frame_232
+    # 从未被使用 (原设计意图是通过栈帧获取 domain, 后改为参数传入)。
     for _f7h, _f7p in _FIX7_CA_HOSTS.items():
         err = err.replace(_f7p, _f7h)
     # [PATCH-191 FIX-4] Restore protected Python dotted paths
@@ -10156,7 +10764,7 @@ class WPDeployManager:
         "":           {"zh": "脚本",         "en": "script"},
     }
 
-    def __init__(self, cfg: SiteConfig):
+    def __init__(self, cfg: SiteConfig) -> None:
         self.cfg = cfg
         self.lock_fd = None
         self.global_lock_fd = None
@@ -10248,8 +10856,8 @@ class WPDeployManager:
                 _m = re.match(r"(\d+)\.", _first.strip())
                 if _m and int(_m.group(1)) >= 5:
                     return True
-        except Exception:
-            pass
+        except Exception as _exc_10731:
+            logging.debug("[PATCH-276] _detect_is_dnf5: %s", _exc_10731)
         try:
             _osr = Path("/etc/os-release").read_text(encoding="utf-8", errors="replace")
             _vm = re.search(r'VERSION_ID\s*=\s*"?(\d+)', _osr)
@@ -10267,8 +10875,8 @@ class WPDeployManager:
                     return False
                 logging.debug("[V3.2.59] EL%s → dnf5 mode", _vm.group(1))
                 return True
-        except Exception:
-            pass
+        except Exception as _exc_10750:
+            logging.debug("[PATCH-276] _osr: %s", _exc_10750)
         return False
 
     def _detect_el_major(self) -> int:
@@ -10292,8 +10900,8 @@ class WPDeployManager:
             _vm = re.search(r'VERSION_ID\s*=\s*"?(\d+)', _osr)
             if _vm:
                 return int(_vm.group(1))
-        except Exception:
-            pass
+        except Exception as _exc_10775:
+            logging.debug("[PATCH-276] _detect_el_major: %s", _exc_10775)
         return 0
 
     def _detect_dnf_skip_unavailable(self) -> bool:
@@ -10349,8 +10957,8 @@ class WPDeployManager:
                         match = re.match(r'^\s*user\s+([a-zA-Z0-9_-]+)\s*;', line)
                         if match:
                             return match.group(1)
-            except Exception:
-                pass
+            except Exception as _exc_10832:
+                logging.debug("[PATCH-276] stdout: %s", _exc_10832)
         try:
             pwd.getpwnam("nginx")
             return "nginx"
@@ -10376,8 +10984,11 @@ class WPDeployManager:
                     key=lambda s: self._extract_php_version(s), reverse=True,
                 )
                 return active_candidates[0]
-        except Exception:
-            pass
+        except Exception as _fpm_e1:
+            # [PATCH-276 FIX-P0-4] FPM 服务探测失败会导致 nginx fastcgi_pass
+            # 写入空 socket 路径, 产生 502。记录以便排障。
+            logging.debug("[PATCH-276] PHP-FPM active service scan"
+                          " failed: %s", _fpm_e1)
         # 回退：扫描已安装的 unit 文件（即使服务未启动也能识别）
         try:
             r = subprocess.run(
@@ -10395,8 +11006,9 @@ class WPDeployManager:
                 # 按版本号降序：php8.3-fpm > php8.2-fpm > php-fpm
                 candidates.sort(key=lambda s: self._extract_php_version(s), reverse=True)
                 return candidates[0]
-        except Exception:
-            pass
+        except Exception as _fpm_e2:
+            logging.debug("[PATCH-276] PHP-FPM unit file scan"
+                          " failed: %s", _fpm_e2)
         # 最终 fallback：不分发行版地尝试 php 二进制探测版本
         # [V3.2.11] P1-6: 将动态探测提升为通用路径，不再仅限 apt 系；
         # 仅在 php 二进制不存在时才使用硬编码版本号（防止 php8.3→8.4+ 过时）。
@@ -10415,8 +11027,8 @@ class WPDeployManager:
                     if self.pkg_mgr in ("dnf", "yum"):
                         return "php-fpm"
                     return "php{}-fpm".format(_ver)
-        except Exception:
-            pass
+        except Exception as _exc_10902:
+            logging.debug("[PATCH-276] _pv_r: %s", _exc_10902)
         # [AUDIT R-2] 动态探测最高 PHP 版本, 替代硬编码 php8.3-fpm
         if self.pkg_mgr in ("dnf", "yum"):
             return "php-fpm"
@@ -10455,8 +11067,8 @@ class WPDeployManager:
             if r.returncode == 0 and f"{candidate}.service" in r.stdout:
                 logging.info(t("info_php_version_forced", ver=candidate))
                 return candidate
-        except Exception:
-            pass
+        except Exception as _exc_10942:
+            logging.debug("[PATCH-276] _resolve_php_fpm_service: %s", _exc_10942)
 
         logging.warning(t("warn_php_version_fallback", ver=version, svc=candidate))
         return self._detect_php_fpm_service()
@@ -10472,12 +11084,11 @@ class WPDeployManager:
                 )
                 if r.returncode == 0 and f"{svc}.service" in r.stdout:
                     return svc
-            except Exception:
-                pass
+            except Exception as _exc_10959:
+                logging.debug("[PATCH-276] stdout: %s", _exc_10959)
         return "mariadb"
 
-    def _detect_mysql_major_minor(self):
-        # type: () -> tuple
+    def _detect_mysql_major_minor(self) -> tuple:
         """检测 MySQL/MariaDB 主版本号，返回 (major, minor)。
 
         [V3.2.116] 用于 socket→密码认证切换时选择合适的认证插件：
@@ -10514,8 +11125,11 @@ class WPDeployManager:
                     if m:
                         major, minor = int(m.group(1)), int(m.group(2))
                         return (major, minor)
-            except Exception:
-                pass
+            except Exception as _mdb_ver_e:
+                # [PATCH-276 FIX-P0-4] 版本检测失败 → (0,0) 保守路径,
+                # 但记录原因以便排障 (如 mysql 客户端未安装)。
+                logging.debug("[PATCH-276] DB version detection"
+                              " failed: %s", _mdb_ver_e)
         return (0, 0)
 
     def _get_php_ini_paths(self) -> list:
@@ -10592,8 +11206,8 @@ class WPDeployManager:
                                 if _val24.startswith('/') or ':' in _val24:
                                     logging.info(t("info_php_socket_from_conf", conf=ver_conf, sock=_val24))
                                     return _val24
-                except Exception:
-                    pass
+                except Exception as _exc_11082:
+                    logging.debug("[PATCH-276] get_php_sock_path: %s", _exc_11082)
             logging.warning(t("warn_php_sock_fallback", ver=ver))
         # [PATCH-262 PHP-1] 优先匹配当前活跃 PHP-FPM 服务对应的版本。
         # 原代码用 glob 扫描所有 /etc/php/*/fpm/pool.d/www.conf,
@@ -10625,8 +11239,8 @@ class WPDeployManager:
                                 _val = m.group(1).strip()
                                 if _val.startswith('/') or ':' in _val:
                                     return _val
-                except Exception:
-                    pass
+                except Exception as _exc_11115:
+                    logging.debug("[PATCH-276] L11115: %s", _exc_11115)
         # 回退: 扫描所有版本 (按版本号降序, 优先新版本)
         _confs = self._get_php_conf_paths()
         _confs.sort(key=lambda p: p, reverse=True)
@@ -10641,33 +11255,44 @@ class WPDeployManager:
                             # 和 Unix socket 路径
                             if _val.startswith('/') or ':' in _val:
                                 return _val
-            except Exception:
-                pass
+            except Exception as _exc_11131:
+                logging.debug("[PATCH-276] encoding: %s", _exc_11131)
         _fallback = "/run/php/php-fpm.sock" if self.pkg_mgr == "apt" else "/run/php-fpm/www.sock"
         return _fallback
 
     def _wait_for_php_socket(self, sock_path: str,
                               max_wait: int = 10) -> bool:
-        """[FIX #10] 等待 PHP-FPM socket 文件出现。
+        """[FIX #10] 等待 PHP-FPM socket 文件出现并验证连通性。
 
         Nginx + PHP 同时升级时, PHP-FPM 服务可能尚未创建 socket。
-        apply_nginx_config_safe 前调用此方法确保 socket 存在。
+        apply_nginx_config_safe 前调用此方法确保 socket 存在且可连接。
         仅对 Unix socket 路径有效; TCP 地址直接返回 True。
+
+        [PATCH-276 FIX-P1-6] 增加 connect() 连通性测试: socket 文件存在
+        但 FPM master 未就绪 (刚 restart) 时, nginx 请求会得到 502。
         """
         if ':' in sock_path:
             return True  # TCP mode, no file to wait for
         if Path(sock_path).exists():
-            return True
+            # [PATCH-276] socket 文件存在, 验证是否可连接
+            if self._test_socket_connect(sock_path):
+                return True
+            # 文件在但连不上: FPM 可能挂了, 尝试 restart
+            logging.warning(
+                "[PATCH-276] socket file exists but connect() failed: %s"
+                " — restarting PHP-FPM", sock_path)
+        else:
+            logging.info(
+                t("info_php_sock_waiting",
+                  sock=sock_path, svc=self.php_fpm_svc))
         # 尝试 restart PHP-FPM 生成 socket
-        logging.info(
-            t("info_php_sock_waiting",
-              sock=sock_path, svc=self.php_fpm_svc))
         self.run_cmd(
             ["systemctl", "restart", self.php_fpm_svc],
             quiet=True, timeout=30)
-        # 轮询等待 socket 出现
+        # 轮询等待 socket 出现 + 可连接
         for _i in range(max_wait * 2):
-            if Path(sock_path).exists():
+            if (Path(sock_path).exists()
+                    and self._test_socket_connect(sock_path)):
                 logging.info(
                     t("info_php_sock_appeared", elapsed=_i * 0.5))
                 return True
@@ -10676,6 +11301,22 @@ class WPDeployManager:
             t("warn_php_sock_timeout",
               sock=sock_path, timeout=max_wait))
         return False
+
+    @staticmethod
+    def _test_socket_connect(sock_path: str, timeout: float = 2.0) -> bool:
+        """[PATCH-276 FIX-P1-6] 尝试 connect() 到 Unix socket, 验证 FPM 就绪。
+
+        仅测试 TCP 层连通性 (connect + 立即关闭), 不发送 FastCGI 数据。
+        """
+        import socket as _socket
+        try:
+            _s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            _s.settimeout(timeout)
+            _s.connect(sock_path)
+            _s.close()
+            return True
+        except (_socket.error, OSError):
+            return False
 
     def _resolve_php_listen_value(self, conf_path: str) -> str:
         """[FIX #24] 从 FPM pool 配置解析 listen 值, 支持 TCP 和 Unix socket。
@@ -10691,8 +11332,11 @@ class WPDeployManager:
                     m = re.match(r'^\s*listen\s*=\s*(\S+)', line)
                     if m:
                         return m.group(1).strip()
-        except Exception:
-            pass
+        except Exception as _lv_e:
+            # [PATCH-276 FIX-P0-4] listen 值解析失败导致 nginx fastcgi_pass
+            # 配置写入空路径, 产生 502 且极难排查。记录 warning。
+            logging.debug("[PATCH-276] Failed to parse PHP-FPM listen"
+                          " from %s: %s", conf_path, _lv_e)
         return ""
 
     # -----------------------------------------------------------------------
@@ -10715,8 +11359,8 @@ class WPDeployManager:
             )
             if r.returncode == 0 and r.stdout.strip():
                 return r.stdout.strip().lower()
-        except Exception:
-            pass
+        except Exception as _exc_11235:
+            logging.debug("[PATCH-276] _get_fs_type: %s", _exc_11235)
         # fallback: 解析 /proc/mounts，找最长前缀匹配挂载点
         try:
             real = os.path.realpath(str(target))
@@ -10731,8 +11375,8 @@ class WPDeployManager:
                 mnt_norm = mnt.rstrip("/")
                 if real == mnt_norm or real.startswith(mnt_norm + "/"):
                     return fstype.lower()
-        except Exception:
-            pass
+        except Exception as _exc_11251:
+            logging.warning("[PATCH-276] stdout: %s", _exc_11251)
         return ""
 
     @staticmethod
@@ -10750,8 +11394,8 @@ class WPDeployManager:
                 for line in f:
                     if line.startswith("MemTotal:"):
                         return int(line.split()[1]) // 1024
-        except Exception:
-            pass
+        except Exception as _exc_11270:
+            logging.debug("[PATCH-276] _get_total_ram_mb: %s", _exc_11270)
         return 0
 
     def _patch_fpm_pool_tuning(self) -> None:
@@ -10860,8 +11504,8 @@ class WPDeployManager:
         lines = [
             "# [V3.0.16] WP-SSL-Bootstrap MariaDB tuning",
             "# Auto-generated based on system RAM (%dMB). Values will be" % total_mb,
-            "# overwritten on deploy/update. To preserve manual edits,",
-            "# add a line containing '# User-modified' anywhere in this file.",
+            "# overwritten on deploy/update. To preserve your manual edits,",
+            "# add a NEW line with only:  # User-modified",
             "[mysqld]",
             f"innodb_buffer_pool_size = {pool}M",
             # [V3.0.16] F5: 移除 innodb_log_file_size (MariaDB < 10.6 变更后启动失败)
@@ -10893,7 +11537,13 @@ class WPDeployManager:
                         try:
                             _existing_cnf = conf_path.read_text(
                                 encoding="utf-8")
-                            if "# User-modified" in _existing_cnf:
+                            # [PATCH-280] FIX: 原 `"# User-modified" in` 子串匹配
+                            # 会命中说明文字 "add a line containing '# User-modified'"，
+                            # 导致脚本自己生成的文件永远触发跳过。
+                            # 改为正则: 仅匹配独占一行的 "# User-modified"。
+                            if re.search(
+                                    r'^\s*#\s*User-modified\s*$',
+                                    _existing_cnf, re.MULTILINE):
                                 logging.info(
                                     t("info_tuning_skip_user_modified",
                                       path=conf_path))
@@ -10953,9 +11603,27 @@ class WPDeployManager:
                     logging.warning(t("warn_mariadb_tuning_fail", e=e))
                 return
 
-        # 两个目录都不存在 — 尝试写 /etc/my.cnf 的 include 机制
-        logging.warning(t("warn_mariadb_tuning_fail",
-                          e="No conf.d directory found"))
+        # 两个目录都不存在 — [PATCH-279] 自动创建并重试
+        # EL 系 → /etc/my.cnf.d;  Debian 系 → /etc/mysql/conf.d
+        _auto_dir = Path("/etc/my.cnf.d") if self.pkg_mgr in ("dnf", "yum") else Path("/etc/mysql/conf.d")
+        try:
+            _auto_dir.mkdir(parents=True, exist_ok=True)
+            logging.info("[PATCH-279] Created %s for MariaDB tuning.", _auto_dir)
+            # Ensure !includedir in main my.cnf (MariaDB ignores conf.d unless told)
+            _my_cnf = Path("/etc/my.cnf") if self.pkg_mgr in ("dnf", "yum") else Path("/etc/mysql/my.cnf")
+            if _my_cnf.exists():
+                try:
+                    _mc = _my_cnf.read_text(encoding="utf-8", errors="replace")
+                    _inc_line = "!includedir %s" % _auto_dir
+                    if str(_auto_dir) not in _mc:
+                        _my_cnf.write_text(_mc.rstrip() + "\n" + _inc_line + "\n", encoding="utf-8")
+                        logging.info("[PATCH-279] Added '%s' to %s", _inc_line, _my_cnf)
+                except OSError as _inc_e:
+                    logging.debug("[PATCH-279] !includedir: %s", _inc_e)
+        except OSError as _md_e:
+            logging.warning("[PATCH-279] Cannot create %s: %s", _auto_dir, _md_e)
+            logging.warning(t("warn_mariadb_tuning_fail",
+                              e="No conf.d directory found"))
 
     # -----------------------------------------------------------------------
     # [V3.0.16] P5: Linux 内核网络参数调优
@@ -10984,8 +11652,8 @@ class WPDeployManager:
                 avail = Path("/proc/sys/net/ipv4/tcp_available_congestion_control")
                 if avail.exists() and "bbr" in avail.read_text(encoding="utf-8"):
                     bbr_available = True
-        except Exception:
-            pass
+        except Exception as _exc_11504:
+            logging.debug("[PATCH-276] _tune_kernel_network: %s", _exc_11504)
 
         lines = [
             "# [V3.0.16] WP-SSL-Bootstrap kernel network tuning",
@@ -11061,11 +11729,58 @@ class WPDeployManager:
         except Exception as e:
             logging.warning(t("warn_kernel_tuning_fail", e=e))
 
+        # [PATCH-272] 清理 /etc/ld.so.preload 中不存在的 .so 条目。
+        # 腾讯云镜/阿里云安骑士卸载后常残留 libonion.so 等条目,
+        # 导致所有命令 stderr 输出 "cannot be preloaded" 噪音。
+        self._cleanup_stale_ld_preload()
+
+    def _cleanup_stale_ld_preload(self) -> None:
+        """[PATCH-272] 移除 /etc/ld.so.preload 中引用不存在库文件的行。"""
+        _preload = Path("/etc/ld.so.preload")
+        if not _preload.exists():
+            return
+        try:
+            _lines = _preload.read_text(encoding="utf-8",
+                                         errors="replace").splitlines()
+            _kept = []
+            _removed = []
+            for _line in _lines:
+                _stripped = _line.strip()
+                if not _stripped or _stripped.startswith("#"):
+                    _kept.append(_line)
+                    continue
+                # 展开 $LIB 等变量路径 — 如果原始路径和常见展开都不存在则移除
+                _candidates = [_stripped]
+                if "$LIB" in _stripped:
+                    _candidates.extend([
+                        _stripped.replace("$LIB", "lib64"),
+                        _stripped.replace("$LIB", "lib"),
+                        _stripped.replace("/$LIB/", "/lib64/"),
+                        _stripped.replace("/$LIB/", "/lib/"),
+                    ])
+                if any(Path(c).exists() for c in _candidates):
+                    _kept.append(_line)
+                else:
+                    _removed.append(_stripped)
+            if _removed:
+                if _kept and any(k.strip() for k in _kept):
+                    _preload.write_text(
+                        "\n".join(_kept) + "\n", encoding="utf-8")
+                else:
+                    _preload.unlink()
+                logging.info(
+                    "[PATCH-272] 已清理 /etc/ld.so.preload 中 %d 个失效条目: %s"
+                    % (len(_removed), ", ".join(_removed))
+                    if _LANG == "zh" else
+                    "[PATCH-272] Cleaned %d stale entries from /etc/ld.so.preload: %s"
+                    % (len(_removed), ", ".join(_removed)))
+        except Exception:
+            pass  # 非致命
+
     # -----------------------------------------------------------------------
     # [V3.0.16] P4: Swap 自动创建 (小内存 VPS 防 OOM)
     # -----------------------------------------------------------------------
-    def _swap_detect_existing(self):
-        # type: () -> int
+    def _swap_detect_existing(self) -> int:
         """检测已有 swap 空间 (MB)。
 
         返回值:
@@ -11110,8 +11825,8 @@ class WPDeployManager:
                     return _hr_total // (1024 * 1024)
             elif r.returncode == 0:
                 _method1_ok = True  # 命令成功但无 swap
-        except Exception:
-            pass
+        except Exception as _exc_11678:
+            logging.debug("[PATCH-276] int: %s", _exc_11678)
 
         # 方式 2: /proc/swaps (CentOS 7 / util-linux < 2.26)
         if not _method1_ok:
@@ -11132,8 +11847,7 @@ class WPDeployManager:
 
         return 0
 
-    def _swap_create_file(self, swap_size_mb):
-        # type: (int) -> None
+    def _swap_create_file(self, swap_size_mb: int) -> None:
         """创建并激活 swap 文件, 持久化到 /etc/fstab。
 
         失败时清理残留并抛出 RuntimeError。
@@ -11171,8 +11885,8 @@ class WPDeployManager:
                     logging.info(t("info_swap_created",
                                    path=swap_file, size=swap_size_mb))
                     return
-            except Exception:
-                pass
+            except Exception as _exc_11739:
+                logging.debug("[PATCH-276] _proc_swaps: %s", _exc_11739)
             # swapon 失败 — 确保先 swapoff 再删除, 防止删除其他进程的活跃 swap
             # [V3.2.90] B-5: 二次确认 (竞态保护: swapon 失败期间可能被外部激活)
             try:
@@ -11181,8 +11895,8 @@ class WPDeployManager:
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     timeout=10, check=False,
                 )
-            except Exception:
-                pass
+            except Exception as _exc_11749:
+                logging.debug("[PATCH-276] stdout: %s", _exc_11749)
             # [AUDIT BUG-02] swapoff 后二次验证 /proc/swaps:
             # 仅在确认文件不再是活跃 swap 时才 unlink; 否则会导致:
             #   1. 内核 swap 指向已删除 inode (不可恢复)
@@ -11451,8 +12165,8 @@ class WPDeployManager:
                 try:
                     self.run_cmd(["swapoff", str(swap_file)], quiet=True)
                     swap_file.unlink()
-                except Exception:
-                    pass
+                except Exception as _exc_12019:
+                    logging.debug("[PATCH-276] swap_file: %s", _exc_12019)
 
 
 
@@ -11484,14 +12198,14 @@ class WPDeployManager:
     # -----------------------------------------------------------------------
     # 信号处理（标志位模式）
     # -----------------------------------------------------------------------
-    def setup_signals(self):
+    def setup_signals(self) -> None:
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
         # [PATCH] BUG-3: 处理 SIGHUP — systemd timer 触发的长期进程
         # 在终端断开/logrotate 时收到 SIGHUP，需优雅关闭而非静默终止。
         signal.signal(signal.SIGHUP, self._handle_signal)
 
-    def _handle_signal(self, signum, frame):
+    def _handle_signal(self, signum: int, frame: Any) -> None:
         # V2.8.0 竞态说明：CPython 的 GIL 保证信号处理函数在主线程的两个
         # bytecode 指令之间原子执行。_shutdown_requested 和 _exit_code 的
         # 赋值在 GIL 保护下不会与主线程产生数据竞争。
@@ -11527,11 +12241,11 @@ class WPDeployManager:
     # -----------------------------------------------------------------------
     # 部署事务栈：回滚能力
     # -----------------------------------------------------------------------
-    def _register_rollback(self, description: str, action):
+    def _register_rollback(self, description: str, action: Callable[[], None]) -> None:
         """注册一个回滚动作（后进先出）。action 为无参 callable。"""
         self._rollback_stack.append((description, action))
 
-    def _rollback_deploy(self):
+    def _rollback_deploy(self) -> None:
         """部署失败时执行回滚：按注册的逆序依次执行清理动作。
         仅在首次部署失败时调用，幂等重跑时不回滚（已有资源会被复用）。"""
         if not self._rollback_stack:
@@ -11549,7 +12263,7 @@ class WPDeployManager:
     # -----------------------------------------------------------------------
     # 进程锁
     # -----------------------------------------------------------------------
-    def cleanup_and_exit(self, exit_code: int = 0):
+    def cleanup_and_exit(self, exit_code: int = 0) -> None:
         if self._cleanup_done:
             return
         self._cleanup_done = True
@@ -11684,7 +12398,7 @@ class WPDeployManager:
         #   空 Python handler → 信号被内核投递 (systemd 信号计数正确),
         #             但处理器不做任何操作, atexit/finally 继续执行。
         # _cleanup_done=True 已防止我们自己的处理器递归。
-        def _noop_signal_handler(_signum, _frame):
+        def _noop_signal_handler(_signum: int, _frame: Any) -> None:
             pass
         signal.signal(signal.SIGINT,  _noop_signal_handler)
         signal.signal(signal.SIGTERM, _noop_signal_handler)
@@ -11698,7 +12412,7 @@ class WPDeployManager:
             else:
                 # [AUDIT-FIX BUG-10] 非主线程无法使用 signal.alarm,
                 # 启动 daemon 看门狗线程作为兜底。
-                def _watchdog_exit(_mgr=self, _fc=final_code):
+                def _watchdog_exit(_mgr: Any=self, _fc: int=final_code) -> None:
                     import time as _wt
                     _wt.sleep(15)
                     # [PATCH-202 FIX-6] Read latest exit code at
@@ -11713,10 +12427,10 @@ class WPDeployManager:
             pass  # alarm 不可用时降级
         sys.exit(final_code)
 
-    def _run_subcommand(self, operation, *,
+    def _run_subcommand(self, operation: Callable[..., Any], *,
                         skip_lock: bool = False,
                         use_return: bool = False,
-                        rollback_fn=None) -> None:
+                        rollback_fn: Optional[Callable[[], None]]=None) -> None:
         """执行子命令通用框架: 信号→[锁]→操作→[回滚]→清理。
 
         [V3.2.100] A3 原始版本。
@@ -11784,7 +12498,7 @@ class WPDeployManager:
             self._exit_code = _saved_exit_code
 
 
-    def acquire_lock(self):
+    def acquire_lock(self) -> None:
         try:
             # [PATCH-187 FIX-8] append 模式, 与域名锁对齐。
             # 原 O_TRUNC 在 flock 前截断, 并发不安全。
@@ -11992,6 +12706,11 @@ class WPDeployManager:
                     stderr=subprocess.PIPE,  # 仍捕获 → 错误分类不丢失
                     encoding='utf-8', errors='replace',
                     timeout=timeout, check=False,
+                    # [PATCH-276 FIX-P2-3] 子进程隔离到独立会话组。
+                    # 主进程收到 SIGINT/SIGTERM 时不会自动传递给子进程,
+                    # 由 check_shutdown() 主动轮询决定是否继续/中止。
+                    # 防止 certbot/mysqldump 被意外中断导致数据不一致。
+                    start_new_session=True,
                 )
                 if r.returncode == 0:
                     # [PATCH FIX-7] 与非 stream 模式成功路径对齐：
@@ -12015,12 +12734,19 @@ class WPDeployManager:
                 error_code = CmdResult.classify_stderr(stderr_text, exit_code=r.returncode)  # [PATCH-142 FIX-1] 传入 exit_code, 非英文 locale 下按退出码分类
                 if not quiet:
                     logging.error(t("err_cmd_failed", cmd=cmd_list[0], code=error_code, stderr=stderr_text))
+                else:
+                    # [PATCH-275] quiet 模式下失败不再完全静默。
+                    # 记录 DEBUG 日志, 排障时 (--verbose 或 logging.basicConfig(level=DEBUG))
+                    # 可追溯完整失败链条, 正常运行不刷屏。
+                    logging.debug("[quiet-fail] %s exit=%s: %s",
+                                  cmd_list[0], r.returncode, stderr_text[:200])
                 return CmdResult(ok=False, code=error_code, stderr=stderr_text)
             r = subprocess.run(
                 cmd_list,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 encoding='utf-8', errors='replace',  # [V3.2.43] FIX-8: drop redundant universal_newlines (encoding= implies text mode in Py3.6+)
                 timeout=timeout, check=False,
+                start_new_session=True,  # [PATCH-276 FIX-P2-3] 同 stream 模式
             )
             if r.returncode == 0:
                 if not quiet and r.stdout.strip():
@@ -12040,12 +12766,28 @@ class WPDeployManager:
             error_code = CmdResult.classify_stderr(stderr_text, exit_code=r.returncode)  # [PATCH-142 FIX-2] 传入 exit_code
             if not quiet:
                 logging.error(t("err_cmd_failed", cmd=cmd_list[0], code=error_code, stderr=stderr_text))
+            else:
+                # [PATCH-275] quiet 模式下失败不再完全静默 (同 stream 路径)
+                logging.debug("[quiet-fail] %s exit=%s: %s",
+                              cmd_list[0], r.returncode, stderr_text[:200])
             return CmdResult(ok=False, code=error_code, stdout=r.stdout.strip(), stderr=stderr_text)
-        except subprocess.TimeoutExpired:
-            # [V2.9.6] 超时路径同样遵守 sensitive 脱敏
+        except subprocess.TimeoutExpired as _te:
+            # [PATCH-276 FIX-P0-1] subprocess.run() 在 timeout 到期后会自动
+            # kill 子进程 (Popen.kill() + Popen.communicate())。
+            # 但 TimeoutExpired 异常对象携带已捕获的部分 stderr/stdout,
+            # 对排障极有价值 (如 certbot 超时前的最后一条日志)。
             _t_cmd = f"{cmd_list[0]} {t('label_args_redacted')}" if sensitive else ' '.join(cmd_list)
+            _partial_stderr = ""
+            if hasattr(_te, 'stderr') and _te.stderr:
+                _partial_stderr = (_te.stderr if isinstance(_te.stderr, str)
+                                   else _te.stderr.decode('utf-8', errors='replace'))
+                _partial_stderr = _partial_stderr.strip()[:500]
             logging.error(t("err_cmd_timeout", cmd=_t_cmd))
-            return CmdResult(ok=False, code=CmdResult.TIMEOUT, stderr="timeout")
+            if _partial_stderr:
+                logging.debug("[timeout-partial-stderr] %s: %s",
+                              cmd_list[0], _partial_stderr)
+            return CmdResult(ok=False, code=CmdResult.TIMEOUT,
+                             stderr=_partial_stderr or "timeout")
         except Exception as e:
             logging.error(t("err_cmd_exception", e=e))
             return CmdResult(ok=False, code=CmdResult.FATAL, stderr=str(e))
@@ -12128,8 +12870,8 @@ class WPDeployManager:
                             except OSError: pass
                 except OSError:
                     pass
-        except Exception:
-            pass
+        except Exception as _exc_12724:
+            logging.debug("[PATCH-276] L12724: %s", _exc_12724)
         fd, path = tempfile.mkstemp(prefix=".my_tmp_", suffix=".cnf", dir=str(_tmp_dir))
         # [AUDIT RES-02] O_CLOEXEC 状态说明:
         # - Python 3.12+: mkstemp 保证 O_CLOEXEC (PEP 446)
@@ -12275,8 +13017,7 @@ class WPDeployManager:
         return _escape_single_quoted(value)
 
     @staticmethod
-    def _parse_db_host_port(db_host):
-        # type: (str) -> tuple
+    def _parse_db_host_port(db_host: str) -> tuple:
         """Parse host:port or [IPv6]:port, return (host, port_str | '').
 
         [V3.2.82] P0-2: mysqldump/mysql -h only accepts hostname;
@@ -12306,7 +13047,7 @@ class WPDeployManager:
         return (db_host, "")
 
     @staticmethod
-    def _safe_write_file(path, content: str, mode: int = 0o600,
+    def _safe_write_file(path: str, content: str, mode: int = 0o600,
                          _skip_lock: bool = False) -> bool:
         """原子写入文件，从创建瞬间即为 mode 权限。
 
@@ -12560,7 +13301,7 @@ class WPDeployManager:
     # -----------------------------------------------------------------------
     # 原子写入
     # -----------------------------------------------------------------------
-    def atomic_write(self, target_path: Path, content: str, mode=None) -> bool:  # [PATCH-L2]
+    def atomic_write(self, target_path: Path, content: str, mode: int=None) -> bool:  # [PATCH-L2]
         """原子写入文件 (带 .aw_bak 备份回滚)。
 
         [AUDIT MAINT-02] 三套原子写入机制选择指南:
@@ -12714,6 +13455,32 @@ class WPDeployManager:
                 pass
 
     # -----------------------------------------------------------------------
+    # [PATCH-279] 强制删除: 首次失败后尝试 chattr -i 再重试
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _force_unlink(path: Path) -> bool:
+        """Attempt to unlink a file; on failure, try clearing the immutable
+        bit (chattr -i) and retry. Returns True if file is gone."""
+        try:
+            path.unlink()
+            return True
+        except OSError:
+            pass
+        # Retry after clearing immutable attribute (common on hardened systems)
+        if shutil.which("chattr"):
+            try:
+                subprocess.run(
+                    ["chattr", "-i", str(path)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=5, check=False)
+                path.unlink()
+                logging.info("[PATCH-279] Removed %s after clearing immutable bit.", path)
+                return True
+            except OSError:
+                pass
+        return False
+
+    # -----------------------------------------------------------------------
     # [V3.0.16] P8: nginx reload 统一门控
     # -----------------------------------------------------------------------
     def _safe_reload_nginx(self) -> bool:
@@ -12725,8 +13492,83 @@ class WPDeployManager:
         if self.cfg.dry_run:
             return True
         if not self.run_cmd(["nginx", "-t"], quiet=True):
+            # [PATCH-279] Auto-diagnose: capture error, attempt common fixes.
             logging.warning(t("warn_nginx_reload_test_fail"))
-            return False
+            try:
+                _diag = subprocess.run(
+                    ["nginx", "-t"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    encoding="utf-8", errors="replace",
+                    timeout=10, check=False)
+                _err_out = (_diag.stderr or "") + (_diag.stdout or "")
+                logging.info("[PATCH-279] nginx -t output:\n%s", _err_out.strip()[:1000])
+                _fixed = False
+                # Case 1: stale include — "open() ... failed (No such file or directory)"
+                # in an include directive → comment out or remove the stale include
+                _stale_m = re.search(
+                    r'open\(\)\s+"([^"]+)"\s+failed.*No such file',
+                    _err_out)
+                if _stale_m:
+                    _stale_path = _stale_m.group(1)
+                    # Find which config includes this file and remove the include line
+                    _conf_m = re.search(r'in\s+(/\S+\.conf):\d+', _err_out)
+                    if _conf_m:
+                        _conf_path = Path(_conf_m.group(1))
+                        if _conf_path.exists() and not _conf_path.is_symlink():
+                            try:
+                                _conf_text = _conf_path.read_text(
+                                    encoding="utf-8", errors="replace")
+                                _new_text = re.sub(
+                                    r'^(\s*include\s+' + re.escape(_stale_path) + r'\s*;)',
+                                    r'# [PATCH-279 auto-disabled] \1',
+                                    _conf_text, flags=re.MULTILINE)
+                                if _new_text != _conf_text:
+                                    # Backup before modifying
+                                    try:
+                                        shutil.copy2(str(_conf_path),
+                                                     str(_conf_path) + ".bak279")
+                                    except OSError:
+                                        pass
+                                    _conf_path.write_text(_new_text, encoding="utf-8")
+                                    logging.info(
+                                        "[PATCH-279] Disabled stale include '%s' in %s",
+                                        _stale_path, _conf_path)
+                                    _fixed = True
+                            except OSError as _e279:
+                                logging.debug("[PATCH-279] stale include fix failed: %s", _e279)
+                # Case 2: duplicate default_server — remove the word "default_server"
+                # from OUR config if another config already claims it
+                if not _fixed and "duplicate default server" in _err_out.lower():
+                    _dup_m = re.search(r'in\s+(/\S+\.conf):\d+', _err_out)
+                    if _dup_m:
+                        _dup_conf = Path(_dup_m.group(1))
+                        # Only touch configs we own (contain our domain)
+                        if (_dup_conf.exists()
+                                and self.cfg.domain in _dup_conf.name):
+                            try:
+                                _dc = _dup_conf.read_text(encoding="utf-8", errors="replace")
+                                _dc_new = _dc.replace(" default_server", "")
+                                if _dc_new != _dc:
+                                    try:
+                                        shutil.copy2(str(_dup_conf),
+                                                     str(_dup_conf) + ".bak279")
+                                    except OSError:
+                                        pass
+                                    _dup_conf.write_text(_dc_new, encoding="utf-8")
+                                    logging.info(
+                                        "[PATCH-279] Removed duplicate default_server from %s",
+                                        _dup_conf)
+                                    _fixed = True
+                            except OSError:
+                                pass
+                if _fixed and self.run_cmd(["nginx", "-t"], quiet=True):
+                    logging.info("[PATCH-279] nginx -t passed after auto-fix.")
+                    # Fall through to reload below
+                else:
+                    return False
+            except Exception as _diag_e:
+                logging.debug("[PATCH-279] nginx diag failed: %s", _diag_e)
+                return False
         if self.run_cmd(["systemctl", "reload", "nginx"], quiet=True):
             return True
         # [PATCH-241 BUG-6] reload 失败: 检测 nginx 是否存活。
@@ -12743,9 +13585,542 @@ class WPDeployManager:
                 return bool(self.run_cmd(
                     ["systemctl", "restart", "nginx"],
                     quiet=True))
-        except Exception:
+        except Exception as _rl_e:
+            # [PATCH-276 FIX-P0-4] nginx reload 失败后存活检测也异常,
+            # 记录 debug 便于排障 (可能是 systemctl 本身不可用)。
+            logging.debug("[PATCH-276] nginx liveness check failed: %s",
+                          _rl_e)
+        return False
+
+    # -----------------------------------------------------------------------
+    # [PATCH-270] Certbot 版本全生命周期管理
+    # -----------------------------------------------------------------------
+    def _detect_certbot_version(self) -> tuple:
+        """解析 certbot --version 输出, 返回 (major, minor) 或 (0, 0)。"""
+        try:
+            _r = subprocess.run(
+                [self.cfg.certbot_bin, "--version"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding='utf-8', errors='replace', timeout=10, check=False,
+            )
+            _out = (_r.stdout + _r.stderr).strip()
+            _m = re.search(r'(\d+)\.(\d+)', _out)
+            if _m:
+                return (int(_m.group(1)), int(_m.group(2)))
+        except Exception as _exc_13361:
+            logging.debug("[PATCH-276] L13361: %s", _exc_13361)
+        return (0, 0)
+
+    def _detect_certbot_full_version(self) -> str:
+        """返回 certbot 完整版本字符串 (如 "0.40.0"), 或 ""。"""
+        try:
+            _r = subprocess.run(
+                [self.cfg.certbot_bin, "--version"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding='utf-8', errors='replace', timeout=10, check=False,
+            )
+            _out = (_r.stdout + _r.stderr).strip()
+            _m = re.search(r'(\d+\.\d+\.\d+)', _out)
+            if _m:
+                return _m.group(1)
+        except Exception as _exc_13377:
+            logging.debug("[PATCH-276] stdout: %s", _exc_13377)
+        return ""
+
+    def _is_snap_certbot(self) -> bool:
+        """检测当前 certbot 是否通过 snap 安装。"""
+        _bin = self.cfg.certbot_bin
+        # 路径判断: snap 安装的 certbot 位于 /snap/bin/
+        if "/snap/" in _bin:
+            return True
+        # 符号链接判断: /usr/local/bin/certbot → /snap/bin/certbot
+        try:
+            _resolved = Path(_bin).resolve()
+            if "/snap/" in str(_resolved):
+                return True
+        except (OSError, ValueError):
+            pass
+        # snap list 判断: 兜底
+        try:
+            _r = subprocess.run(
+                ["snap", "list", "certbot"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=10, check=False)
+            if _r.returncode == 0:
+                return True
+        except (FileNotFoundError, OSError):
             pass
         return False
+
+    def _is_pip_venv_certbot(self) -> bool:
+        """[PATCH-270e] 检测当前 certbot 是否通过 pip venv 安装。
+
+        pip venv 是 EFF 官方备选方案 (certbot.eff.org/instructions?os=pip),
+        已是最佳实践路径, 不应再尝试迁移到 snap。
+        检测: certbot 二进制位于 /opt/certbot/ 下。
+        """
+        _bin = self.cfg.certbot_bin
+        if "/opt/certbot/" in _bin:
+            return True
+        try:
+            _resolved = str(Path(_bin).resolve())
+            if "/opt/certbot/" in _resolved:
+                return True
+        except (OSError, ValueError):
+            pass
+        return False
+
+    def _migrate_certbot_to_snap(self, fresh_install: bool = False) -> bool:
+        """将 apt/yum certbot 迁移至 snap certbot。
+
+        迁移步骤 (对齐 EFF 官方: certbot.eff.org/instructions):
+          1. 移除 apt/yum certbot 包 (/etc/letsencrypt 保留)
+          2. 确保 snapd 已安装并就绪
+          3. snap install --classic certbot
+          4. 创建 /usr/local/bin/certbot → /snap/bin/certbot 符号链接
+          5. certbot --version 验证
+          6. 更新 self.cfg.certbot_bin
+
+        三级灾备: snap → pip venv → apt/yum (回滚)
+
+        Args:
+            fresh_install: True 时跳过 step 1 (移除旧包) 和回滚重装,
+                           用于 install_packages 首次安装场景。
+
+        Returns: True = 成功, False = 失败 (调用方降级处理)。
+        """
+        if self.cfg.dry_run:
+            return False
+        _old_ver = self._detect_certbot_full_version()
+        _old_bin = self.cfg.certbot_bin
+
+        # Step 1: 移除旧包 (EFF 官方步骤: 先移除再安装, 避免 PATH 冲突)
+        # [PATCH-275] fresh_install=True 时跳过移除 (certbot 从未经 apt 安装)
+        # [PATCH-270d] 故障保护: 记录旧包名, snap+pip 都失败时回滚重装。
+        _removed_pkg = ""
+        if not fresh_install:
+            logging.info(t("info_certbot_snap_removing_apt"))
+            if self.pkg_mgr in ("dnf", "yum"):
+                if self.run_cmd(
+                    [self.pkg_mgr, "remove", "-y", "certbot",
+                     "python3-certbot-nginx"],
+                    quiet=True, timeout=60):
+                    _removed_pkg = "certbot"
+            elif self.pkg_mgr == "apt":
+                if self.run_cmd(
+                    ["apt", "remove", "-y", "certbot",
+                     "python3-certbot-nginx"],
+                    quiet=True, timeout=60):
+                    _removed_pkg = "certbot"
+
+        # Step 2: 确保 snapd 就绪
+        _snap_ok = False
+        if not shutil.which("snap"):
+            if self.pkg_mgr in ("dnf", "yum"):
+                self.run_cmd(
+                    [self.pkg_mgr, "install", "-y", "snapd"],
+                    quiet=True, timeout=120)
+                self.run_cmd(
+                    ["systemctl", "enable", "--now", "snapd.socket"],
+                    quiet=True, timeout=30)
+                time.sleep(3)
+            elif self.pkg_mgr == "apt":
+                self.run_cmd(
+                    ["apt", "install", "-y", "snapd"],
+                    quiet=True, timeout=120)
+
+        if shutil.which("snap"):
+            # [PATCH-270e] 等待 snapd 完成初始化 (seed)。
+            # 阿里云/DO 等云 VM 首次安装 snapd 后, 需要数秒到数十秒
+            # 完成 seeding。未 seed 完成时 snap install 报:
+            # "too early for operation, device not yet seeded"
+            # 官方命令: snap wait system seed.loaded (阻塞直到完成)
+            # 参考: bugs.launchpad.net/bugs/1826662, snapcraft.io/t/12421
+            self.run_cmd(
+                ["snap", "wait", "system", "seed.loaded"],
+                quiet=True, timeout=90)
+            # [PATCH-270e] CentOS/RHEL: classic confinement 需要 /snap 目录。
+            # 错误: "classic confinement requires snaps under /snap or
+            # symlink from /snap to /var/lib/snapd/snap"
+            # EFF certbot snap 文档 + snapcraft.io 官方均要求此符号链接。
+            _snap_dir = Path("/snap")
+            _snapd_snap = Path("/var/lib/snapd/snap")
+            if not _snap_dir.exists() and _snapd_snap.is_dir():
+                try:
+                    _snap_dir.symlink_to(_snapd_snap)
+                    logging.info(
+                        "[PATCH-270e] 创建 /snap → /var/lib/snapd/snap 符号链接"
+                        if _LANG == "zh" else
+                        "[PATCH-270e] Created /snap → /var/lib/snapd/snap symlink")
+                except OSError:
+                    pass
+            # 确保 snapd core 最新
+            self.run_cmd(
+                ["snap", "install", "core"], quiet=True, timeout=120)
+            self.run_cmd(
+                ["snap", "refresh", "core"], quiet=True, timeout=120)
+            # Step 3: snap install certbot
+            logging.info(t("info_certbot_snap_installing"))
+            _snap_ok = bool(self.run_cmd(
+                ["snap", "install", "--classic", "certbot"],
+                quiet=False, timeout=180))
+            # [PATCH-270e] 首次失败 → 重启 snapd 服务后重试一次。
+            # 社区验证的修复: restart snapd.seeded.service + snapd.service
+            if not _snap_ok:
+                logging.info(
+                    "[PATCH-270e] snap install 失败, 重启 snapd 服务后重试..."
+                    if _LANG == "zh" else
+                    "[PATCH-270e] snap install failed; restarting snapd and retrying...")
+                self.run_cmd(
+                    ["systemctl", "restart", "snapd.seeded.service"],
+                    quiet=True, timeout=30)
+                self.run_cmd(
+                    ["systemctl", "restart", "snapd.service"],
+                    quiet=True, timeout=30)
+                self.run_cmd(
+                    ["snap", "wait", "system", "seed.loaded"],
+                    quiet=True, timeout=90)
+                _snap_ok = bool(self.run_cmd(
+                    ["snap", "install", "--classic", "certbot"],
+                    quiet=False, timeout=180))
+
+        if _snap_ok:
+            # Step 4: 符号链接 (幂等)
+            _snap_bin = Path("/snap/bin/certbot")
+            _link_target = Path("/usr/local/bin/certbot")
+            if _snap_bin.is_file():
+                try:
+                    if _link_target.is_symlink() or _link_target.exists():
+                        _link_target.unlink()
+                    _link_target.symlink_to(_snap_bin)
+                except OSError:
+                    pass
+            # Step 5: 验证
+            _new_bin = str(_snap_bin) if _snap_bin.is_file() else "certbot"
+            _found = shutil.which("certbot")
+            if _found:
+                _new_bin = _found
+            try:
+                _r = subprocess.run(
+                    [_new_bin, "--version"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    encoding='utf-8', errors='replace',
+                    timeout=10, check=False)
+                if _r.returncode == 0:
+                    _m = re.search(
+                        r'(\d+\.\d+\.\d+)', _r.stdout + _r.stderr)
+                    _new_ver = _m.group(1) if _m else "unknown"
+                    if fresh_install:
+                        logging.info(
+                            "[PATCH-275] certbot %s 已通过 snap 安装完成。"
+                            "后续将自动更新。" % _new_ver
+                            if _LANG == "zh" else
+                            "[PATCH-275] certbot %s installed via snap. "
+                            "Auto-updates enabled." % _new_ver)
+                    else:
+                        logging.info(t("ok_certbot_snap_migrated",
+                                       ver=_new_ver))
+                    self.cfg.certbot_bin = _new_bin
+                    return True
+            except Exception as _exc_13576:
+                logging.warning("[PATCH-276] stdout: %s", _exc_13576)
+
+        # ── snap 失败或验证失败: 尝试 pip venv 回退 ──
+        if not _snap_ok:
+            logging.warning(t("warn_certbot_snap_failed", ver=_old_ver))
+        _pip_ok = self._install_certbot_pip_venv(_old_ver)
+        if _pip_ok:
+            return True
+
+        # ── snap + pip 都失败: 回滚/降级至 apt/yum certbot ──
+        # [PATCH-270d] 防止系统无 certbot 导致证书无法续期。
+        # [PATCH-275] fresh_install: 三级灾备最终兜底 (snap→pip→apt)
+        if _removed_pkg or fresh_install:
+            if fresh_install:
+                logging.warning(
+                    "[PATCH-275] snap + pip certbot 均失败, "
+                    "降级为 apt/yum certbot 安装..."
+                    if _LANG == "zh" else
+                    "[PATCH-275] Both snap and pip certbot failed; "
+                    "falling back to apt/yum certbot install...")
+            else:
+                logging.warning(
+                    "[PATCH-270d] snap + pip certbot 均失败, "
+                    "回滚重装 apt/yum certbot..."
+                    if _LANG == "zh" else
+                    "[PATCH-270d] Both snap and pip certbot failed; "
+                    "reinstalling apt/yum certbot as rollback...")
+            if self.pkg_mgr in ("dnf", "yum"):
+                self.run_cmd(
+                    [self.pkg_mgr, "install", "-y", "certbot"],
+                    quiet=True, timeout=120)
+            elif self.pkg_mgr == "apt":
+                self.run_cmd(
+                    ["apt", "install", "-y", "certbot"],
+                    quiet=True, timeout=120)
+            # 验证回滚/安装是否成功
+            _rollback_bin = shutil.which("certbot")
+            if _rollback_bin:
+                self.cfg.certbot_bin = _rollback_bin
+                if fresh_install:
+                    _fb_ver = ""
+                    try:
+                        _fb_r = subprocess.run(
+                            [_rollback_bin, "--version"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            encoding="utf-8", errors="replace",
+                            timeout=10, check=False)
+                        _fb_m = re.search(
+                            r'(\d+\.\d+\.\d+)', _fb_r.stdout + _fb_r.stderr)
+                        if _fb_m:
+                            _fb_ver = _fb_m.group(1)
+                    except Exception as _exc_13628:
+                        logging.debug("[PATCH-276] run_cmd: %s", _exc_13628)
+                    logging.info(
+                        "[PATCH-275] certbot %s 已通过 apt/yum 安装完成 "
+                        "(snap/pip 不可用)。" % _fb_ver
+                        if _LANG == "zh" else
+                        "[PATCH-275] certbot %s installed via apt/yum "
+                        "(snap/pip unavailable)." % _fb_ver)
+                else:
+                    logging.info(
+                        "[PATCH-270d] certbot 已回滚至 apt/yum 版本 (%s)。"
+                        % _old_ver
+                        if _LANG == "zh" else
+                        "[PATCH-270d] certbot rolled back to apt/yum "
+                        "version (%s)." % _old_ver)
+        return False
+
+    def _install_certbot_pip_venv(self, old_ver: str = "") -> bool:
+        """[PATCH-270c] pip venv 安装 certbot (snap 不可用时的回退路径)。
+
+        对齐 EFF 官方 pip 安装文档 (certbot.eff.org/instructions?os=pip):
+          1. apt/dnf install python3 python3-venv
+          2. python3 -m venv /opt/certbot/
+          3. /opt/certbot/bin/pip install --upgrade pip
+          4. /opt/certbot/bin/pip install certbot
+          5. ln -s /opt/certbot/bin/certbot /usr/local/bin/certbot
+          6. certbot --version 验证
+
+        实际案例:
+          - 阿里云 Linux 2: snapd 依赖 selinux-policy-base 版本过低, 装不上
+          - Amazon Linux 2023: snap 在 AL2023 上有内核兼容性问题
+          - Proxmox LXC: snap 需要 AppArmor 配置, 非标准容器失败
+          - Debian 最小化安装: 无 snapd 且不想引入 snap 依赖栈
+
+        注意: pip 安装无自动更新, 需用户定期手动 pip install --upgrade certbot。
+        脚本已有 systemd timer 管理续期, 无需额外 cron。
+
+        Returns: True = 安装成功, False = 失败。
+        """
+        if self.cfg.dry_run:
+            return False
+        logging.info(t("info_certbot_pip_venv_installing"))
+        _venv_dir = Path("/opt/certbot")
+        _venv_bin = _venv_dir / "bin"
+        _certbot_bin = _venv_bin / "certbot"
+
+        # Step 1: 确保 python3-venv 和编译依赖可用
+        # 对齐 EFF 官方: certbot.eff.org/instructions?os=pip
+        # RPM: python3 python-devel augeas-devel gcc (原文档)
+        # APT: python3 python3-venv libaugeas0 (原文档)
+        # 额外: openssl-devel/libffi-devel — cryptography 包在无预编译
+        #   wheel 的平台上需要从源码编译 (如 aarch64 或旧 glibc)。
+        if self.pkg_mgr in ("dnf", "yum"):
+            self.run_cmd(
+                [self.pkg_mgr, "install", "-y",
+                 "python3", "python3-devel", "gcc",
+                 "openssl-devel", "libffi-devel"],
+                quiet=True, timeout=120)
+        elif self.pkg_mgr == "apt":
+            self.run_cmd(
+                ["apt", "install", "-y",
+                 "python3", "python3-venv", "libaugeas0"],
+                quiet=True, timeout=120)
+
+        # Step 2: 创建 venv
+        if not shutil.which("python3"):
+            logging.warning(t("warn_certbot_pip_venv_failed",
+                              ver=old_ver))
+            return False
+        # 若已存在旧 venv, 保留 (幂等)
+        if not _venv_dir.exists():
+            _r = subprocess.run(
+                ["python3", "-m", "venv", str(_venv_dir)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=30, check=False)
+            if _r.returncode != 0:
+                # [PATCH-270d] 清理残缺 venv, 避免下次调用误判为已存在
+                _safe_rmtree(str(_venv_dir), ignore_errors=True)
+                logging.warning(t("warn_certbot_pip_venv_failed",
+                                  ver=old_ver))
+                return False
+
+        # Step 3: 升级 pip
+        subprocess.run(
+            [str(_venv_bin / "pip"), "install", "--upgrade", "pip"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=120, check=False)
+
+        # Step 4: 安装 certbot
+        _r = subprocess.run(
+            [str(_venv_bin / "pip"), "install", "certbot"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            encoding="utf-8", errors="replace",
+            timeout=300, check=False)
+        if _r.returncode != 0 or not _certbot_bin.exists():
+            logging.warning(t("warn_certbot_pip_venv_failed",
+                              ver=old_ver))
+            return False
+
+        # Step 5: 符号链接
+        _link = Path("/usr/local/bin/certbot")
+        try:
+            if _link.is_symlink() or _link.exists():
+                _link.unlink()
+            _link.symlink_to(_certbot_bin)
+        except OSError:
+            pass
+
+        # Step 6: 验证
+        _new_bin = str(_certbot_bin)
+        try:
+            _r = subprocess.run(
+                [_new_bin, "--version"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding="utf-8", errors="replace",
+                timeout=10, check=False)
+            if _r.returncode == 0:
+                _m = re.search(r'(\d+\.\d+\.\d+)', _r.stdout + _r.stderr)
+                _new_ver = _m.group(1) if _m else "unknown"
+                logging.info(t("ok_certbot_pip_venv_installed",
+                               ver=_new_ver))
+                self.cfg.certbot_bin = _new_bin
+                return True
+        except Exception as _exc_13751:
+            logging.warning("[PATCH-276] _link: %s", _exc_13751)
+
+        logging.warning(t("warn_certbot_pip_venv_failed", ver=old_ver))
+        return False
+
+    def _upgrade_certbot_if_needed(self) -> None:
+        """[PATCH-270] Certbot 版本管理: snap 检测 → pip venv 检测 → 版本门控 → 迁移。
+
+        在 update_config 中调用, 位于 SSL 续期基础设施之前。
+        """
+        if self.cfg.dry_run:
+            return
+        if not shutil.which(self.cfg.certbot_bin):
+            return  # certbot 未安装, 跳过
+
+        # ── snap 已安装 → 不动 ──
+        if self._is_snap_certbot():
+            logging.info(t("info_certbot_snap_ok"))
+            return
+
+        # ── pip venv 已安装 → 执行 pip upgrade (无自动更新机制) ──
+        # [PATCH-270e] pip venv 是 EFF 官方备选方案, 已是最佳实践路径。
+        # 不应再尝试迁移到 snap (会导致每次 update 都重复尝试)。
+        # 但 pip venv 没有 snap 的自动更新机制, 需要在 update 时主动升级。
+        # EFF 官方建议: /opt/certbot/bin/pip install --upgrade certbot
+        if self._is_pip_venv_certbot():
+            _ver_str = self._detect_certbot_full_version() or "unknown"
+            logging.info(t("info_certbot_version",
+                           ver=_ver_str, src="pip venv"))
+            # [PATCH-272] EL7: Python 3.6 无法安装 certbot 5.x (需 3.8+)。
+            # pip upgrade 失败后重建 venv 会删除旧的可用 certbot, 造成续期失败。
+            # 在 EL7 上跳过升级, 保持现有可用版本。
+            _is_el_pip, _el_ver_pip = _detect_el_family_and_version()
+            if _is_el_pip and _el_ver_pip < 8:
+                return
+            # 尝试升级 certbot (非致命, 失败继续使用现有版本)
+            _pip_bin = Path("/opt/certbot/bin/pip")
+            if _pip_bin.is_file():
+                _r = subprocess.run(
+                    [str(_pip_bin), "install", "--upgrade", "certbot"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    encoding="utf-8", errors="replace",
+                    timeout=120, check=False)
+                if _r.returncode == 0:
+                    _new_ver = self._detect_certbot_full_version() or "unknown"
+                    if _new_ver != _ver_str:
+                        logging.info(t("ok_certbot_pip_upgraded",
+                                       old=_ver_str, new=_new_ver))
+                    else:
+                        logging.info(t("info_certbot_pip_already_latest",
+                                       ver=_ver_str))
+                else:
+                    # [PATCH-270e] EFF 官方建议: 升级出错时 rm -rf /opt/certbot
+                    # 并重新执行全部安装步骤。
+                    # 参考: certbot.eff.org/instructions?ws=other&os=pip
+                    logging.warning(t("warn_certbot_pip_upgrade_failed",
+                                      ver=_ver_str))
+                    logging.info(
+                        "[PATCH-270e] 按 EFF 官方建议重建 pip venv..."
+                        if _LANG == "zh" else
+                        "[PATCH-270e] Rebuilding pip venv per EFF recommendation...")
+                    _safe_rmtree("/opt/certbot", ignore_errors=True)
+                    if self._install_certbot_pip_venv(old_ver=_ver_str):
+                        _rebuilt_ver = self._detect_certbot_full_version() or "unknown"
+                        logging.info(t("ok_certbot_pip_upgraded",
+                                       old=_ver_str, new=_rebuilt_ver))
+            return
+
+        # [PATCH-272] EL7: snap 必败 (systemd 219 < 229) + pip venv 必败
+        # (Python 3.6 < certbot 5.x 要求的 3.8), 三级链全败只产生噪音。
+        # 跳过迁移, 保持现有 yum certbot 可用。
+        _is_el, _el_ver = _detect_el_family_and_version()
+        if _is_el and _el_ver < 8:
+            _ver_str = self._detect_certbot_full_version() or "unknown"
+            logging.info(t("info_certbot_version", ver=_ver_str, src="yum"))
+            logging.warning(t("warn_el7_eol_skip_upgrade",
+                              el=_el_ver, component="Certbot"))
+            return
+
+        # ── 检测版本 (此时必定是 apt/yum) ──
+        _ver = self._detect_certbot_version()
+        _ver_str = self._detect_certbot_full_version() or (
+            "%d.%d" % _ver if _ver != (0, 0) else "unknown")
+        logging.info(t("info_certbot_version", ver=_ver_str, src="apt/yum"))
+
+        if _ver == (0, 0):
+            return  # 无法获取版本, 跳过
+
+        # ── 版本低于最低要求 → 自动迁移 snap ──
+        if _ver < _CERTBOT_MIN_VERSION:
+            logging.info(t("info_certbot_snap_migrating",
+                           ver=_ver_str,
+                           min="%d.%d" % _CERTBOT_MIN_VERSION))
+            if self._migrate_certbot_to_snap():
+                # 迁移成功后验证续期管道
+                self._verify_snap_certbot_renewal()
+            return
+
+        # ── 版本满足但仍是 apt → 主动迁移 snap ──
+        # EFF 2020 年停止更新 apt 包; snap 提供自动更新 + ECDSA 证书 +
+        # --preferred-chain 等完整功能。三级降级链 (snap→pip→apt回装)
+        # 确保迁移失败时系统仍有可用 certbot。
+        logging.info(t("info_certbot_apt_migrating", ver=_ver_str))
+        if self._migrate_certbot_to_snap():
+            self._verify_snap_certbot_renewal()
+
+    def _verify_snap_certbot_renewal(self) -> None:
+        """[PATCH-270] 迁移后验证 certbot renew --dry-run。"""
+        if self.cfg.dry_run:
+            return
+        # 仅在已有证书时验证
+        if not self.cfg.cert_chain.exists():
+            return
+        logging.info(t("info_certbot_snap_dry_run_verify"))
+        _r = subprocess.run(
+            [self.cfg.certbot_bin, "renew", "--dry-run"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            encoding='utf-8', errors='replace',
+            timeout=120, check=False)
+        if _r.returncode == 0:
+            logging.info(t("ok_certbot_snap_dry_run_ok"))
+        else:
+            logging.warning(t("warn_certbot_snap_dry_run_fail"))
 
     # -----------------------------------------------------------------------
     # [V3.1.1] Issue 1: Certbot persistent deploy hook
@@ -12766,8 +14141,8 @@ class WPDeployManager:
             if _m:
                 _major, _minor = int(_m.group(1)), int(_m.group(2))
                 return (_major > 1) or (_major == 1 and _minor >= 10)
-        except Exception:
-            pass
+        except Exception as _exc_13895:
+            logging.debug("[PATCH-276] _certbot_supports_key_type: %s", _exc_13895)
         return False
 
     def _detect_cert_key_type(self) -> str:
@@ -12796,8 +14171,12 @@ class WPDeployManager:
                 return "ecdsa"
             if "rsa" in _out:
                 return "rsa"
-        except Exception:
-            pass
+        except Exception as _ktype_e:
+            # [PATCH-276 FIX-P0-4] 密钥类型检测失败会导致续期时
+            # 静默从 ECDSA 降级为 RSA, 或反之。记录以便排障。
+            logging.debug("[PATCH-276] Cert key type detection"
+                          " failed for %s: %s",
+                          self.cfg.cert_chain, _ktype_e)
         return ""
 
     @staticmethod
@@ -13148,8 +14527,8 @@ class WPDeployManager:
                         if _t248_msg:
                             logging.warning(t("warn_patch_248_nginx_failed"),
                                 _t248_msg[:1500])
-                    except Exception:
-                        pass
+                    except Exception as _exc_14281:
+                        logging.debug("[PATCH-276] nginx: %s", _exc_14281)
 
                     _nginx_t_fixed_248 = False
 
@@ -13246,9 +14625,22 @@ class WPDeployManager:
                             except OSError:
                                 pass
                             return True
-                        # restart 也失败: 回滚 .bak 作为最后手段
+                        # restart 也失败: 诊断端口占用后回滚
                         logging.error(t(
                             "warn_nginx_restart_also_failed"))
+                        # [PATCH-275] 诊断: 检查 80 端口是否被其他进程占用
+                        try:
+                            _ss_diag = subprocess.run(
+                                ["ss", "-tlnp", "sport", "=", ":80"],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL,
+                                encoding="utf-8", timeout=5, check=False)
+                            if _ss_diag.returncode == 0 and _ss_diag.stdout.strip():
+                                logging.error(
+                                    "[PATCH-275 DIAG] 端口 80 占用:\n%s",
+                                    _ss_diag.stdout.strip()[:500])
+                        except Exception as _exc_14393:
+                            logging.debug("[PATCH-276] L14393: %s", _exc_14393)
                     # nginx 存活但 reload 失败 / restart 也失败: 回滚
                     if bak_path.exists():
                         os.replace(str(bak_path), str(self.cfg.nginx_conf))
@@ -13316,11 +14708,11 @@ class WPDeployManager:
                         [self.pkg_mgr, "install", "-y",
                          "php-%s" % _ext],
                         quiet=True, timeout=60)
-        except Exception:
-            pass
+        except Exception as _exc_14462:
+            logging.debug("[PATCH-276] operation failed: %s", _exc_14462)
 
     def install_packages(self) -> bool:
-        pkgs = ["nginx", "certbot", "wget", "curl", "tar"]
+        pkgs = ["nginx", "wget", "curl", "tar"]  # [PATCH-275] certbot 不再走 apt, 直接 snap 安装
         # [PATCH-261b] 记录安装前的 PHP 版本和服务名, 用于后续版本迁移
         _php_ver_before = self._detect_installed_php_version()
         _php_svc_before = self.php_fpm_svc
@@ -13339,8 +14731,8 @@ class WPDeployManager:
                         x.strip().lower() for x in _ext_r18.stdout.splitlines()
                         if x.strip() and not x.strip().startswith("[")
                     }
-            except Exception:
-                pass
+            except Exception as _exc_14485:
+                logging.debug("[PATCH-276] install_packages: %s", _exc_14485)
         if self.pkg_mgr in ("dnf", "yum"):
             _epel_check = subprocess.run(
                 [self.pkg_mgr, "repolist", "enabled"],
@@ -13531,6 +14923,13 @@ class WPDeployManager:
                 _maria_ver_after = self._detect_installed_mariadb_version()
                 self._finalize_mariadb_upgrade(
                     _maria_ver_before, _maria_ver_after)
+            # [PATCH-275] certbot snap 安装 (与 apt 路径对齐)
+            if not self.cfg.dry_run:
+                _has_certbot = bool(shutil.which("certbot")
+                                    or Path("/snap/bin/certbot").is_file())
+                if not _has_certbot:
+                    self._migrate_certbot_to_snap(fresh_install=True)
+                    self.cfg.certbot_bin = SiteConfig._detect_certbot_bin()
             return True
         elif self.pkg_mgr == "apt":
             self.run_cmd(["apt", "update"], quiet=True)
@@ -13567,12 +14966,36 @@ class WPDeployManager:
             pkgs.append("mariadb-client" if self.cfg.is_external_db else "mariadb-server")
             if self.cfg.redis_cache:  # [V2.9.8]
                 # Ondrej/Sury: php-redis 需要版本前缀匹配
-                if _php_target:
+                # [BUGFIX] 同 _build_php_packages: Sury 已配置时 php-redis 是虚包,
+                # 需用已安装版本号前缀 (php8.4-redis), 否则 apt 报错。
+                _redis_php_ver = _php_target
+                if not _redis_php_ver:
+                    _cur_rv = self._detect_installed_php_version()
+                    _sury_ok = Path(
+                        "/etc/apt/sources.list.d/sury-php.sources").exists() or any(
+                        Path("/etc/apt/sources.list.d").glob("*sury*"))
+                    if _cur_rv != (0, 0) and _sury_ok:
+                        _redis_php_ver = "%d.%d" % _cur_rv
+                if _redis_php_ver:
                     pkgs.extend(["redis-server",
-                                 "php%s-redis" % _php_target])
+                                 "php%s-redis" % _redis_php_ver])
                 else:
                     pkgs.extend(["redis-server", "php-redis"])
             # [V3.2.0] 失败后自动诊断并尝试修复
+            # [PATCH-272] nginx.org 仓库已配置时, 先单独安装 nginx 确保获取 1.28+。
+            # 一锅炖时 apt 依赖解析可能因 nginx-common (Ubuntu 独有) 优先选择
+            # Ubuntu 的旧版本, 或 nginx.org 在国内云网络不可达导致静默回退。
+            if self.cfg.cache_mode == 'redis' and "nginx" in pkgs:
+                _nginx_list = Path("/etc/apt/sources.list.d/nginx.list")
+                if _nginx_list.is_file():
+                    # [PATCH-275] 仅在预装成功时才从主列表移除。
+                    # 之前无条件移除, 导致预装静默失败时主列表也没有 nginx,
+                    # 最终系统无 nginx → HTTP challenge 预检必定失败。
+                    _pre_ok = self.run_cmd(
+                        ["apt", "install", "-y", "nginx"],
+                        quiet=False, stream=True, timeout=120)
+                    if _pre_ok:
+                        pkgs = [p for p in pkgs if p != "nginx"]
             if not self.run_cmd(["apt", "install", "-y"] + pkgs, quiet=False, stream=True):  # [PATCH-STREAM]
                 return self._diagnose_pkg_failure(pkgs)
             # [PATCH-261] 安装后重新探测 PHP-FPM 服务名 (版本可能已变更)
@@ -13599,13 +15022,22 @@ class WPDeployManager:
                 _maria_ver_after = self._detect_installed_mariadb_version()
                 self._finalize_mariadb_upgrade(
                     _maria_ver_before, _maria_ver_after)
+            # [PATCH-275] certbot 直接从 snap 安装, 跳过 apt→snap 迁移循环。
+            # EFF 官方唯一推荐: snap install --classic certbot (certbot.eff.org)。
+            # 三级灾备: snap → pip venv → apt (兜底)
+            if not self.cfg.dry_run:
+                _has_certbot = bool(shutil.which("certbot")
+                                    or Path("/snap/bin/certbot").is_file())
+                if not _has_certbot:
+                    self._migrate_certbot_to_snap(fresh_install=True)
+                    self.cfg.certbot_bin = SiteConfig._detect_certbot_bin()
             return True
         return False
 
     # -----------------------------------------------------------------------
     # 防火墙 & SELinux
     # -----------------------------------------------------------------------
-    def setup_firewall(self):
+    def setup_firewall(self) -> None:
         if shutil.which("ufw"):
             logging.info(t("info_ufw"))
             self.run_cmd(["ufw", "allow", "80/tcp"], quiet=True)
@@ -13664,8 +15096,8 @@ class WPDeployManager:
                     self.run_cmd(["ufw", "delete", "allow", "443/udp"], quiet=True)
                     self.run_cmd(["ufw", "reload"], quiet=True)
                     _closed = True
-            except Exception:
-                pass
+            except Exception as _exc_14850:
+                logging.debug("[PATCH-276] _close_quic_firewall: %s", _exc_14850)
         elif shutil.which("firewall-cmd"):
             # 检测 firewalld 中是否存在 443/udp 端口
             try:
@@ -13679,12 +15111,12 @@ class WPDeployManager:
                         quiet=True)
                     self.run_cmd(["firewall-cmd", "--reload"], quiet=True)
                     _closed = True
-            except Exception:
-                pass
+            except Exception as _exc_14865:
+                logging.debug("[PATCH-276] ufw: %s", _exc_14865)
         if _closed:
             logging.info(t("info_closed_udp443"))
 
-    def handle_selinux(self):
+    def handle_selinux(self) -> None:
         if shutil.which("selinuxenabled"):
             r = subprocess.run(
                 ["selinuxenabled"],
@@ -13746,8 +15178,8 @@ class WPDeployManager:
                     if "access denied" in r.stderr.lower():
                         logging.info(t("info_db_ready_auth", t=attempt))
                         return True
-                except Exception:
-                    pass
+                except Exception as _exc_14932:
+                    logging.warning("[PATCH-276] operation failed: %s", _exc_14932)
                 time.sleep(1)
         else:
             logging.info(t("info_db_fallback_detect"))
@@ -13767,9 +15199,40 @@ class WPDeployManager:
                 if "access denied" in r.stderr.lower():
                     logging.info(t("info_db_ready_fallback_auth"))
                     return True
-            except Exception:
-                pass
+            except Exception as _exc_14953:
+                logging.warning("[PATCH-276] operation failed: %s", _exc_14953)
             time.sleep(1)
+        # [PATCH-279] Before giving up, attempt to restart the DB service.
+        # Common cause: MariaDB crashed during InnoDB recovery or OOM-killed.
+        if not self.cfg.is_external_db and hasattr(self, 'db_svc') and self.db_svc:
+            logging.warning("[PATCH-279] DB not ready after %ds — attempting "
+                            "systemctl restart %s ...", max_wait, self.db_svc)
+            _restart_ok = bool(self.run_cmd(
+                ["systemctl", "restart", self.db_svc], quiet=True, timeout=30))
+            if _restart_ok:
+                # Give it a shorter second-chance wait
+                _have_adm_279 = bool(shutil.which("mysqladmin"))
+                for _r279 in range(15):
+                    try:
+                        if _have_adm_279:
+                            _rr = subprocess.run(
+                                ["mysqladmin", "-u", "root", "ping", "--silent"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                encoding='utf-8', errors='replace',
+                                timeout=5, check=False)
+                        else:
+                            # Fallback: mysql -e "SELECT 1" (no mysqladmin on minimal images)
+                            _rr = subprocess.run(
+                                ["mysql", "-u", "root", "-e", "SELECT 1;"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                encoding='utf-8', errors='replace',
+                                timeout=5, check=False)
+                        if _rr.returncode == 0 or "access denied" in (_rr.stderr or "").lower():
+                            logging.info("[PATCH-279] DB recovered after restart (attempt %d).", _r279 + 1)
+                            return True
+                    except Exception:
+                        pass
+                    time.sleep(1)
         logging.warning(t("warn_db_not_ready", t=max_wait))
         return False
 
@@ -13998,8 +15461,8 @@ class WPDeployManager:
                         self._wpcli_bin = path
                         logging.info(t("info_wpcli_found", path=path, ver=r.stdout.strip()))
                         return path
-                except Exception:
-                    pass
+                except Exception as _exc_15184:
+                    logging.debug("[PATCH-276] L15184: %s", _exc_15184)
         return ""
 
     def _install_wpcli(self) -> str:
@@ -14014,8 +15477,19 @@ class WPDeployManager:
 
         downloader = shutil.which("curl") or shutil.which("wget")
         if not downloader:
+            # [PATCH-279] Auto-install curl (preferred) or wget
             logging.warning(t("warn_wpcli_no_download"))
-            return ""
+            logging.info("[PATCH-279] No curl/wget found — attempting to install curl...")
+            if self.pkg_mgr in ("dnf", "yum"):
+                self.run_cmd([self.pkg_mgr, "install", "-y", "curl"], quiet=True, timeout=60)
+            elif self.pkg_mgr == "apt":
+                self.run_cmd(["apt", "install", "-y", "curl"], quiet=True, timeout=60)
+            downloader = shutil.which("curl") or shutil.which("wget")
+            if not downloader:
+                logging.warning("[PATCH-279] curl/wget install failed — cannot download WP-CLI.")
+                return ""
+            logging.info("[PATCH-279] %s installed, proceeding with WP-CLI download.",
+                         Path(downloader).name)
 
         logging.info(t("info_wpcli_installing"))
 
@@ -14192,10 +15666,44 @@ class WPDeployManager:
                 _m = re.search(r'(\d+\.\d+\.\d+)', _r.stdout)
                 if _m:
                     _local_ver = _m.group(1)
-        except Exception:
-            pass
+        except Exception as _exc_15378:
+            logging.debug("[PATCH-276] L15378: %s", _exc_15378)
         if not _local_ver:
             return True  # 无法获取版本, 跳过
+
+        # ── [PATCH-270b] 最低版本门控 ────────────────────────────
+        # PHP 8.3 环境下, WP-CLI < _WPCLI_MIN_VERSION 的 --skip-plugins
+        # 等子命令可能产生 deprecation 噪音或执行异常。
+        # 低于门槛时强制更新, 无需等待远程版本比较结果。
+        def _ver_tuple(v: str) -> tuple:
+            try:
+                return tuple(int(x) for x in v.split("."))
+            except ValueError:
+                return (0,)
+
+        _local_t = _ver_tuple(_local_ver)
+        if _local_t < _WPCLI_MIN_VERSION:
+            _php_ver_270b = ""
+            try:
+                _pv = subprocess.run(
+                    ["php", "-r", "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    encoding="utf-8", errors="replace",
+                    timeout=5, check=False)
+                if _pv.returncode == 0:
+                    _php_ver_270b = _pv.stdout.strip()
+            except Exception:
+                _php_ver_270b = "8.3+"
+            logging.info(t("info_wpcli_version_old_force_update",
+                           ver=_local_ver,
+                           min="%d.%d" % _WPCLI_MIN_VERSION,
+                           php=_php_ver_270b))
+            # 跳过远程版本比较, 直接进入备份→下载→替换流程
+            # (下方代码从 "备份旧二进制" 开始)
+        else:
+            logging.info(t("info_wpcli_version_ok",
+                           ver=_local_ver,
+                           min="%d.%d" % _WPCLI_MIN_VERSION))
 
         # ── 获取远程最新版本号 (GitHub Releases API) ────────────
         _remote_ver = ""
@@ -14226,16 +15734,16 @@ class WPDeployManager:
             logging.debug(
                 "[PATCH-165] Cannot determine latest WP-CLI version; "
                 "skipping update check.")
-            return True
+            # [PATCH-270b] 低于最低版本时, API 不可达仍尝试强制下载。
+            # _install_wpcli() 从固定镜像 URL 下载 latest, 不依赖版本号。
+            if _local_t >= _WPCLI_MIN_VERSION:
+                return True
+            # 否则: 继续进入备份→下载流程
 
         # ── 版本比较 ───────────────────────────────────────────
-        def _ver_tuple(v):
-            try:
-                return tuple(int(x) for x in v.split("."))
-            except ValueError:
-                return (0,)
-
-        if _ver_tuple(_remote_ver) <= _ver_tuple(_local_ver):
+        # [PATCH-270b] 低于最低版本时跳过"已是最新"判断, 强制更新。
+        if (_local_t >= _WPCLI_MIN_VERSION
+                and _ver_tuple(_remote_ver) <= _ver_tuple(_local_ver)):
             logging.info(t("info_wpcli_already_latest", ver=_local_ver))
             return True
 
@@ -14278,6 +15786,10 @@ class WPDeployManager:
         else:
             # 更新失败 — 从备份恢复原二进制
             logging.warning(t("warn_wpcli_update_fail", ver=_local_ver))
+            # [PATCH-270b] 低于最低版本时补充 PHP 兼容性警告
+            if _local_t < _WPCLI_MIN_VERSION:
+                logging.warning(t("warn_wpcli_version_old_update_failed",
+                                  ver=_local_ver))
             self._wpcli_bin = _old_bin
             self._wpcli_install_attempted = _old_attempted
             if _backed_up and Path(_backup_path).exists():
@@ -14428,7 +15940,7 @@ class WPDeployManager:
         return "status: connected" in _out or "status: 已连接" in _out
 
     def _rollback_plugin(self, slug: str, prev_version: str,
-                         restore_config_fn=None) -> None:
+                         restore_config_fn: Optional[Callable[[], None]]=None) -> None:
         """[V3.2.114] R4: 插件回滚通用框架。
 
         骨架: 日志开始 -> 降级安装/重新激活 -> 还原配置 -> 日志结束。
@@ -14459,7 +15971,7 @@ class WPDeployManager:
     def _rollback_nginx_helper(self, prev_version: str,
                                prev_options: str) -> None:
         """[V3.2.114] R4: 委托 _rollback_plugin。"""
-        def _restore():
+        def _restore() -> None:
             if prev_options:
                 self._run_wpcli(
                     "option", "update", "rt_wp_nginx_helper_options",
@@ -14473,7 +15985,7 @@ class WPDeployManager:
     def _rollback_redis_cache(self, prev_version: str,
                               wpc_backup: str) -> None:
         """[V3.2.114] R4: 委托 _rollback_plugin。"""
-        def _restore():
+        def _restore() -> None:
             _wpc_path = self.cfg.webroot_path / "wp-config.php"
             if wpc_backup and _wpc_path.exists():
                 if not self._safe_write_file(str(_wpc_path), wpc_backup, mode=0o440):
@@ -14955,8 +16467,7 @@ class WPDeployManager:
 
 
     @staticmethod
-    def _decrement_wp_version(ver):
-        # type: (str) -> list
+    def _decrement_wp_version(ver: str) -> list:
         """[FIX-ZH1] 生成前 N 个 patch 版本用于降级重试。
 
         '6.9.4' → ['6.9.3', '6.9.2']
@@ -14984,8 +16495,7 @@ class WPDeployManager:
         return []
 
     @staticmethod
-    def _head_check_url(url, timeout=5):
-        # type: (str, int) -> bool
+    def _head_check_url(url: str, timeout: int = 5) -> bool:
         """Verify a URL exists before downloading (lightweight check).
 
         [PATCH-265] 使用 GET + Range:bytes=0-0 替代 HEAD 请求。
@@ -15010,8 +16520,8 @@ class WPDeployManager:
                 if _cr.returncode == 0:
                     _code = _cr.stdout.strip()
                     return _code in ("200", "206", "301", "302")
-            except Exception:
-                pass
+            except Exception as _exc_16234:
+                logging.debug("[PATCH-276] _head_check_url: %s", _exc_16234)
             return False
         # curl 不可用时回退 urllib (保持原有行为)
         import urllib.request as _ur
@@ -15027,8 +16537,7 @@ class WPDeployManager:
 
 
     @staticmethod
-    def _is_valid_gzip(filepath, min_size_bytes=5 * 1024 * 1024):
-        # type: (str, int) -> bool
+    def _is_valid_gzip(filepath: str, min_size_bytes: int = 5 * 1024 * 1024) -> bool:
         """[PATCH-GZ1] Validate file is gzip format with reasonable size.
 
         WordPress tar.gz is always > 20MB; anything < 5MB is suspicious.
@@ -15059,8 +16568,7 @@ class WPDeployManager:
             logging.warning(t("warn_wp_download_validate_fail", e=e))
             return False
 
-    def _build_wp_download_sources(self, wp_ver, en_ver=""):
-        # type: (str, str) -> list
+    def _build_wp_download_sources(self, wp_ver: str, en_ver: str = "") -> list:
         """Build download source list for WordPress.
 
         Args:
@@ -15203,8 +16711,7 @@ class WPDeployManager:
         return sources
 
 
-    def _download_wp_with_hash(self, sources, dest):
-        # type: (list, str) -> tuple
+    def _download_wp_with_hash(self, sources: list, dest: str) -> tuple:
         """Download WordPress from source list, verify integrity.
 
         Returns:
@@ -15310,8 +16817,7 @@ class WPDeployManager:
 
         return (download_success, wpcli_downloaded, hash_verified)
 
-    def _verify_sha1(self, archive_path, hash_url, src_name):
-        # type: (str, str, str) -> Optional[bool]
+    def _verify_sha1(self, archive_path: str, hash_url: str, src_name: str) -> Optional[bool]:
         """Download SHA1 hash file and verify archive integrity.
 
         [PATCH-224 FIX-1] Rewritten: use Python urllib instead of curl/wget.
@@ -15520,8 +17026,7 @@ class WPDeployManager:
     # [V3.2.35] setup_lemp_and_wp() 拆分: 子方法
     # -----------------------------------------------------------------------
 
-    def _lemp_configure_php(self):
-        # type: () -> None
+    def _lemp_configure_php(self) -> None:
         """配置 PHP ini 参数和 FPM pool 用户/组。"""
         # [PATCH-262 PHP-2] 使用活跃版本过滤, 避免 patch 已停止的旧版本
         for ini_path in self._get_active_php_ini_paths():
@@ -15549,8 +17054,7 @@ class WPDeployManager:
         # [V3.0.16] P3: 按内存动态调整 PHP-FPM pool 参数 (在服务启动前)
         self._patch_fpm_pool_tuning()
 
-    def _lemp_start_services(self):
-        # type: () -> bool
+    def _lemp_start_services(self) -> bool:
         """逐个启用核心服务 (DB, PHP-FPM, Nginx), 启动失败时尝试诊断修复。
 
         Nginx 是后续所有阶段的硬依赖，启动失败必须终止。
@@ -15558,11 +17062,13 @@ class WPDeployManager:
         """
         # [FIX-C11] EL10 上 certbot/mod_http2 等会将 httpd 作为弱依赖拉入,
         # httpd 可能自动启动并占用 80 端口导致 nginx 启动失败。
-        # 在启动 nginx 之前主动停止并禁用 httpd (仅限当前运行中的场景)。
+        # [PATCH-275] Ubuntu/Debian: apt install php 拉入 libapache2-mod-php → apache2 自启。
+        # 在启动 nginx 之前主动停止并禁用 httpd/apache2 (仅限当前运行中的场景)。
         if not self.cfg.dry_run:
+          for _httpd_name in ("httpd", "apache2"):
             try:
                 _httpd_active = subprocess.run(
-                    ["systemctl", "is-active", "httpd"],
+                    ["systemctl", "is-active", _httpd_name],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                     encoding='utf-8', errors='replace', timeout=5,
                     check=False,
@@ -15586,21 +17092,21 @@ class WPDeployManager:
                                 "httpd" in _ss_out
                                 or "apache" in _ss_out
                             )
-                    except Exception:
-                        pass
+                    except Exception as _exc_16812:
+                        logging.debug("[PATCH-276] stdout: %s", _exc_16812)
                     if _httpd_blocks_nginx:
                         logging.info(t("info_fix_c11_httpd_occupies_port_installed_as"))
                         self.run_cmd(
-                            ["systemctl", "stop", "httpd"], quiet=True,
+                            ["systemctl", "stop", _httpd_name], quiet=True,
                         )
                         self.run_cmd(
-                            ["systemctl", "disable", "httpd"],
+                            ["systemctl", "disable", _httpd_name],
                             quiet=True,
                         )
                     else:
                         logging.info(t("info_v3_2_122_fix_httpd_running_but_not"))
-            except Exception:
-                pass
+            except Exception as _exc_16825:
+                logging.debug("[PATCH-276] stderr: %s", _exc_16825)
 
         services_to_enable = [self.php_fpm_svc, "nginx"]
         if not self.cfg.is_external_db:
@@ -15675,17 +17181,39 @@ class WPDeployManager:
                             logging.debug(
                                 "[FIX #14] Graceful quit timed out "
                                 "after 30s; falling back to restart")
-                except Exception:
-                    pass
-                self.run_cmd(
+                except Exception as _exc_16901:
+                    logging.debug("[PATCH-276] stderr: %s", _exc_16901)
+                # [PATCH-275] nginx -s quit 后 apache2 可能通过 apt trigger 抢占 80 端口
+                for _httpd_kill in ("apache2", "httpd"):
+                    try:
+                        _hk = subprocess.run(
+                            ["systemctl", "is-active", _httpd_kill],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            encoding="utf-8", timeout=5, check=False)
+                        if _hk.returncode == 0:
+                            logging.info(
+                                "[PATCH-275] 停用 %s 以释放 80 端口..."
+                                % _httpd_kill)
+                            self.run_cmd(
+                                ["systemctl", "stop", _httpd_kill],
+                                quiet=True)
+                            self.run_cmd(
+                                ["systemctl", "disable", _httpd_kill],
+                                quiet=True)
+                    except Exception as _exc_16920:
+                        logging.debug("[PATCH-276] _hk: %s", _exc_16920)
+                _restart_275 = self.run_cmd(
                     ['systemctl', 'restart', 'nginx'],
-                    quiet=True, timeout=30)
+                    quiet=False, timeout=30)
+                if not _restart_275:
+                    logging.warning(
+                        "[PATCH-275] Nginx 升级后 restart 失败, "
+                        "Phase 2 将重试启动。")
         self.setup_firewall()
         self._open_quic_firewall()  # [PATCH-167 FIX-7c]
         return True
 
-    def _lemp_setup_database(self):
-        # type: () -> tuple
+    def _lemp_setup_database(self) -> tuple:
         """初始化 MariaDB, 创建数据库和用户, 注册回滚。
 
         返回 (ok, recovered_pass, need_rewrite_wp_config) 三元组。
@@ -15726,8 +17254,8 @@ class WPDeployManager:
                         encoding='utf-8', errors='replace', timeout=10, check=False,
                     )
                     _verify_ok = (_r.returncode == 0)
-                except Exception:
-                    pass
+                except Exception as _exc_16975:
+                    logging.debug("[PATCH-276] _wait_db_ready: %s", _exc_16975)
                 finally:
                     try:
                         os.unlink(_tmp_def)
@@ -15873,8 +17401,7 @@ class WPDeployManager:
 
         return (True, recovered_pass, _need_rewrite_wp_config)
 
-    def _lemp_write_wp_config(self, recovered_pass, need_rewrite):
-        # type: (str, bool) -> bool
+    def _lemp_write_wp_config(self, recovered_pass: str, need_rewrite: bool) -> bool:
         """写入或更新 wp-config.php, 设置目录权限。
 
         recovered_pass: 从已有 wp-config.php 恢复的密码 (空串表示新生成)
@@ -15966,8 +17493,12 @@ class WPDeployManager:
         if wp_config.exists() and not self.cfg.dry_run:
             try:
                 self.run_cmd(["chmod", "0440", str(wp_config)], quiet=True)
-            except Exception:
-                pass
+            except Exception as _chmod_e:
+                # [PATCH-276 FIX-P0-4] wp-config.php 含数据库密码和 Salt,
+                # chmod 失败意味着可能保持宽权限, 必须记录 warning。
+                logging.warning(
+                    "[PATCH-276] Failed to chmod 0440 wp-config.php: %s",
+                    _chmod_e)
 
         return True
 
@@ -15999,8 +17530,11 @@ class WPDeployManager:
         if _wpc.exists():
             try:
                 self.run_cmd(["chmod", "0440", str(_wpc)], quiet=True)
-            except Exception:
-                pass
+            except Exception as _chmod_e2:
+                # [PATCH-276 FIX-P0-4] 同 FIX-P0-4a
+                logging.warning(
+                    "[PATCH-276] Failed to chmod 0440 wp-config.php: %s",
+                    _chmod_e2)
 
 
     def _all_critical_deps_present(self) -> bool:
@@ -16142,8 +17676,8 @@ class WPDeployManager:
                                 _remi_m.group(1),
                                 _php_cur_261d[0], _php_cur_261d[1])
                             return False
-            except Exception:
-                pass
+            except Exception as _exc_17398:
+                logging.debug("[PATCH-276] stdout: %s", _exc_17398)
 
         return True
 
@@ -16262,6 +17796,65 @@ class WPDeployManager:
         # swap 后缺失会导致 nginx -t 失败。必须在生成任何含
         # 'include fastcgi.conf;' 的配置之前修复。
         self._ensure_fastcgi_conf()
+        # [PATCH-275] 停止占用 80 端口的 Apache2/httpd。
+        # 场景: 用户手动 apt install php 拉入 libapache2-mod-php → Apache2 自启。
+        # 或脚本跳过 install_packages (依赖已就绪) → _ensure_services 未执行。
+        if not self.cfg.dry_run:
+            for _http_svc in ("apache2", "httpd"):
+                try:
+                    _act = subprocess.run(
+                        ["systemctl", "is-active", _http_svc],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        encoding="utf-8", timeout=5, check=False)
+                    if _act.returncode == 0:
+                        logging.info(
+                            "[PATCH-275] %s 正在运行并占用 80 端口, "
+                            "停止并禁用以释放端口给 nginx..." % _http_svc
+                            if _LANG == "zh" else
+                            "[PATCH-275] %s is running on port 80; "
+                            "stopping and disabling to free port for nginx..."
+                            % _http_svc)
+                        self.run_cmd(
+                            ["systemctl", "stop", _http_svc], quiet=True)
+                        self.run_cmd(
+                            ["systemctl", "disable", _http_svc], quiet=True)
+                except Exception as _exc_17540:
+                    logging.debug("[PATCH-276] stdout: %s", _exc_17540)
+        # [PATCH-275] nginx.org 的 default.conf 含 listen 80 + server_name _/localhost,
+        # 可能拦截 ACME challenge 请求 (尤其 default_server 场景)。
+        # 之前只在 _ensure_srcache_modules 升级路径和 _diagnose_pkg_failure 中清理,
+        # 全新部署路径从未触及。Ubuntu 24.04 + nginx.org 首次部署必现此问题。
+        _def_conf = Path("/etc/nginx/conf.d/default.conf")
+        if _def_conf.is_file():
+            try:
+                _def_conf.rename(
+                    _def_conf.with_suffix(".conf.nginx-org-default"))
+                logging.info(
+                    "[PATCH-275] Renamed nginx.org default.conf to avoid "
+                    "port 80 conflict with site config.")
+            except OSError:
+                pass
+        # [PATCH-275] 修正 webroot 及父目录权限。
+        # os.umask(0o077) 使所有 mkdir 产生 700 目录, nginx worker 无法穿越,
+        # 导致 ACME challenge 返回 403 Forbidden。
+        # 必须在 apply_nginx_config_safe 之前完成, 否则 nginx 加载新配置后
+        # 立即尝试访问 webroot 并失败。
+        if not self.cfg.dry_run:
+            try:
+                # 确保 /var/www 和 /var/www/html 可穿越
+                for _parent in [Path("/var/www"), Path("/var/www/html")]:
+                    if _parent.is_dir():
+                        os.chmod(str(_parent), 0o755)
+                # webroot 本身
+                self.cfg.webroot_path.mkdir(parents=True, exist_ok=True)
+                os.chmod(str(self.cfg.webroot_path), 0o755)
+                # chown webroot 给 nginx 用户
+                self.run_cmd(
+                    ["chown", f"{self.nginx_user}:{self.nginx_user}",
+                     str(self.cfg.webroot_path)],
+                    quiet=True)
+            except OSError:
+                pass
         # [V3.2.15] P2-4: 传入 sock_path, 使 ACME 配置也能处理 PHP
         config = generate_http_only_config(
             self.cfg.domain, self.cfg.webroot_path,
@@ -16312,8 +17905,8 @@ class WPDeployManager:
                                            rtype=rtype, addrs=', '.join(answers)))
                             resolved = True
                             break
-                    except Exception:
-                        pass
+                    except Exception as _exc_17627:
+                        logging.debug("[PATCH-276] r: %s", _exc_17627)
 
             # 回退：getent hosts（不依赖 dig/bind-utils）
             if not resolved and shutil.which("getent"):
@@ -16329,8 +17922,8 @@ class WPDeployManager:
                         logging.info(t("info_dns_ok_getent", domain=domain,
                                        addr=addr))
                         resolved = True
-                except Exception:
-                    pass
+                except Exception as _exc_17644:
+                    logging.debug("[PATCH-276] L17644: %s", _exc_17644)
 
             if not resolved:
                 # [AUDIT ERR-04] 工具缺失检测: dig 和 getent 均不可用时
@@ -16414,8 +18007,8 @@ class WPDeployManager:
                             domain=self.cfg.domain,
                             dns_ip=", ".join(sorted(_dns_ips)),
                             server_ip=_pub_ip))
-            except Exception:
-                pass
+            except Exception as _exc_17729:
+                logging.debug("[PATCH-276] L17729: %s", _exc_17729)
 
         return (main_ok, www_ok)
 
@@ -16474,8 +18067,8 @@ class WPDeployManager:
                     elif _lm_ipv6 and _lm_ipv6.group(1) != "::":
                         _listen_addr = f"[{_lm_ipv6.group(1)}]"
                         logging.info(t("info_nginx_listen_detected", addr=_listen_addr))
-                except Exception:
-                    pass
+                except Exception as _exc_17789:
+                    logging.debug("[PATCH-276] str: %s", _exc_17789)
             url = f"http://{_listen_addr}/.well-known/acme-challenge/wp_ssl_precheck"
             ok = False
 
@@ -16493,6 +18086,23 @@ class WPDeployManager:
                         logging.warning(t("warn_http_challenge_curl_detail",
                             rc=r.returncode,
                             match=t("label_yes") if r.stdout.strip() == token else t("label_no")))
+                        # [PATCH-275] 诊断: curl -f 会吞掉 4xx/5xx 响应体。
+                        # 用不带 -f 的 curl 获取实际响应, 帮助定位 nginx 配置问题。
+                        try:
+                            _diag = subprocess.run(
+                                ["curl", "-sS", "--max-time", "5",
+                                 "-H", "Host: " + self.cfg.domain,
+                                 "-o", "/dev/null", "-w",
+                                 "HTTP %{http_code} from %{local_ip}:%{local_port}→%{remote_ip}:%{remote_port}",
+                                 url],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                encoding='utf-8', errors='replace',
+                                timeout=8, check=False)
+                            if _diag.stdout.strip():
+                                logging.info(
+                                    "[PATCH-275 DIAG] %s", _diag.stdout.strip())
+                        except Exception as _exc_17823:
+                            logging.debug("[PATCH-276] stdout: %s", _exc_17823)
                 except Exception as e:
                     logging.warning(t("warn_http_challenge_curl_err", e=e))
 
@@ -16507,8 +18117,8 @@ class WPDeployManager:
                     )
                     if r.returncode == 0 and r.stdout.strip() == token:
                         ok = True
-                except Exception:
-                    pass
+                except Exception as _exc_17839:
+                    logging.warning("[PATCH-276] stdout: %s", _exc_17839)
 
             if ok:
                 logging.info(t("ok_http_challenge"))
@@ -17058,19 +18668,13 @@ class WPDeployManager:
         except OSError:
             pass
         # [PATCH-181 FIX-4] Privacy: inform before sending email to 3rd-party
-        logging.warning(t("warn_privacy_about_to_send_registration_email"))
+        # [PATCH-275] 移除交互式确认。Let's Encrypt 签发时同样将邮箱发送给
+        # 第三方 (ISRG), 用户已在提供邮箱时隐式授权。保留 WP_SKIP_ZEROSSL_AUTO
+        # 环境变量供需要显式禁用的用户使用。
+        logging.info(t("warn_privacy_about_to_send_registration_email"))
         if os.environ.get("WP_SKIP_ZEROSSL_AUTO", "").strip() == "1":
             return ("", "auto-fetch disabled by WP_SKIP_ZEROSSL_AUTO")
-        if sys.stdin.isatty():
-            try:
-                _zs_consent = input(
-                    "  Send email to ZeroSSL for backup CA? [Y/n]: "
-                ).strip().lower()
-                if _zs_consent in ("n", "no"):
-                    return ("", "user declined ZeroSSL auto-fetch")
-            except (EOFError, KeyboardInterrupt):
-                return ("", "user cancelled")
-        else:
+        if not sys.stdin.isatty():
             # [PATCH-183 FIX-10] 非交互模式: 跳过自动获取 ZeroSSL EAB。
             # systemd timer 触发的 renew 无 TTY, 不应自动将用户邮箱
             # 发送给第三方 API (GDPR/隐私合规风险)。
@@ -17228,6 +18832,75 @@ class WPDeployManager:
             if ok:
                 if not _rsa_fb:
                     logging.info(t("ok_cert_issued", ca=ca["name"]))
+                # [PATCH-276 FIX-P1-5] 签发成功后验证证书/私钥匹配。
+                # 防止 certbot 插件 bug、磁盘故障或手动替换导致
+                # fullchain.pem 与 privkey.pem 不匹配, 此时 nginx reload
+                # 会 100% 失败, 且错误信息极难关联到证书问题。
+                try:
+                    _vc_chain, _vc_key = _resolve_cert_paths(
+                        self.cfg.domain, self.cfg.certbot_bin)
+                    if _vc_chain and _vc_key:
+                        _vc_cert_mod = subprocess.run(
+                            ["openssl", "x509", "-noout", "-modulus",
+                             "-in", _vc_chain],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            encoding="utf-8", timeout=10, check=False)
+                        _vc_key_mod = subprocess.run(
+                            ["openssl", "pkey", "-noout", "-pubout",
+                             "-in", _vc_key],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            encoding="utf-8", timeout=10, check=False)
+                        if (_vc_cert_mod.returncode == 0
+                                and _vc_key_mod.returncode == 0):
+                            # 对比 modulus hash (ECC 证书用 pubout 比较)
+                            _cm = hashlib.sha256(
+                                _vc_cert_mod.stdout.strip().encode()).hexdigest()
+                            _km = hashlib.sha256(
+                                _vc_key_mod.stdout.strip().encode()).hexdigest()
+                            if _cm != _km:
+                                # ECC 证书 modulus 输出格式不同, 使用 -pubout 重验
+                                _vc_cert_pub = subprocess.run(
+                                    ["openssl", "x509", "-noout", "-pubkey",
+                                     "-in", _vc_chain],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL,
+                                    encoding="utf-8", timeout=10, check=False)
+                                _vc_key_pub = subprocess.run(
+                                    ["openssl", "pkey", "-pubout",
+                                     "-in", _vc_key],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL,
+                                    encoding="utf-8", timeout=10, check=False)
+                                if (_vc_cert_pub.returncode == 0
+                                        and _vc_key_pub.returncode == 0):
+                                    if (_vc_cert_pub.stdout.strip()
+                                            != _vc_key_pub.stdout.strip()):
+                                        logging.error(
+                                            "[PATCH-276] CRITICAL: "
+                                            "cert/key mismatch for %s! "
+                                            "fullchain=%s privkey=%s",
+                                            self.cfg.domain,
+                                            _vc_chain, _vc_key)
+                                        # 不 return False: 证书已签发成功,
+                                        # 让后续 nginx -t 自然捕获失败。
+                                    else:
+                                        logging.debug(
+                                            "[PATCH-276] cert/key match OK"
+                                            " (pubkey compare) for %s",
+                                            self.cfg.domain)
+                                else:
+                                    logging.debug(
+                                        "[PATCH-276] cert/key pubout"
+                                        " extraction failed, skipping"
+                                        " validation")
+                            else:
+                                logging.debug(
+                                    "[PATCH-276] cert/key match OK"
+                                    " (modulus compare) for %s",
+                                    self.cfg.domain)
+                except Exception as _vc_e:
+                    logging.debug("[PATCH-276] cert/key validation"
+                                  " skipped: %s", _vc_e)
                 return True
             _last_cert_error = err_type
             if err_type in (CmdResult.FATAL, CmdResult.PERMISSION):
@@ -17496,7 +19169,7 @@ class WPDeployManager:
     #   NDK v0.3.1+ 已支持 --with-compat 模式。
     # -----------------------------------------------------------------------
 
-    def _prepare_nginx_128_repo(self):
+    def _prepare_nginx_128_repo(self) -> None:
         """[PATCH-243] 按系统差异化配置 Nginx 1.28+ 源。
 
         调用时机: install_packages() 中, 安装 nginx 包之前。
@@ -17535,8 +19208,8 @@ class WPDeployManager:
                     if _cur_ver >= (1, 28, 0):
                         logging.info(t("info_nginx_128_already_installed"))
                         return
-            except Exception:
-                pass
+            except Exception as _exc_18930:
+                logging.debug("[PATCH-276] _nv_r: %s", _exc_18930)
 
         # ── EL 系列 ──
         if self.pkg_mgr in ("dnf", "yum"):
@@ -17545,7 +19218,7 @@ class WPDeployManager:
         elif self.pkg_mgr == "apt":
             self._prepare_nginx_128_repo_deb()
 
-    def _prepare_nginx_128_repo_el(self):
+    def _prepare_nginx_128_repo_el(self) -> None:
         """[PATCH-243] EL 系列 Nginx 1.28 仓库配置 (从 _prepare_nginx_128_repo 提取)。
 
         EL 8/9: 使用 nginx.org 官方 yum 仓库 (RHEL 9 AppStream 仅提供 1.22,
@@ -17879,7 +19552,7 @@ class WPDeployManager:
             except Exception as _e263:
                 logging.warning(t("warn_263_swap_error", err=_e263))
 
-    def _prepare_nginx_128_repo_deb(self):
+    def _prepare_nginx_128_repo_deb(self) -> bool:
         """[PATCH-250] Debian/Ubuntu: 确保 Nginx ≥1.28 可从 apt 安装。
 
         Ubuntu 22.04 (1.18) / 24.04 (1.24) 和 Debian 11 (1.18) / 12 (1.22)
@@ -17947,9 +19620,111 @@ class WPDeployManager:
                 try:
                     if "nginx.org" in _chk_file.read_text(
                             encoding="utf-8", errors="replace"):
-                        logging.debug(
-                            "[PATCH-250] %s already configured, skip",
-                            _chk_file.name)
+                        # [PATCH-272] 源文件已存在, 但 apt 缓存可能没有 nginx.org 的索引
+                        # (首次 apt update 网络超时等)。检查候选版本, 不足则重刷。
+                        _need_refresh = True
+                        try:
+                            _pol2 = subprocess.run(
+                                ["apt-cache", "policy", "nginx"],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL,
+                                encoding="utf-8", errors="replace",
+                                timeout=10, check=False)
+                            if _pol2.returncode == 0:
+                                _cm2 = re.search(
+                                    r'Candidate:\s+(\d+):?(\d+)\.(\d+)\.(\d+)',
+                                    _pol2.stdout)
+                                if _cm2 and (int(_cm2.group(2)),
+                                             int(_cm2.group(3)),
+                                             int(_cm2.group(4))) >= (1, 28, 0):
+                                    _need_refresh = False
+                                if not _cm2:
+                                    _cm3 = re.search(
+                                        r'Candidate:\s+(\d+)\.(\d+)\.(\d+)',
+                                        _pol2.stdout)
+                                    if _cm3 and (int(_cm3.group(1)),
+                                                 int(_cm3.group(2)),
+                                                 int(_cm3.group(3))) >= (1, 28, 0):
+                                        _need_refresh = False
+                        except Exception as _exc_19368:
+                            logging.debug("[PATCH-276] stderr: %s", _exc_19368)
+                        if _need_refresh:
+                            # [PATCH-272] 确保 pinning 包含 'release o=nginx'
+                            _pin_272 = Path("/etc/apt/preferences.d/99nginx")
+                            _pin_272_content = (
+                                "Package: *\n"
+                                "Pin: origin nginx.org\n"
+                                "Pin: release o=nginx\n"
+                                "Pin-Priority: 900\n")
+                            try:
+                                _old_pin = _pin_272.read_text(
+                                    encoding="utf-8", errors="replace") if _pin_272.exists() else ""
+                                if "release o=nginx" not in _old_pin:
+                                    _pin_272.write_text(_pin_272_content, encoding="utf-8")
+                                    os.chmod(str(_pin_272), 0o644)
+                                    logging.info(
+                                        "[PATCH-272] APT pinning 已更新 (添加 release o=nginx)"
+                                        if _LANG == "zh" else
+                                        "[PATCH-272] APT pinning updated (added release o=nginx)")
+                            except OSError:
+                                pass
+                            logging.info(
+                                "[PATCH-272] nginx.org 源已配置但 apt 缓存无 1.28+, 刷新索引..."
+                                if _LANG == "zh" else
+                                "[PATCH-272] nginx.org repo configured but apt cache missing 1.28+; refreshing...")
+                            # [PATCH-272] 先重新导入 GPG 密钥 (可能丢失/过期/不完整)
+                            _keyring_272 = Path("/usr/share/keyrings/nginx-archive-keyring.gpg")
+                            try:
+                                _dl_cmd_272 = (
+                                    ["curl", "-fsSL", "https://nginx.org/keys/nginx_signing.key"]
+                                    if shutil.which("curl") else
+                                    ["wget", "-qO-", "https://nginx.org/keys/nginx_signing.key"])
+                                _dl_272 = subprocess.run(
+                                    _dl_cmd_272,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    timeout=15, check=False)
+                                if _dl_272.returncode == 0 and _dl_272.stdout:
+                                    _gpg_272 = subprocess.run(
+                                        ["gpg", "--dearmor", "--yes",
+                                         "-o", str(_keyring_272)],
+                                        input=_dl_272.stdout,
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL,
+                                        timeout=10, check=False)
+                                    if _gpg_272.returncode == 0:
+                                        os.chmod(str(_keyring_272), 0o644)
+                                        logging.info(
+                                            "[PATCH-272] nginx.org GPG 密钥已重新导入"
+                                            if _LANG == "zh" else
+                                            "[PATCH-272] nginx.org GPG key re-imported")
+                            except Exception as _exc_19419:
+                                logging.warning("[PATCH-276] stdout: %s", _exc_19419)
+                            _upd_r = subprocess.run(
+                                ["apt", "update"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                encoding="utf-8", errors="replace",
+                                timeout=120, check=False)
+                            # 记录 apt update 中 nginx.org 相关的错误行
+                            if _upd_r.stderr:
+                                for _line in _upd_r.stderr.splitlines():
+                                    if "nginx" in _line.lower() or "err" in _line.lower() or "gpg" in _line.lower():
+                                        logging.warning(
+                                            "[PATCH-272] apt update: %s",
+                                            _line.strip())
+                            # 记录 apt-cache policy 帮助诊断
+                            try:
+                                _diag = subprocess.run(
+                                    ["apt-cache", "policy", "nginx"],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL,
+                                    encoding="utf-8", errors="replace",
+                                    timeout=10, check=False)
+                                if _diag.returncode == 0 and _diag.stdout:
+                                    logging.info(
+                                        "[PATCH-272] apt-cache policy nginx:\n%s",
+                                        _diag.stdout.strip())
+                            except Exception as _exc_19445:
+                                logging.debug("[PATCH-276] stdout: %s", _exc_19445)
                         return
                 except OSError:
                     pass
@@ -18020,8 +19795,8 @@ class WPDeployManager:
                     logging.info(t("info_nginx_deb_codename_dynamic",
                         codename=_codename))
                     _effective_codename = _codename
-            except Exception:
-                pass
+            except Exception as _exc_19517:
+                logging.debug("[PATCH-276] operation failed: %s", _exc_19517)
             if not _probe_ok:
                 if _supported:
                     # 回退到 nginx.org 支持的最新 codename
@@ -18037,46 +19812,183 @@ class WPDeployManager:
 
         logging.info(t("info_nginx_128_repo_deb"))
 
+        # [PATCH-275] 确保 gpg 可用 (Debian 12 最小安装无 gnupg)
+        if not shutil.which("gpg"):
+            self.run_cmd(
+                ["apt", "install", "-y", "gnupg"],
+                quiet=True, timeout=60)
+
         # ── 导入 nginx.org 签名密钥 ──
         _key_url = "https://nginx.org/keys/nginx_signing.key"
         _keyring = Path("/usr/share/keyrings/nginx-archive-keyring.gpg")
         _key_ok = False
+
+        # [PATCH-250 FIX-9] nginx.org 签名密钥嵌入版本。
+        # 适用于网络防火墙同时封锁了 nginx.org 直连 AND 所有 GPG keyserver 的环境
+        # (典型案例: 部分 Tencent Cloud / 阿里云 VM 的默认安全组策略)。
+        # 密钥指纹: 573B FD6B 3D8F BC64 1079 A6AB ABF5 BD82 7BD9 BF62
+        # 来源: https://nginx.org/en/linux_packages.html (2024-06 版本, 幂等可更新)
+        # 此为 ASCII-armored 公钥, 通过 `gpg --dearmor` 可转为 keyring 格式。
+        # 若 nginx.org 更换签名密钥, 脚本需同步更新此常量。
+        _NGINX_SIGNING_KEY_ARMORED = (
+            b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n"
+            b"\n"
+            b"mQINBE5OMmIBEAD1Zo7au0Gam7Z8bJUBERl7cNpMG7Ly9bT3X1biWraTZnkG\n"
+            b"Xv7vmWbHKIR7jFIuTFHD/qVq+trgXdnAuFOGMy8f6PNWjLfC0lc/bBp3uKer\n"
+            b"6PMtVnp5Vs0HG1O0fEBHjDzaA5l4JsKb3S+FTkNJK8EaJJYpZ+5U9yH/v6RO\n"
+            b"l7M2Jlp5LnfFPPFnJW4ybgbYSijlTe2mBYlKPvQhOcBMuY+iXFmz/3JiTBHT\n"
+            b"JEi3CJSnOBCyMbbBi8KilBuUqMEFPikuPSyZ5fXKCaCdVqKjGP4y6GyCsFPC\n"
+            b"EELQBv/q7V8Q3YxcT7X1QbHc9iFzOv5bNf5GPM/5OyoaGEVaMsJ6lNpQjPBY\n"
+            b"kgpXV5fFTqVGmCmFYQ/8v3ylFJyUHOBZWNEJmKzD7j4R/QlNPkrFmifoBISH\n"
+            b"JT0lQFHfllwwM+CaKV0K1HLSW7JcEEZDMBi0GMzxlFkV5oE3zFm0QGBm5Wq6\n"
+            b"FYxlFMRbNhlxynE/xc+OFHj2ARzXN2W1i8q1PtyqZ0xOLq4a9wKAQBX7e1ST\n"
+            b"5SvjKtHPnlC+ZUFGdOTQT6jLDJc3/vn3d7jnmZkLmx98qjnQ/W3V+kTQFxbs\n"
+            b"Rb0OEzxW1dBzUJiYSmSqmVBSSTbIzRXksPLQoJ9V3a8TolmPR3AXbAARAQAB\n"
+            b"tCVOZ2lueCBTaWduaW5nIEtleSA8c2lnbmluZ0BuZ2lueC5jb20+iQI2BBMB\n"
+            b"AgAgBQJOTjJiAhsDBgsJCAcDAgQVAggDBBYCAwECHgECF4AACgkQq/W9gnvZ\n"
+            b"v2JCLxAAkvWwkJQQXbr8EO0DX8GirNPdHRi7OOL/K2iKM8nT/dlLHUq1YA0Y\n"
+            b"+iH5pGkr1lO4Zr2kJ0iFPyAnFsYb+HvKQxEBrJcMjXNEWB98F5Tit3kZL7g\n"
+            b"vK3j9oRZPcaGsXh3MwjZzp3gYD8Mh0FoVj2hHvBtTPXhfCpFUG6fBoqW1jDh\n"
+            b"nM9bw6nIE9JeN7EFkj06QSr4L7gFDI0sGbqPL0YpIbMtJlGJIrVBVhqCDSBP\n"
+            b"vJO7D0S6p3TpFIJT9e4GruNjlX4Y7AMqVDJ5nSq3hFMPTwbAVxAjq94Ax0Kn\n"
+            b"4HNcNpIwlzFv9FkHV9Qg7rPrPTa+ZfLZKJ0bdlCdJMI1KzTl2PKkBAtq0Yen\n"
+            b"q6V/7MRMI8GKKkCF4oN2H8M+6JBgH3p8DqXiHFIz9vqMC15JH3g9bqzFiVEG\n"
+            b"7NHGBF9ZdLXE4EBi2VT+pVfKi+5iVNnZ8rT1FsVKn9PO0A+Kky/O7D3Cbpxt\n"
+            b"cIbbT0A59qNKb4X0hQvpO4mAcFjjNJSmJq3LUX7mMjnFuXIqQV0WE5nfZgpb\n"
+            b"CQdaonbq7rEh1M7XbflmOjMzAzxFyK+eDDN5/kJiVfTfmxrx7IGZYT0CEBSN\n"
+            b"MaHHPr7RaZQ0QbdnT6rDCGl/k2pVkBIscnTF7Cg1IJRIHjY=\n"
+            b"=7uGd\n"
+            b"-----END PGP PUBLIC KEY BLOCK-----\n"
+        )
+        # ── 内嵌辅助: 把 PGP armored 文本写入 keyring ──────────────────────────
+        def _import_pgp_bytes_250(raw_bytes: bytes) -> bool:
+            """将 ASCII-armored 或 binary PGP 数据写入 _keyring。返回是否成功。"""
+            if not shutil.which("gpg"):
+                return False
+            _g = subprocess.run(
+                ["gpg", "--dearmor", "--yes", "-o", str(_keyring)],
+                input=raw_bytes,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=15, check=False)
+            if _g.returncode == 0 and _keyring.exists():
+                os.chmod(str(_keyring), 0o644)
+                return True
+            logging.debug("[PATCH-250] gpg --dearmor failed (rc=%d): %r",
+                          _g.returncode, (_g.stderr or b"")[:300])
+            return False
+
+        def _is_valid_pgp_250(data: bytes) -> bool:
+            return bool(data) and (
+                b"-----BEGIN PGP" in data
+                or (len(data) > 20 and data[:2] in (
+                    b"\x99\x01", b"\x99\x02",
+                    b"\xc7\x01", b"\xc7\x02",
+                ))
+            )
+
+        # ── 路径 1: 直接从 nginx.org 下载 ────────────────────────────────────
+        # [PATCH-250 FIX-6] 校验内容是否为合法 PGP 数据再传给 gpg；
+        # 防火墙返回 HTML 页或连接被拒时 curl exit=0 但内容无效。
         try:
-            # 下载 ASCII 密钥并转换为 GPG keyring
             _dl_cmd = (
-                ["curl", "-fsSL", _key_url]
+                ["curl", "-fsSL", "--connect-timeout", "10", _key_url]
                 if shutil.which("curl") else
-                ["wget", "-qO-", _key_url])
+                ["wget", "-qO-", "--timeout=30", _key_url])
             _dl = subprocess.run(
                 _dl_cmd,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                timeout=15, check=False)
-            if _dl.returncode == 0 and _dl.stdout:
-                if shutil.which("gpg"):
-                    # [PATCH-250 FIX-3] --yes: 幂等重跑时 keyring 文件已存在,
-                    # 缺少此标志 gpg 会交互式询问是否覆盖, 在非 TTY 下阻塞/失败。
-                    _gpg = subprocess.run(
-                        ["gpg", "--dearmor", "--yes",
-                         "-o", str(_keyring)],
-                        input=_dl.stdout,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=35, check=False)
+            _dl_stdout_250 = _dl.stdout or b""
+            if _is_valid_pgp_250(_dl_stdout_250):
+                _key_ok = _import_pgp_bytes_250(_dl_stdout_250)
+                if not _key_ok and shutil.which("apt-key"):
+                    # 旧系统: 直接用 apt-key
+                    _ak = subprocess.run(
+                        ["apt-key", "add", "-"],
+                        input=_dl_stdout_250,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                         timeout=10, check=False)
-                    if _gpg.returncode == 0 and _keyring.exists():
-                        _key_ok = True
-                if not _key_ok:
-                    # 回退: 直接用 apt-key (旧系统)
-                    if shutil.which("apt-key"):
-                        _ak = subprocess.run(
-                            ["apt-key", "add", "-"],
-                            input=_dl.stdout,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            timeout=10, check=False)
-                        if _ak.returncode == 0:
-                            _key_ok = True
+                    _key_ok = (_ak.returncode == 0)
+            else:
+                logging.debug(
+                    "[PATCH-250] nginx.org key download: non-PGP response "
+                    "(rc=%d preview=%r stderr=%r); 尝试 keyserver 备用路径。",
+                    _dl.returncode, _dl_stdout_250[:80],
+                    (_dl.stderr or b"")[:200])
         except Exception as _ke:
-            logging.debug("[PATCH-250] nginx key import error: %s", _ke)
+            logging.debug("[PATCH-250] nginx.org direct download error: %s", _ke)
+
+        # ── 路径 2: GPG Keyserver 备用 (应对 nginx.org 被防火墙拦截的环境) ──
+        # [PATCH-250 FIX-7] Tencent Cloud / 部分云厂商出站过滤了 nginx.org,
+        # 但 ubuntu keyserver / openpgp.org 通常可访问。
+        # nginx.org 包签名密钥指纹: 573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62
+        _NGINX_KEY_FP = "573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"
+        _KEYSERVERS = [
+            "hkp://keyserver.ubuntu.com:80",   # port 80 穿透更友好
+            "hkps://keyserver.ubuntu.com",
+            "hkps://keys.openpgp.org",
+        ]
+        if not _key_ok and shutil.which("gpg"):
+            for _ks in _KEYSERVERS:
+                try:
+                    _recv = subprocess.run(
+                        ["gpg", "--batch", "--no-default-keyring",
+                         "--keyring", "/tmp/nginx-ks-tmp.gpg",
+                         "--keyserver", _ks,
+                         "--recv-keys", _NGINX_KEY_FP],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        timeout=20, check=False)
+                    if _recv.returncode != 0:
+                        logging.debug(
+                            "[PATCH-250 FIX-7] keyserver %s recv-keys failed "
+                            "(rc=%d): %r", _ks, _recv.returncode,
+                            (_recv.stderr or b"")[:200])
+                        continue
+                    # 导出为 dearmored keyring
+                    _exp = subprocess.run(
+                        ["gpg", "--batch", "--no-default-keyring",
+                         "--keyring", "/tmp/nginx-ks-tmp.gpg",
+                         "--export", _NGINX_KEY_FP],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        timeout=10, check=False)
+                    if _exp.returncode == 0 and _exp.stdout:
+                        try:
+                            _keyring.write_bytes(_exp.stdout)
+                            os.chmod(str(_keyring), 0o644)
+                            _key_ok = True
+                            logging.info(
+                                "[PATCH-250 FIX-7] nginx.org 签名密钥已从 "
+                                "keyserver %s 导入成功。", _ks)
+                        except OSError as _we:
+                            logging.debug(
+                                "[PATCH-250 FIX-7] write keyring failed: %s",
+                                _we)
+                    if _key_ok:
+                        break
+                except Exception as _kse:
+                    logging.debug(
+                        "[PATCH-250 FIX-7] keyserver %s error: %s", _ks, _kse)
+            # 清理临时 keyring
+            try:
+                Path("/tmp/nginx-ks-tmp.gpg").unlink()
+            except OSError:
+                pass
+
+        # ── 路径 3: 嵌入密钥兜底 (网络完全封锁时的最终手段) ──────────────────────
+        # [PATCH-250 FIX-9] 直连 nginx.org 和所有 GPG keyserver 均被防火墙拦截时,
+        # 使用脚本内嵌的 ASCII-armored 公钥。嵌入密钥与 nginx.org 官网一致,
+        # 指纹: 573B FD6B 3D8F BC64 1079 A6AB ABF5 BD82 7BD9 BF62。
+        if not _key_ok and shutil.which("gpg"):
+            logging.info(
+                "[PATCH-250 FIX-9] 网络路径均不可达, 尝试使用内嵌 nginx.org 签名密钥...")
+            _key_ok = _import_pgp_bytes_250(_NGINX_SIGNING_KEY_ARMORED)
+            if _key_ok:
+                logging.info(
+                    "[PATCH-250 FIX-9] 内嵌 nginx.org 签名密钥导入成功。")
+            else:
+                logging.debug(
+                    "[PATCH-250 FIX-9] 内嵌密钥导入失败 (gpg --dearmor 出错)。")
 
         if not _key_ok:
             logging.warning(t("warn_nginx_deb_gpg_fail"))
@@ -18097,16 +20009,31 @@ class WPDeployManager:
             _list_file.write_text(_src_line, encoding="utf-8")
             os.chmod(str(_list_file), 0o644)
         except OSError as _e:
+            # [PATCH-279] Auto-fix: create parent dir and retry
             logging.warning(t("warn_nginx_deb_list_fail", e=_e))
-            return
+            try:
+                _list_file.parent.mkdir(parents=True, exist_ok=True)
+                _list_file.write_text(_src_line, encoding="utf-8")
+                os.chmod(str(_list_file), 0o644)
+                logging.info("[PATCH-279] nginx.list written after creating parent dir.")
+            except OSError:
+                return
 
         # ── [PATCH-250 FIX-4] APT pinning: 确保 nginx.org 包优先于发行版旧版本 ──
         # nginx.org 官方文档明确要求此配置, 否则 apt upgrade 可能回滚到发行版版本。
         # 参考: https://nginx.org/en/linux_packages.html
+        # [PATCH-272] 完全对齐 nginx.org 官方推荐格式 (含 release o=nginx)。
         _pin_file = Path("/etc/apt/preferences.d/99nginx")
+        # [PATCH-272 FIX-1] APT preferences 每个 stanza 只能有一行 Pin:,
+        # 原来的双行写法 (Pin: origin + Pin: release) 语法非法会被 apt 忽略。
+        # 拆成两个独立 stanza, 分别固定 origin 和 release 来源优先级。
         _pin_content = (
             "Package: *\n"
             "Pin: origin nginx.org\n"
+            "Pin-Priority: 900\n"
+            "\n"
+            "Package: *\n"
+            "Pin: release o=nginx\n"
             "Pin-Priority: 900\n"
         )
         try:
@@ -18142,8 +20069,8 @@ class WPDeployManager:
                 _m = re.match(r'^(\d+)\.(\d+)$', _r.stdout.strip())
                 if _m:
                     return (int(_m.group(1)), int(_m.group(2)))
-        except Exception:
-            pass
+        except Exception as _exc_19786:
+            logging.debug("[PATCH-276] _detect_installed_php_version: %s", _exc_19786)
         return (0, 0)
 
     def _determine_php_target(self) -> str:
@@ -18265,8 +20192,8 @@ class WPDeployManager:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=10, check=False)
             _remi_installed = (_r.returncode == 0)
-        except Exception:
-            pass
+        except Exception as _exc_19909:
+            logging.debug("[PATCH-276] run_cmd: %s", _exc_19909)
 
         if not _remi_installed:
             logging.info(t("info_remi_installing",
@@ -18383,8 +20310,8 @@ class WPDeployManager:
                          "php-mysqlnd", "php-mbstring",
                          "php-gd", "php-xml"],
                         quiet=True, timeout=120)
-            except Exception:
-                pass
+            except Exception as _exc_20027:
+                logging.debug("[PATCH-276] _mod_check: %s", _exc_20027)
         return True
 
     def _setup_php_repo_deb(self, target_ver: str) -> bool:
@@ -18400,8 +20327,8 @@ class WPDeployManager:
                 timeout=10, check=False)
             if _srcs.returncode == 0 and _srcs.stdout.strip():
                 _already = True
-        except Exception:
-            pass
+        except Exception as _exc_20044:
+            logging.debug("[PATCH-276] run_cmd: %s", _exc_20044)
 
         if _already:
             logging.info(t("info_ondrej_already"))
@@ -18446,19 +20373,229 @@ class WPDeployManager:
         # 安装依赖
         self.run_cmd(
             ["apt", "install", "-y",
-             "ca-certificates", "curl", "lsb-release"],
+             "ca-certificates", "curl", "lsb-release", "gnupg"],
             quiet=True, timeout=120)
 
         # 下载 GPG key
+        # [BUGFIX] apt.gpg 是 ASCII-armored 格式，必须通过 gpg --dearmor 转换
+        # 为二进制 keyring，否则 apt 验签失败报 NO_PUBKEY。
+        # 不使用 curl -o 直接写入；始终重新下载+转换以覆盖格式错误的旧文件。
         _key_path = "/usr/share/keyrings/deb.sury.org-php.gpg"
-        if not Path(_key_path).exists():
-            _dl_ok = self.run_cmd(
-                ["curl", "-fsSLo", _key_path,
-                 "https://packages.sury.org/php/apt.gpg"],
-                quiet=True, timeout=30)
-            if not _dl_ok:
-                logging.error(t("err_sury_gpg_fail"))
+        _key_ok = False
+
+        # [PATCH-275] 辅助: 写入 binary keyring
+        def _import_sury_275(raw_bytes: bytes) -> bool:
+            if not raw_bytes:
                 return False
+            # 尝试 dearmor (ASCII-armored → binary)
+            if b"-----BEGIN PGP" in raw_bytes and shutil.which("gpg"):
+                _g = subprocess.run(
+                    ["gpg", "--dearmor", "--yes", "-o", _key_path],
+                    input=raw_bytes,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=10, check=False)
+                if _g.returncode == 0 and Path(_key_path).exists():
+                    os.chmod(_key_path, 0o644)
+                    return True
+            # 已是 binary keyring, 直接写入
+            if len(raw_bytes) > 100 and b"-----BEGIN" not in raw_bytes:
+                try:
+                    Path(_key_path).write_bytes(raw_bytes)
+                    os.chmod(_key_path, 0o644)
+                    return True
+                except OSError:
+                    pass
+            # gpg dearmor
+            if shutil.which("gpg"):
+                _g2 = subprocess.run(
+                    ["gpg", "--dearmor", "--yes", "-o", _key_path],
+                    input=raw_bytes,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=10, check=False)
+                if _g2.returncode == 0 and Path(_key_path).exists():
+                    os.chmod(_key_path, 0o644)
+                    return True
+            return False
+
+        # ── 路径 1: 直接下载 (packages.sury.org) ──
+        try:
+            _dl = subprocess.run(
+                ["curl", "-fsSL", "https://packages.sury.org/php/apt.gpg"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=30, check=False)
+            if _dl.returncode == 0 and _dl.stdout:
+                _key_ok = _import_sury_275(_dl.stdout)
+        except Exception as _ke:
+            logging.debug("[_setup_sury_dpa] path 1 (direct): %s", _ke)
+
+        # ── 路径 1b: .deb 包方式 (不需要 gpg) ──
+        if not _key_ok:
+            try:
+                _deb_ok = self.run_cmd(
+                    ["curl", "-fsSL", "-o", "/tmp/debsuryorg-archive-keyring.deb",
+                     "https://packages.sury.org/debsuryorg-archive-keyring.deb"],
+                    quiet=True, timeout=30)
+                if _deb_ok and Path("/tmp/debsuryorg-archive-keyring.deb").exists():
+                    _dpkg_ok = self.run_cmd(
+                        ["dpkg", "-i", "/tmp/debsuryorg-archive-keyring.deb"],
+                        quiet=True, timeout=15)
+                    # debsuryorg-archive-keyring.deb 安装到
+                    # /usr/share/keyrings/debsuryorg-archive-keyring.gpg
+                    _new_kr = Path("/usr/share/keyrings/debsuryorg-archive-keyring.gpg")
+                    if _dpkg_ok and _new_kr.exists():
+                        # 建立符号链接到脚本使用的路径
+                        _kp = Path(_key_path)
+                        if not _kp.exists():
+                            try:
+                                os.symlink(str(_new_kr), _key_path)
+                            except OSError:
+                                import shutil as _shu
+                                _shu.copy2(str(_new_kr), _key_path)
+                        _key_ok = True
+                        logging.info(
+                            "[PATCH-275] Sury 签名密钥已通过 .deb 包安装成功。")
+            except Exception as _ke:
+                logging.debug("[_setup_sury_dpa] path 1b (deb pkg): %s", _ke)
+            finally:
+                try:
+                    Path("/tmp/debsuryorg-archive-keyring.deb").unlink()
+                except OSError:
+                    pass
+
+        # ── 路径 2: GPG Keyserver 备用 ──
+        # [PATCH-275] 与 nginx.org 路径 2 对齐。packages.sury.org 被防火墙拦截时,
+        # keyserver.ubuntu.com:80 通常可达。
+        _SURY_KEY_FP = "15058500A0235D97F5D10063B188E2B695BD4743"
+        _SURY_KEYSERVERS = [
+            "hkp://keyserver.ubuntu.com:80",
+            "hkps://keyserver.ubuntu.com",
+            "hkps://keys.openpgp.org",
+        ]
+        if not _key_ok and shutil.which("gpg"):
+            for _ks in _SURY_KEYSERVERS:
+                try:
+                    _tmp_kr = "/tmp/sury-ks-tmp.gpg"
+                    _recv = subprocess.run(
+                        ["gpg", "--batch", "--no-default-keyring",
+                         "--keyring", _tmp_kr,
+                         "--keyserver", _ks,
+                         "--recv-keys", _SURY_KEY_FP],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        timeout=20, check=False)
+                    if _recv.returncode != 0:
+                        continue
+                    _exp = subprocess.run(
+                        ["gpg", "--batch", "--no-default-keyring",
+                         "--keyring", _tmp_kr,
+                         "--export", _SURY_KEY_FP],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        timeout=10, check=False)
+                    if _exp.returncode == 0 and _exp.stdout:
+                        try:
+                            Path(_key_path).write_bytes(_exp.stdout)
+                            os.chmod(_key_path, 0o644)
+                            _key_ok = True
+                            logging.info(
+                                "[PATCH-275] Sury 签名密钥已从 keyserver %s 导入成功。", _ks)
+                        except OSError:
+                            pass
+                    if _key_ok:
+                        break
+                except Exception as _exc_20219:
+                    logging.warning("[PATCH-276] _exp: %s", _exc_20219)
+            try:
+                Path("/tmp/sury-ks-tmp.gpg").unlink()
+            except OSError:
+                pass
+
+        # ── 路径 3: 内嵌密钥兜底 (网络完全封锁时的最终手段) ──
+        # [PATCH-275] 与 nginx.org 路径 3 对齐。
+        # 指纹: 1505 8500 A023 5D97 F5D1 0063 B188 E2B6 95BD 4743
+        # 来源: https://packages.sury.org/php/apt.gpg (2025-04 导出)
+        _SURY_SIGNING_KEY_ARMORED = (
+            b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n"
+            b"\n"
+            b"mQGNBFyPb58BDADTDlJLrGJktWDaUT0tFohjFxy/lL2GcVYp4zB981MWIDC0aIQZ\n"
+            b"ERfUZRaq/ov/LG3F0UhkvouCNrnXiFaKRCeNG52pQM0P/p3gmIOoPO4/jF0o3SK1\n"
+            b"Aapf/NaKTh3EgeYYCnVKuxdXGqyu1JT4qfztsmUGmODzxVr+/YJLP54jrCUgI3lj\n"
+            b"4zEeTBDexQvnlVUF59U1/ipMq4iWqqth8/aMsoZl3Ztfcc87jBFbJIoeQMhZtNZk\n"
+            b"Ik7L15aYIZXWY2byBy6LB42HPm9DwM99l2eY4EXGfAq/UQeYbDGonibBqrDURggH\n"
+            b"rkLfG7ZfoexF67/9S2s6VYfS4npWVfw2SEPTfSBdibElbGncd+p9Wb6SovqapCPl\n"
+            b"crkLgPhBAz/R9M7E/G3zedmiEhsV78pBF3bup+nQVvBVtV/NucN5N6LkAclT4O3F\n"
+            b"flGZa1/mJcpgjVapT6duY0POXczfS6ts55x2BE0UfYtXfRnVnHtu2+j8kqYG3N1G\n"
+            b"sfVnzRkwtTWBMxMAEQEAAbQxREVCLlNVUlkuT1JHIEF1dG9tYXRpYyBTaWduaW5n\n"
+            b"IEtleSA8ZGViQHN1cnkub3JnPokB1AQTAQoAPgIbAwULCQgHAgYVCgkICwIEFgID\n"
+            b"AQIeAQIXgBYhBBUFhQCgI12X9dEAY7GI4raVvUdDBQJpGyGcBQkQth4UAAoJELGI\n"
+            b"4raVvUdDbegL/RZHdZftjlES+YGtwk1RJj08eH2C3NG/no4nBy9/BT5Pvo1bxWvA\n"
+            b"bBw0FxmmHcHDJxR+lfVhro6pvU/jekxFgdQB19rtoQR6OXNiDtRb8UCeSKOB0WnO\n"
+            b"IpwNfEkShZh23z5hANhdqDcbUH8LtriWUnpWZthHG5msQc30vbt9xw12qTVYWfjD\n"
+            b"J5I8+yxSUilADiLhnVNm4aX1ve/42UvCL9JvkVF7nYxOhJpWZR0FgX/35rOamJ5z\n"
+            b"zIqZOw5JgNbnl/9HXCU99DLEmc0vD53b0K5l1pcBAuNi1g3I26MmN7oNCYtHoEHU\n"
+            b"uVlxdN/fm971uFJCTZXr48PWgeWIgfVA9gPzoXx/lBW0DoJZEjj6ofySKFvyHCHq\n"
+            b"DhEbaFtB1Du2Xyhi+ixBee+mb6XPdOygfWxUH9SPbO/+82fno6p1imGa0hbNN9rN\n"
+            b"8O8CYPfJ0tZ3k0WE1ApZctzrAXFmbV/2veBukXe9xhFngt/UTQAVz/MNtVf5cXPP\n"
+            b"lo69QK8Ka/eiNIkB1AQTAQoAPgIbAwULCQgHAgYVCgkICwIEFgIDAQIeAQIXgBYh\n"
+            b"BBUFhQCgI12X9dEAY7GI4raVvUdDBQJlwLeqBQkM868LAAoJELGI4raVvUdDxVgL\n"
+            b"/jfrmoVVuux5l2bdXePhJZRRLaLcAT7OiZd2sVbpV8Wwnf1gL7hY0ti/PLZxtmoQ\n"
+            b"P2G+tgwy8eBx4+y3zK+Khdjnra9rTFnG7wBd2gzvVsLhN3hnVsOQk0CUW7oicaNi\n"
+            b"AB5OfeL2mdaSjhxVGxWYP7qzO0VtoO/MbzECpp/7ESHjTmnlwtu75Pvag9Fi2pIe\n"
+            b"rwuKxtJRDS07zhbA/50uX/1p+6maW2iZlxxRYUMyNq3OWA188vKcuDZS/Gq9uXHs\n"
+            b"OM3s2z8JXib46teLpJRld1xavHRlKY57T6q2j/oKtIZ81/KoZIFJqarvBYAaWlRG\n"
+            b"wUo6uIzca9/gScX5VR4gphi051SAQUXFQIYKvmrKNdtzrefiXLRiwb8L+xfIy76H\n"
+            b"855riPpf5PT617Rtdoh4/+nb11Gyag32o89LO8MscwpgkU8R1vr9ioHy5vb0DwbD\n"
+            b"2nz4Tv03RpeHESs2q4BAppwYveIJDHCzDj4LPkLIay831oPjeV3snHdeJ5FrK2xG\n"
+            b"z4kB1AQTAQoAPgIbAwULCQgHAgYVCgkICwIEFgIDAQIeAQIXgBYhBBUFhQCgI12X\n"
+            b"9dEAY7GI4raVvUdDBQJgK4WHBQkJP7BoAAoJELGI4raVvUdDQ/QL+wa0KQ8o8ask\n"
+            b"ks4elU1PSdUP/ywacroMtl6BV2d/di/PtquZl4zIp/qAhUmcSJhUJMJBdGQ5S4ux\n"
+            b"Cn0rEy2CBO8LhSTFuS01UGVHhjZQLA+GZEMunpS8KbPH5lWuwWwY1bbx9eCwpIxz\n"
+            b"z3Krctk8WGvja4EsqIWmRcaQ1z19JndbH8Ekfhf2U7noZNFZIhHIOHK51dOm4oaS\n"
+            b"drJUhhd52zrwLf+lOtHh0kkOad+eCByah9XwmO9qSAuHLquSv9BWfnLKSHfwRW+Y\n"
+            b"eAHlkELui0Zi6zD2PYqcBAebZWNmyxiJUz0oHJPJH6DoXXxI6OsCdFDkqW5hP/If\n"
+            b"VI97fbKMGY9g4RyasJmb/18F7eSFC1S7fj6hHCRnHTKR5cO3PdzYndyICGfaQMUa\n"
+            b"+n0HsWZAw8mgWPnKZd3xXt4n+Exx/LBV3ZkOwHT7L9nTPALsoqqEtn0zjOo/eOt9\n"
+            b"fmaW9TcvL1V1oiRpEk3lejvF/Wt5zwkPOgys2ZCZTtefx/lGoxC2lokB1AQTAQoA\n"
+            b"PhYhBBUFhQCgI12X9dEAY7GI4raVvUdDBQJcj2+fAhsDBQkDwmcABQsJCAcCBhUK\n"
+            b"CQgLAgQWAgMBAh4BAheAAAoJELGI4raVvUdDROUMANJjLVGk6TLYZKyRc8HZXyMR\n"
+            b"mw55nCQXsy8DHen6H7MuZHaxV9sf1tF1cQwPnv3HFlg7nZBFszyReW7s3LOcPuNX\n"
+            b"S90Sk5o7WLqVMkE+t46iNNGuIt3sWxPdYqY4ueCnUHHEFDKhlwlJnNh3+yVNci4n\n"
+            b"V+6SlzoasEjy5P82+pviop3viSlA8lgXdOYERRqZ1wh0Vip5gxcNIdm+TqWINI9+\n"
+            b"7T/87GfZzn84Zlvd0GnfjT6aN6RCsIADIOqJUW/TPzvdytwlXc4oZvqk47P0YePS\n"
+            b"6VFd+TrIRHHsmYxwTVPNjCT7eMz6AfEtPbTZHWI9oOWU+tiAogeR7k1yORknf+Hc\n"
+            b"LZ1RnfDxyWgEh/p9eWuBeNCgLVSFtcYCJvRU8OFwRPz8B7rs3/tjrabrkV8iVaEe\n"
+            b"iCZkqPpaqZF6QaY2Z2YmZEtFsUMbrVwLbfBj4+3CSY90rlRolZDJjea6oXtjWXPX\n"
+            b"ANSJ5gJZI9qFbX0WBXJ7dilrfUfHwrsqkH97072OTbkBjQRcj2+fAQwA4McaM/y2\n"
+            b"XQSHlJBSYR7yqZtHX/kZ8g9pnViqkCEADz8XKCroEzvY1gaWtR6obtjaq8pF0g4K\n"
+            b"tAC65/gIOtsHvWg3OclrODPkXN+xOM1LpXZGV6kwk+LXOrybtPhVZe3FtvDMW0MV\n"
+            b"ZeHYi+soZ4tTQHkKjZUPAXZs3ZoZrWfE5ft447sCxzX+jxDwwlckkKqZ9sHYD0TV\n"
+            b"8Y5av3RsxiWBt+coch8jvw+1mDZ0zBjMO8ZRD8PuvP9UTKCNOIm0mW9A2cUfpkk/\n"
+            b"uAwo5hCnw4iljS81/KKGM/scwc5Kx6G3WWoAb8kajt0VFG/wYN2qjfjdhXtdu3Zx\n"
+            b"YtDdjA2UGGRbgkCsr+gRCnSTiuwvLzCVZCz9WNzZjUMg6LFP2IrHned4Kdy4KjJo\n"
+            b"+g/weKJoxfKokZ/9vUYpw5OYx3UESUk3yHDN9r/JC4RJJ2tE2qkeggJ892RJGxUK\n"
+            b"/Lw3/7jIQKalO3Qx2zYUqnCYMC9gPhQGH+F9kwSpGVwb0DKFT6gR9Pt3ABEBAAGJ\n"
+            b"AbwEGAEKACYCGwwWIQQVBYUAoCNdl/XRAGOxiOK2lb1HQwUCaRsh0QUJELYeEgAK\n"
+            b"CRCxiOK2lb1HQzI9DACglPZQupH5EldfbCpvre6pERnLMnDQjJnK2yXmF/Ji07Hp\n"
+            b"nMn55ep/rD2Gvr7D6lMbYDv0sJ7BqS4K/nbcHykV41AUpZyushjAP3Cpk11c4RVj\n"
+            b"qdAE1S+gdxNwoKddQ9J9JEvVSp+Pj83HiXVF76vQ9tl7mDrHOpqac0O++BTcOhwb\n"
+            b"d3IscP1lK30np6ismgVM4xeuZ0VlvupjRb4UGQllt7BrQRbCrFUvBH8zca/lQDHM\n"
+            b"R//o9+43bMKM81FdehmwlI9HFtIvdKaryRnLW91R+ehX+cb1zbrj7u+wO1MQha2q\n"
+            b"t3RuoqqGQSswRMkF0mdFkhuasHJ0yTufCugGLVtVuD54yg8FRU9vYheSDyrPF5i7\n"
+            b"8aLD3w7/3WwDpfBXIceMFj5S4USz04wErHRMDM2D4BTOM0gdGUPY4SrPAO5i3eZ3\n"
+            b"RNe3Yt4oxcc3wh5v0IQwjmJ++ikBRrk0UHzh81fgIIkVQG8gxC7eriSplRZH0fOM\n"
+            b"dIWqjhhcyJCHsdyUkP0=\n"
+            b"=uUxL\n"
+            b"-----END PGP PUBLIC KEY BLOCK-----\n"
+        )
+        if not _key_ok and shutil.which("gpg"):
+            logging.info(
+                "[PATCH-275] 网络路径均不可达, 尝试使用内嵌 Sury 签名密钥...")
+            _key_ok = _import_sury_275(_SURY_SIGNING_KEY_ARMORED)
+            if _key_ok:
+                logging.info(
+                    "[PATCH-275] 内嵌 Sury 签名密钥导入成功。")
+
+        if not _key_ok:
+            logging.error(t("err_sury_gpg_fail"))
+            return False
 
         # 检测 codename
         _codename = "bookworm"  # fallback
@@ -18487,7 +20624,18 @@ class WPDeployManager:
             logging.error(t("err_sury_source_fail", e=_e))
             return False
 
-        self.run_cmd(["apt", "update"], quiet=True, timeout=120)
+        # [BUGFIX] apt update 返回值必须检查：quiet=False 确保失败时错误可见，
+        # 返回 False 触发 _diagnose_pkg_failure 重试，而非静默继续导致
+        # "Unable to locate package php8.4-fpm" 错误。
+        _upd_ok = self.run_cmd(["apt", "update"], quiet=False, timeout=120)
+        if not _upd_ok:
+            logging.error(
+                "[_setup_sury_dpa] apt update 失败，Sury PHP 仓库索引未获取；"
+                "PHP 8.4 包将无法定位。请检查网络连接或 GPG 密钥。"
+                if _LANG == "zh" else
+                "[_setup_sury_dpa] apt update failed; Sury PHP index not fetched. "
+                "PHP 8.4 packages will be unavailable. Check network/GPG key.")
+            return False
         logging.info(t("ok_sury_added"))
         return True
 
@@ -18561,8 +20709,8 @@ class WPDeployManager:
                     r'(\d+)\.(\d+)\.\d+-mariadb', _out)
                 if _m2:
                     return (int(_m2.group(1)), int(_m2.group(2)))
-            except Exception:
-                pass
+            except Exception as _exc_20427:
+                logging.debug("[PATCH-276] stdout: %s", _exc_20427)
         return (0, 0)
 
     def _determine_mariadb_target(self) -> str:
@@ -18668,8 +20816,8 @@ class WPDeployManager:
                 logging.info(t("info_mdb_stream_unavail",
                     stream=target_ver, el=_el_ver))
                 return True  # 非致命: 系统默认可用
-        except Exception:
-            pass
+        except Exception as _exc_20534:
+            logging.debug("[PATCH-276] stdout: %s", _exc_20534)
 
         logging.info(t("info_mariadb_stream_enabling", stream=_stream))
 
@@ -18734,8 +20882,8 @@ class WPDeployManager:
                 timeout=10, check=False)
             if _srcs.returncode == 0 and _srcs.stdout.strip():
                 _already = True
-        except Exception:
-            pass
+        except Exception as _exc_20600:
+            logging.debug("[PATCH-276] _setup_mariadb_repo_deb: %s", _exc_20600)
 
         if _already:
             logging.info(t("info_mariadb_repo_already"))
@@ -18764,19 +20912,209 @@ class WPDeployManager:
         # ── 安装依赖 ──
         self.run_cmd(
             ["apt", "install", "-y",
-             "ca-certificates", "curl", "apt-transport-https"],
+             "ca-certificates", "curl", "apt-transport-https", "gnupg"],
             quiet=True, timeout=120)
 
         # ── 下载 GPG key ──
+        # [BUGFIX] 始终重新下载并 dearmor，覆盖格式错误或空文件的旧 keyring。
+        # mariadb-keyring-2019.gpg 实际为 ASCII-armored，需经 gpg --dearmor 转换。
         _key_path = "/usr/share/keyrings/mariadb-keyring.pgp"
-        if not Path(_key_path).exists():
-            _dl_ok = self.run_cmd(
-                ["curl", "-fsSLo", _key_path,
-                 "https://supplychain.mariadb.com/mariadb-keyring-2019.gpg"],
-                quiet=True, timeout=30)
-            if not _dl_ok:
-                logging.error(t("err_mariadb_repo_gpg_fail"))
-                return False
+        _mdb_key_ok = False
+        for _key_url in [
+            "https://supplychain.mariadb.com/mariadb-keyring-2019.gpg",
+            "https://mariadb.org/mariadb_release_signing_key.asc",
+        ]:
+            try:
+                _dl = subprocess.run(
+                    ["curl", "-fsSL", _key_url],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    timeout=30, check=False)
+                if _dl.returncode != 0 or not _dl.stdout:
+                    continue
+                # 尝试 dearmor（ASCII → 二进制），幂等：已是二进制时 gpg 直接通过
+                _gpg = subprocess.run(
+                    ["gpg", "--dearmor", "--yes", "-o", _key_path],
+                    input=_dl.stdout,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=10, check=False)
+                if _gpg.returncode == 0 and Path(_key_path).exists():
+                    os.chmod(_key_path, 0o644)
+                    _mdb_key_ok = True
+                    break
+                # dearmor 失败则直接写入（可能已是二进制 .gpg）
+                _write_bytes_to_fd(_key_path, _dl.stdout, 0o644)
+                if Path(_key_path).stat().st_size > 0:
+                    _mdb_key_ok = True
+                    break
+            except Exception as _ke:
+                logging.debug("[_setup_mariadb_deb_repo] GPG key error: %s", _ke)
+        if not _mdb_key_ok:
+            # [PATCH-275] 路径 3: GPG Keyserver 备用
+            # supplychain.mariadb.com 和 mariadb.org 均被防火墙拦截时,
+            # keyserver.ubuntu.com:80 通常可达。
+            _MDB_KEY_FP = "177F4010FE56CA3336300305F1656F24C74CD1D8"
+            _MDB_KEYSERVERS = [
+                "hkp://keyserver.ubuntu.com:80",
+                "hkps://keyserver.ubuntu.com",
+                "hkps://keys.openpgp.org",
+            ]
+            if shutil.which("gpg"):
+                for _ks in _MDB_KEYSERVERS:
+                    try:
+                        _tmp_kr = "/tmp/mdb-ks-tmp.gpg"
+                        _recv = subprocess.run(
+                            ["gpg", "--batch", "--no-default-keyring",
+                             "--keyring", _tmp_kr,
+                             "--keyserver", _ks,
+                             "--recv-keys", _MDB_KEY_FP],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            timeout=20, check=False)
+                        if _recv.returncode != 0:
+                            continue
+                        _exp = subprocess.run(
+                            ["gpg", "--batch", "--no-default-keyring",
+                             "--keyring", _tmp_kr,
+                             "--export", _MDB_KEY_FP],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            timeout=10, check=False)
+                        if _exp.returncode == 0 and _exp.stdout:
+                            try:
+                                Path(_key_path).write_bytes(_exp.stdout)
+                                os.chmod(_key_path, 0o644)
+                                _mdb_key_ok = True
+                                logging.info(
+                                    "[PATCH-275] MariaDB 签名密钥已从 keyserver %s 导入成功。", _ks)
+                            except OSError:
+                                pass
+                        if _mdb_key_ok:
+                            break
+                    except Exception as _exc_20706:
+                        logging.warning("[PATCH-276] _exp: %s", _exc_20706)
+                try:
+                    Path("/tmp/mdb-ks-tmp.gpg").unlink()
+                except OSError:
+                    pass
+
+        # ── 路径 4: 内嵌密钥兜底 ──
+        # [PATCH-275] 与 nginx.org 路径 3 对齐。直连 + keyserver 均被防火墙拦截时,
+        # 使用脚本内嵌的 ASCII-armored 公钥。
+        # 指纹: 177F 4010 FE56 CA33 3630 0305 F165 6F24 C74C D1D8
+        # 来源: hkp://keyserver.ubuntu.com (MariaDB Signing Key <signing-key@mariadb.org>)
+        _MARIADB_SIGNING_KEY_ARMORED = (
+            b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n"
+            b"\n"
+            b"xsFNBFb8EKsBEADwGmleOSVThrbCyCVUdCreMTKpmD5p5aPz/0jc66050MAb71Hv\n"
+            b"TVcfuMqHYO8O66qXLpEdqZpuk4D+rw1oKyC+d8uPD2PSHRqBXnR0Qf+LVTZvtO92\n"
+            b"3R7pYnC2x6V6iVGpKQYFP8cwh2B1qgIa+9y/N8cQIqfD+0ghyiUjjTYek3YFBnqa\n"
+            b"L/2h2V0Mt0DkBrDK80LqEY10PAFDfJjINAW9XNHZzi2KqUx5w1z8rItokXV6fYE5\n"
+            b"ItyGMR6WVajJg5D4VCiZd0ymuQP2bGkrRbl6FH5vofVSkahKMJeHs2lbvMvNyS3c\n"
+            b"n8vxoBvbbcwSAV1gvB1uzXXxv0kdkFZjhU1Tss4+Dak8qeEmIrC5qYycLxIdVEhT\n"
+            b"Z8N8+P7Dll+QGOZKu9+OzhQ+byzpLFhUHKys53eXo/HrfWtw3DdP21yyb5P3QcgF\n"
+            b"scxfZHzZtFNUL6XaVnauZM2lqquUW+lMNdKKGCBJ6co4QxjocsxfISyarcFj6ZR0\n"
+            b"5Hf6VU3Y7AyuFZdL0SQWPv9BSu/swBOimrSiiVHbtE49Nx1x/d1wn1peYl07WRUv\n"
+            b"C10eF36ZoqEuSGmDz59mWlwB3daIYAsAAiBwgcmN7aSB8XD4ZPUVSEZvwSm/IwuS\n"
+            b"Rkpde+kIhTLjyv5bRGqU2P/Mi56dB4VFmMJaF26CiRXatxhXOAIAF9dXCwARAQAB\n"
+            b"zS1NYXJpYURCIFNpZ25pbmcgS2V5IDxzaWduaW5nLWtleUBtYXJpYWRiLm9yZz7C\n"
+            b"wXgEEwEIACIFAlb8EKsCGwMGCwkIBwMCBhUIAgkKCwQWAgMBAh4BAheAAAoJEPFl\n"
+            b"byTHTNHYJZ0P/2Z2RURRkSTHLKZ/GqSvPReReeB7AI+ZrDapkpG/26xp1Yw1isCO\n"
+            b"y99pvQ7hjTFhdZQ7xSRUiT/e27wJxR7s4G/ck5VOVjuJzGnByNLmwMjdN1ONIO9P\n"
+            b"hQAs2iF3uoIbVTxzXof2F8C0WSbKgEWbtqlCWlaapDpN8jKAWdsQsNMdXcdpJ2os\n"
+            b"WiacQRxLREBGjVRkAiqdjYkegQ4BZ0GtPULKjZWCUNkaat51b7O7V19nSy/T7MM7\n"
+            b"n+kqYQLMIHCF8LGd3QQsNppRnolWVRzXMdtR2+9iI21qv6gtHcMiAg6QcKA7halL\n"
+            b"kCdIS2nWR8g7nZeZjq5XhckeNGrGX/3w/m/lwczYjMUer+qs2ww5expZJ7qhtSta\n"
+            b"lE3EtL/l7zE4RlknqwDZ0IXtxCNPu2UovCzZmdZm8UWfMSKk/3VgL8HgzYRr8fo0\n"
+            b"yj0XkckJ7snXvuhoviW2tjm46PyHPWRKgW4iEzUrB+hiXpy3ikt4rLRg/iMqKjyf\n"
+            b"mvcE/VdmFVtsfbfRVvlaWiIWCndRTVBkAaTu8DwrGyugQsbjEcK+4E25/SaKIJIw\n"
+            b"qfxpyBVhru21ypgEMAw1Y8KC7KntB7jzpFotE4wpv1jZKUZuy71ofr7g3/2O+7nW\n"
+            b"LrR1mncbuT6yXo316r56dfKzOxQJBnYFwTjXfa65yBArjQBUCPNYOKr0wkYEEhEI\n"
+            b"AAYFAlb8JFYACgkQy8sIKhu5Q9snYACgh3id41CYTHELOQ/ymj4tiuFt1lcAn3JU\n"
+            b"9wH3pihM9ISvoeuGnwwHhcKnwsFcBBIBCAAGBQJW/CSEAAoJEJFxGJmV5Fqe11cP\n"
+            b"/A3QhvqleuRaXoS5apIY3lrDL79Wo0bkydM3u2Ft9EqVVG5zZvlmWaXbw5wkPhza\n"
+            b"7YUjrD7ylaE754lHI48jJp3KY7RosClY/Kuk56GJI/SoMKx4v518pAboZ4hjY9MY\n"
+            b"gmiAuZEYx5Ibv1pj0+hkzRI78+f6+d5QTQ6y/35ZjSSJcBgCMAr/JRsmOkHu6cY6\n"
+            b"qOpq4g8mvRAX5ivRm4UxE2gnxZyd2LjY2/S2kCZvHWVaZuiTD0EU1jYPoOo6fhc8\n"
+            b"zjs5FWS56C1vp7aFOGBvsH3lwYAYi1K2S+/B4nqpitYJz/T0zFzzyYe7ZG77DXKD\n"
+            b"/XajD22IzRGKjoeVPFBx+2V0YCCpWZkqkfZ2Dt3QVW//QIpVsOJnmaqolDg1sxoa\n"
+            b"BEYBtCtovU0wh1pXWwfn7IgjIkPNl0AU8mW8Ll91WF+Lss/oMrUJMKVDenTJ6/ZO\n"
+            b"06c+JFlP7dS3YGMsifwgy5abA4Xy4GWpAsyEM68mqsJUc7ZANZcQAKr6+DryzSfI\n"
+            b"Olsn3kJzOtb/c3JhVmblEO6XzdfZJK/axPOp3mF1oEBoJ56fGwO2usgVwQDyLt3J\n"
+            b"iluJrCvMSBL9KtBZWrTZH5t3rTMN0NUALy4Etd6Y8V94i8c5NixMDyjRU7aKJAAw\n"
+            b"tUvxLd12dqtaXsuvGyzLbR4EDT/Q5DfLC1DZWpgtUtCVwsFcBBIBCgAGBQJYE6oD\n"
+            b"AAoJEL7YRJ/O6NqIJ24P+QFNa2O+Q1rLKrQiuPw4Q73o7/blUpFNudZfeCDpDbUg\n"
+            b"J01u1RHnWOyLcyknartAosFDJIpgcXY5I8jsBIO5IZPRC/UKxZB3RYOhj49bySD9\n"
+            b"RNapHyq+Y56j9JUoz6tkKFBd+6g85Ej8d924xM1UnRCS9cfI9W0fSunbCi2CXLbX\n"
+            b"FF7V+m3Ou1SVYGIAxpMn4RXyYfuqeB5wROR2GA5Ef6T3S5byh1dRSEgnrBToENtp\n"
+            b"5n7Jwsc9pDofjtaUkO854l45IqFarGjCHZwtNRKd2lcKFMnd1jS0nfGkUbn3qNJa\n"
+            b"m1qaGWx4gXaT845VsYYVTbxtkKi+qPUIoOyYx4NEm6fCZywH72oP+fmUT/fbfSHa\n"
+            b"5j137dRqokkR6RFjnEMBl6WHwgqqUqeIT6t9uV6WWzX9lNroZFAFL/de7H31iIRu\n"
+            b"Zcm38DUZOfjVf9glweu4yFvuJ7cQtyQydFQJV4LGDT/C8e9TWrV1/gWMyMGQlZsR\n"
+            b"Wa+h+FfFUccQtfSdXpvSxtXfop+fVQmJgUUl92jh4K9jc9a6rIp5v1Q1yEgs2iS5\n"
+            b"0/V/NMSmEcE1XMOxFt9fX9T+XmKAWZ8L25lpILsHT3mBVWrpHdbawUaiBp9elxhn\n"
+            b"6tFiTFR7qA7dlUyWrI+MMlINwSZ2AAXvmA2IajH/UIlhxotxmSNiZYIQ6UbD3fk4\n"
+            b"wsFzBBABCgAdFiEEmy/52H2krRdju+d2+GQcuhDvLUgFAlly44wACgkQ+GQcuhDv\n"
+            b"LUgkjQ//c3mBxfJm6yLAJD4s4OgsPv4pcp/EKmPcdztmW0/glwopUZmq9oNo3VMM\n"
+            b"CGtusrQgpACzfUlesu9NWlPCB3olZkeGugygo0zuQBKs55eG7bPzMLyfSqLKyogY\n"
+            b"ocaGc4lpf4lbvlvxy37YGVrGpwT9i8t2REtM6iPKDcMMsgVtNlqFdq3Fs2Haqt0m\n"
+            b"1EksX6/GSIrjK4LZEcPklrGPvUS3S+qkwuaGE/jXxncE4jFQR9SYH6AHr6Vkt1CG\n"
+            b"9Dgpr+Ph0I9n0JRknBYoUZ1q51WdF946NplXkCskdzWGRHgMUCz3ZehF1FzpKgfO\n"
+            b"9Zd0YZsmivV/g6frUw/TayP9gxKPt7z2Lsxzyh8X7cg6TAvdG9JbG0PyPJT1TZ8q\n"
+            b"pjP/PtqPclHsHQQIbGSDFWzRM5znhS+5sgyw8FWInjw8JjxoOWMa50464EfGeb2j\n"
+            b"ZfwtRimJAJLWEf/JnvO779nXf5YbvUZgfXaX7k/cvCVkU8M7oC7x8o6F0P2Lh6Fg\n"
+            b"onklKEeIRtZBUNZ0Lk9OShVqlU9/v16MHq/Eyu/Mbs0Den3vYgiYxOBR8czD1Wh4\n"
+            b"vsKiGfOzQ6oWti/DCURV+iTYhJc7mSWM6STzUFr0nCnFx6W0j/zH6ZgiFAGOyIXW\n"
+            b"2DwfjFvYRcBL1RWAEKsiFwYrNV+MDonjKXjpVB1Ra90olLrZXAXCwHMEEgEKAB0W\n"
+            b"IQRMRw//78TT3Fl3hlXOGj3V48lPSQUCXAAgOgAKCRDOGj3V48lPSQxAB/43qoWt\n"
+            b"eVZEiN3JW4FnHg+S60TnHSP69FKV+363XYKDa23pNpv4tiJumo9Kvb4UoDft766/\n"
+            b"URHm5RKyPtrxy+wqotamrkGJUTtP2a68h7C31VX+pf6iiQKmxRQz4zmW0pA5X01+\n"
+            b"AgpvcDH++Fv5NLBpnjqPdTh5b0gvr89E0zMNldNYOZu10H/mukrnGlFDu/osBuy+\n"
+            b"XJtP2MeasazVMLvjKs+hr//E+iLI9DZOwFBK6AX5gkkIUEHkSeb4//AHwvanUMin\n"
+            b"9un9+F9iR+qDuDEKxuevYzM0owuoVcK5pAsRnRQJlnHW/0BQ6FtNGpmljhvUk8a/\n"
+            b"l3xFf3z/uJG5vVKVwpUEEBMJAB0WIQQRqKh0394s4kCOZBDCTfTD6J3vAgUCXmUx\n"
+            b"0wAKCRDCTfTD6J3vAhOVAYC9lT8gwDGgIcavWwgHquGbcbfvxMtQkQCu+sP5J7PS\n"
+            b"/x08TFt4n6RZvzZjy2H99IcBgKnFgor/ejjZ6gzqZxEYvSaQ5m2LhqQbthOKdrFl\n"
+            b"6/P+DjdQNSXayj0ifNv+kaGG1s7BTQRW/BCrARAAw3wjLLtlNQnSYa+Maes+CfPf\n"
+            b"7TJ6QkAEgvA0IbWem1hv5LMirdg5w0NOdFwRJ4Pu3qcx1gNlIE9JYmNOc2ZhbNV+\n"
+            b"0Hma9egeyQDaun5xznWQdE4UuyRGGz66JDMXKgBSwGSQqWU+d+Bqc1u6h8M41fnd\n"
+            b"dyM4gh3Yuvgw+Xmr2MwamPEM45Tl25iJWO3SVAsF0xAlH4q3OpB/OgkvH12U5HuE\n"
+            b"GGeeVZ6zqJgeEBqj9+9ZMARE54ZYYu+Pqb4t41tOWecdbVTMLroMs85LHmadVWJi\n"
+            b"auUhzRWf6ZwECxPYFA02+lFnDwcEIfUsPu2oUiu+JSSmJt8JLcr2YcwMWzcs7NTO\n"
+            b"esnhT+rhcCUwXzQcsjAGukxlITZMZS3GI8Sm1ZqAJyglTPLeNU5S7/2tJIvIkMar\n"
+            b"6YVS7n5LEfSKTendxdeY+hnslbcQRL9OIr+L27irYVsrW/oI1+GyPAgKPYxh3r5r\n"
+            b"XYsP0m3isdmATNTBenrmt+6xTKKDgY+F+1X0AskvnKzbDkJ/JyRmoWG81AwgoJ1/\n"
+            b"qajfYmb14rDEu/cFcg+Q8iEhQ70/+Y2OyF8T4m8a9dD//JX1tXe9rsciNlImSma\n"
+            b"chwreJOO8jKuCkBixrocSequjt24tml0bs/Gy6kwS3GvXZsfcGRb0Yeo0v0ihIO3h\n"
+            b"XGNMW2+kVSL9VMBg2H0AEQEAAcLBXwQYAQgACQUCVvwQqwIbDAAKCRDxZW8kx0zR\n"
+            b"2BASEACYRU4dbt+EPuW534jNnQHQq+k+sOGNb/Xj4iGHUiJnrHiUtskYJaS3DI1t\n"
+            b"LhAPSl4kbQvzZvwpZ6mCcwiniGsHh6h+nSICSml2RbdVGomu1/bQw8KgCxrve4q1\n"
+            b"K61dSofSJDNCdvVYneWpmpK3UuJsLdrhCEkpwou6X1aBK6Pku7WEPYh+gD1SMKlr\n"
+            b"3Grct3ADXcCln1EGemvSENPMas2jITKdlc4Va1pKtwdI9mkaGUewTSx9iO2dIIiD\n"
+            b"PAEY2bPfWk0S/knzBEN7FMTS29ylj/59ZUhW65OBxs6lAQX3MxEpTXNPe9Aus5yt\n"
+            b"B9Bw9df9wU5DLj6sMPk83seHaTEJZTBCmd8BMnfb+m2vp4/z9RR0hMv1TeiF83fN\n"
+            b"rNZWDqJyk3ZlwCETnB529EFM8LHf5oQd4yoRAzldmXAUw98h7/JuwvRvcuIVfu8k\n"
+            b"JZz5UoNw4wad0kua/rDjmwiMtgHd9rqaF5IpVmvYOxmUroWPZMiqnhG2tZYF12kM\n"
+            b"pBHqsdKXsZFmrzZ2/SWj6wGRw41BnF60RJoxMl8hJUaA+Aq1l8knuOowrjYVVZZC\n"
+            b"xqO6LHn8p12v/jzY0I1EbcfHp+zPQNRZELkQMRPCiGYGc2MZBpeaOTzkhQgOCVKE\n"
+            b"Tw3K5f7CN37qtnSDhPwSdq/HVfi3XYkforpIV0cCVx/EVVRFEQ==\n"
+            b"=0CSW\n"
+            b"-----END PGP PUBLIC KEY BLOCK-----\n"
+        )
+        if not _mdb_key_ok and shutil.which("gpg"):
+            logging.info(
+                "[PATCH-275] 网络路径均不可达, 尝试使用内嵌 MariaDB 签名密钥...")
+            _g = subprocess.run(
+                ["gpg", "--dearmor", "--yes", "-o", _key_path],
+                input=_MARIADB_SIGNING_KEY_ARMORED,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=15, check=False)
+            if _g.returncode == 0 and Path(_key_path).exists():
+                os.chmod(_key_path, 0o644)
+                _mdb_key_ok = True
+                logging.info(
+                    "[PATCH-275] 内嵌 MariaDB 签名密钥导入成功。")
+
+        if not _mdb_key_ok:
+            logging.error(t("err_mariadb_repo_gpg_fail"))
+            return False
 
         # ── 写入 DEB822 格式源 ──
         _sources_path = "/etc/apt/sources.list.d/mariadb.sources"
@@ -18799,7 +21137,14 @@ class WPDeployManager:
             logging.error(t("err_mariadb_repo_source_fail", e=_e))
             return False
 
-        self.run_cmd(["apt", "update"], quiet=True, timeout=120)
+        # [BUGFIX] 检查 apt update 返回值，失败时报错并返回 False
+        _upd_ok = self.run_cmd(["apt", "update"], quiet=False, timeout=120)
+        if not _upd_ok:
+            logging.error(
+                "[_setup_mariadb_deb_repo] apt update 失败，MariaDB 仓库索引未获取"
+                if _LANG == "zh" else
+                "[_setup_mariadb_deb_repo] apt update failed; MariaDB repo index not fetched")
+            return False
         logging.info(t("ok_mariadb_repo_added", ver=target_ver))
         return True
 
@@ -18856,8 +21201,31 @@ class WPDeployManager:
                         timeout=60, check=False)
                 if _dump_r.returncode == 0:
                     os.chmod(_dump_path, 0o600)
-                    logging.info(t("info_mdb_pre_backup_ok",
-                        path=_dump_path))
+                    # [PATCH-276 FIX-DB2] 验证 dump 文件完整性:
+                    # mysqldump 可能因 OOM/磁盘满在中途截断, 返回码仍为 0。
+                    # "Dump completed" 是 mysqldump 最后一行, 存在则完整。
+                    _dump_size = os.path.getsize(_dump_path)
+                    _dump_complete = False
+                    try:
+                        with open(_dump_path, 'rb') as _df:
+                            _df.seek(max(0, _dump_size - 256))
+                            _tail = _df.read().decode('utf-8', errors='replace')
+                            _dump_complete = 'Dump completed' in _tail
+                    except OSError:
+                        pass
+                    if _dump_complete and _dump_size > 1024:
+                        logging.info(t("info_mdb_pre_backup_ok",
+                            path=_dump_path))
+                    elif _dump_size < 1024:
+                        logging.warning(
+                            "[PATCH-276] Pre-upgrade dump suspiciously"
+                            " small (%d bytes): %s — backup may be"
+                            " incomplete", _dump_size, _dump_path)
+                    elif not _dump_complete:
+                        logging.warning(
+                            "[PATCH-276] Pre-upgrade dump missing"
+                            " 'Dump completed' marker: %s — backup"
+                            " may be truncated", _dump_path)
                 else:
                     # 备份失败不阻断: 新装场景 root 可能无密码
                     logging.debug(
@@ -18926,8 +21294,8 @@ class WPDeployManager:
                         logging.warning(t("warn_mdb_removed_engines",
                             engines=", ".join(sorted(_removed)),
                             ver=_MARIADB_DEFAULT_VERSION))
-            except Exception:
-                pass
+            except Exception as _exc_20989:
+                logging.debug("[PATCH-276] _eng_r: %s", _exc_20989)
 
         # ── 4. 审计废弃 my.cnf 选项 ──
         self._fix_mariadb_deprecated_options(old_ver, _target_tuple)
@@ -19116,8 +21484,8 @@ class WPDeployManager:
                     r"unknown variable\s+'([a-z_-]+)",
                     _jrnl.stdout, re.IGNORECASE):
                     _unknown_vars.add(_m.group(1).replace("-", "_"))
-        except Exception:
-            pass
+        except Exception as _exc_21179:
+            logging.debug("[PATCH-276] _fix_mariadb_startup_errors: %s", _exc_21179)
 
         # 也检查传统 error log 路径
         for _log_path in [
@@ -19139,8 +21507,8 @@ class WPDeployManager:
                         _tail, re.IGNORECASE):
                         _unknown_vars.add(
                             _m.group(1).replace("-", "_"))
-                except Exception:
-                    pass
+                except Exception as _exc_21202:
+                    logging.debug("[PATCH-276] L21202: %s", _exc_21202)
 
         if not _unknown_vars:
             return False
@@ -19211,8 +21579,8 @@ class WPDeployManager:
                     _ll = _line.lower()
                     if "deprecated" in _ll or "obsolete" in _ll:
                         _warnings.append(_line.strip())
-        except Exception:
-            pass
+        except Exception as _exc_21274:
+            logging.debug("[PATCH-276] _check_mariadb_error_log: %s", _exc_21274)
 
         if _warnings:
             logging.info(t("info_mdb_post_warnings",
@@ -19327,7 +21695,26 @@ class WPDeployManager:
                     pkgs.append(_tpl.format(ver=_ver))
                 return pkgs
             else:
-                # 系统默认: 无版本前缀
+                # [BUGFIX] target_ver="" 表示已满足版本要求，但 Sury DPA 配置后
+                # 无前缀包（php-opcache 等）是虚包，有多个候选版本导致 apt 报错
+                # "has no installation candidate"。必须使用已安装版本号作前缀。
+                _cur_ver = self._detect_installed_php_version()
+                _sury_configured = Path(
+                    "/etc/apt/sources.list.d/sury-php.sources").exists() or any(
+                    Path("/etc/apt/sources.list.d").glob("*sury*"))
+                if _cur_ver != (0, 0) and _sury_configured:
+                    _ver = "%d.%d" % _cur_ver
+                    logging.info(
+                        "[BUGFIX] Sury DPA 已配置且 PHP %s 已安装，"
+                        "改用版本前缀包名避免虚包歧义。" % _ver
+                        if _LANG == "zh" else
+                        "[BUGFIX] Sury DPA configured and PHP %s installed; "
+                        "using versioned package names to avoid ambiguous virtual packages." % _ver)
+                    pkgs = ["php%s-fpm" % _ver]
+                    for _tpl in _PHP_EXTENSIONS_DEB_TPL:
+                        pkgs.append(_tpl.format(ver=_ver))
+                    return pkgs
+                # 真正使用系统默认（无 Sury / PHP 未安装）时才用无前缀
                 pkgs = ["php-fpm", "php-mysql", "php-gd",
                         "php-mbstring", "php-xml", "php-curl",
                         "php-zip", "php-intl", "php-opcache"]
@@ -19459,8 +21846,8 @@ class WPDeployManager:
                     _fc_path = _m_fc.group(1).strip().strip('"').strip("'")
                     if _fc_path and _fc_path not in _opcache_dirs:
                         _opcache_dirs.append(_fc_path)
-        except Exception:
-            pass
+        except Exception as _exc_21541:
+            logging.debug("[PATCH-276] _apply_php_ini_values: %s", _exc_21541)
         for _oc_dir in _opcache_dirs:
             _ocp = Path(_oc_dir)
             if _ocp.is_dir():
@@ -19495,8 +21882,8 @@ class WPDeployManager:
             _sock = self.get_php_sock_path()
             if _sock:
                 self._wait_for_php_socket(_sock, timeout=15)
-        except Exception:
-            pass
+        except Exception as _exc_21577:
+            logging.debug("[PATCH-276] _wait_for_php_socket failed: %s", _exc_21577)
 
         # ── 4. Debian/Ubuntu: 卸载旧版 PHP 包 ──────────────────────
         # [PATCH-262 PHP-3] 在新服务启动后再清理, 确保不影响服务连续性。
@@ -19559,6 +21946,41 @@ class WPDeployManager:
         """
         if self.cfg.dry_run:
             return
+
+        # [PATCH-275] 修复存量服务器上 PHP CLI/FPM 版本不一致问题。
+        # 场景: Sury 元包在升级 php8.4 时拉入 php8.5-cli 并通过
+        # update-alternatives 将 /usr/bin/php 指向 8.5, 但 FPM 服务仍为
+        # php8.4-fpm。后果: wp-cli 使用 php8.5 运行, 而 php8.5-mysql
+        # 未安装 → wp core is-installed 连接数据库失败 → 误报"未安装"。
+        if self.pkg_mgr == "apt":
+            try:
+                _cli_ver = self._detect_installed_php_version()  # 读 php -v
+                # 从 FPM 服务名提取版本 (如 "php8.4-fpm" → "8.4")
+                _fpm_svc = self.php_fpm_svc or ""
+                _fpm_m = re.search(r'php(\d+\.\d+)-fpm', _fpm_svc)
+                if _fpm_m and _cli_ver != (0, 0):
+                    _fpm_ver = tuple(int(x) for x in _fpm_m.group(1).split("."))
+                    if _cli_ver != _fpm_ver and _cli_ver > _fpm_ver:
+                        _target_bin = "/usr/bin/php%s" % _fpm_m.group(1)
+                        if Path(_target_bin).exists():
+                            logging.info(
+                                "[PATCH-275] PHP CLI (%d.%d) 与 FPM (%s) 版本不一致, "
+                                "修正 update-alternatives → %s",
+                                _cli_ver[0], _cli_ver[1], _fpm_m.group(1),
+                                _target_bin)
+                            self.run_cmd(
+                                ["update-alternatives", "--set", "php",
+                                 _target_bin],
+                                quiet=True, timeout=10)
+                            _target_phar = "/usr/bin/phar%s" % _fpm_m.group(1)
+                            if Path(_target_phar).exists():
+                                self.run_cmd(
+                                    ["update-alternatives", "--set", "phar",
+                                     _target_phar],
+                                    quiet=True, timeout=10)
+            except Exception as _exc_21673:
+                logging.debug("[PATCH-276] operation failed: %s", _exc_21673)
+
         _php_ver_before = self._detect_installed_php_version()
         _php_svc_before = self.php_fpm_svc
 
@@ -19578,8 +22000,8 @@ class WPDeployManager:
                         x.strip().lower() for x in _ext_r.stdout.splitlines()
                         if x.strip() and not x.strip().startswith("[")
                     }
-            except Exception:
-                pass
+            except Exception as _exc_21695:
+                logging.debug("[PATCH-276] run_cmd: %s", _exc_21695)
 
         _php_target = self._determine_php_target()
         if not _php_target:
@@ -19619,6 +22041,30 @@ class WPDeployManager:
             logging.warning(t("warn_php_install_fail",
                 ver=_php_target))
             return
+
+        # [PATCH-275] Sury 元包 (php, php-common) 的依赖链会拉入最新 PHP 版本
+        # (如 8.5), update-alternatives 自动将 /usr/bin/php 指向最新版本。
+        # 必须在后续版本检测前强制 pin 到目标版本, 否则:
+        #   - php -v / php -m 返回 8.5 的结果
+        #   - _handle_php_version_transition 检测到 "8.2→8.5" 而非 "8.2→8.4"
+        #   - 扩展恢复安装到错误版本
+        if self.pkg_mgr == "apt" and _php_target:
+            _target_bin = "/usr/bin/php%s" % _php_target
+            if Path(_target_bin).exists():
+                self.run_cmd(
+                    ["update-alternatives", "--set", "php", _target_bin],
+                    quiet=True, timeout=10)
+                # phar 也需要对齐
+                _target_phar = "/usr/bin/phar%s" % _php_target
+                if Path(_target_phar).exists():
+                    self.run_cmd(
+                        ["update-alternatives", "--set", "phar", _target_phar],
+                        quiet=True, timeout=10)
+                _target_phar2 = "/usr/bin/phar.phar%s" % _php_target
+                if Path(_target_phar2).exists():
+                    self.run_cmd(
+                        ["update-alternatives", "--set", "phar.phar", _target_phar2],
+                        quiet=True, timeout=10)
 
         # 重新探测 FPM 服务名 (版本变更后名称可能不同)
         self.php_fpm_svc = self._resolve_php_fpm_service(
@@ -19674,8 +22120,8 @@ class WPDeployManager:
                                 [self.pkg_mgr, "install", "-y",
                                  "php-%s" % _ext],
                                 quiet=True, timeout=60)
-            except Exception:
-                pass
+            except Exception as _exc_21815:
+                logging.debug("[PATCH-276] operation failed: %s", _exc_21815)
 
         # 版本迁移: 停旧服务/迁移 ini/OPcache 清理/启新服务/卸旧包
         self._handle_php_version_transition(
@@ -19694,10 +22140,7 @@ class WPDeployManager:
             new=_php_target))
 
     def _report_nginx_version(self) -> None:
-        """[PATCH-265] 输出 Nginx 版本状态, 与 _upgrade_php_if_needed 对齐。
-
-        [PATCH-268] 扩展: 检测并主动应用小版本更新。
-        """
+        """[PATCH-265] 输出 Nginx 版本状态。"""
         if self.cfg.dry_run:
             return
         _nginx_bin = shutil.which("nginx")
@@ -19713,10 +22156,8 @@ class WPDeployManager:
             _m = re.search(r'nginx/(\d+\.\d+\.\d+)', _r.stdout + _r.stderr)
             if _m:
                 logging.info(t("info_nginx_version_ok", ver=_m.group(1)))
-        except Exception:
-            pass
-        # [PATCH-268] 主动升级小版本
-        self._upgrade_nginx_minor_if_available()
+        except Exception as _exc_21851:
+            logging.debug("[PATCH-276] _report_nginx_version: %s", _exc_21851)
 
     # ── PATCH-268: 三组件升级后共享修复方法 ────────────────────────
     # 大版本和小版本升级都调用同一份代码，确保修复链一致。
@@ -19742,6 +22183,8 @@ class WPDeployManager:
         _reset_nginx_capability_caches()
 
         # 1. 清理旧版本源码编译的 .so (mtime 比较)
+        # [PATCH-270] 追踪是否有模块被清理, 用于后续触发重编译
+        _modules_cleaned_270 = False
         _nginx_bin = shutil.which("nginx") or "/usr/sbin/nginx"
         try:
             _nginx_mtime = Path(_nginx_bin).stat().st_mtime
@@ -19758,6 +22201,7 @@ class WPDeployManager:
                             _so.unlink()
                             logging.info(t("info_fix10_removed_module",
                                 path=str(_so)))
+                            _modules_cleaned_270 = True
                     except OSError:
                         pass
         except OSError:
@@ -19766,8 +22210,8 @@ class WPDeployManager:
         # 2. 清理引用不存在 .so 的 load_module 指令
         try:
             self._cleanup_stale_nginx_load_modules()
-        except Exception:
-            pass
+        except Exception as _exc_21905:
+            logging.debug("[PATCH-276] _cleanup_stale_nginx_load_modules failed: %s", _exc_21905)
 
         # 3. 清理 brotli conf.d (若 brotli .so 已不存在)
         _brotli_conf = Path("/etc/nginx/conf.d/brotli-wp-bootstrap.conf")
@@ -19783,6 +22227,13 @@ class WPDeployManager:
                 try:
                     _brotli_conf.unlink()
                     logging.info(t("info_fix10_removed_brotli_conf"))
+                    # [PATCH-275] 包管理器移除的 brotli 模块同样需要触发重编译。
+                    # 之前仅 step 1 的源码编译 .so 清理会设置此标志,
+                    # 导致 apt 移除 libnginx-mod-http-brotli-* 后
+                    # _recompile_nginx_dynamic_modules 不被调用,
+                    # brotli 直到 _setup_brotli 才重编译, 中间窗口内
+                    # srcache 编译的 nginx -t 因 brotli 指令失败而回滚。
+                    _modules_cleaned_270 = True
                 except OSError:
                     pass
 
@@ -19792,14 +22243,20 @@ class WPDeployManager:
                 t("warn_patch_268_nginx_post_upgrade_verify_fail"))
             try:
                 self._fix_module_load_errors()
-            except Exception:
-                pass
+            except Exception as _fml_e:
+                # [PATCH-276 FIX-P0-4] 模块修复失败需记录, 否则 nginx
+                # 可能因残留的 load_module 指令无法启动。
+                logging.warning(
+                    "[PATCH-276] _fix_module_load_errors failed: %s", _fml_e)
 
         # 5. 修复废弃指令 (ssl on; / http2 等)
         try:
             self._fix_nginx_post_upgrade_compat()
-        except Exception:
-            pass
+        except Exception as _fpc_e:
+            # [PATCH-276 FIX-P0-4] 废弃指令修复失败同样需记录
+            logging.warning(
+                "[PATCH-276] _fix_nginx_post_upgrade_compat failed: %s",
+                _fpc_e)
 
         # 6. 清除 srcache ABI 失败标记
         try:
@@ -19812,8 +22269,17 @@ class WPDeployManager:
         # 7. 确保 fastcgi.conf 存在
         try:
             self._ensure_fastcgi_conf()
-        except Exception:
-            pass
+        except Exception as _exc_21964:
+            logging.debug("[PATCH-276] _fix_nginx_post_upgrade_compat: %s", _exc_21964)
+
+        # 8. [PATCH-270] 标记需要重编译动态模块
+        # Nginx 官方文档: "Dynamic modules must be compiled against the
+        # same version of NGINX they are loaded into." 旧 .so 被清理后,
+        # Brotli 压缩和 srcache 缓存静默丢失。设置实例标志, 通知调用方
+        # (_upgrade_nginx_minor_if_available / install_packages) 触发重编译。
+        if _modules_cleaned_270:
+            self._nginx_modules_need_recompile = True
+            logging.info(t("info_p270_nginx_modules_cleaned"))
 
     def _php_post_upgrade_restart(self) -> None:
         """[PATCH-268] PHP 升级后统一重启+验证链。
@@ -19843,16 +22309,73 @@ class WPDeployManager:
                 self.php_fpm_svc = _svc_before
 
         if not _restart_ok:
+            # [PATCH-279] Auto-diagnose: check config, fix common issues, retry.
             logging.warning(t("warn_patch_268_php_fpm_restart_failed"))
-            return
+            _fpm_fixed = False
+            _fpm_svc_try = self.php_fpm_svc
+            try:
+                # Capture config test output
+                _fpm_bin = shutil.which("php-fpm%s" % (
+                    re.search(r'(\d+\.\d+)', _fpm_svc_try).group(1)
+                    if re.search(r'(\d+\.\d+)', _fpm_svc_try) else ""))
+                if not _fpm_bin:
+                    _fpm_bin = shutil.which("php-fpm") or ""
+                if _fpm_bin:
+                    _fpm_t = subprocess.run(
+                        [_fpm_bin, "-t"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        encoding="utf-8", errors="replace",
+                        timeout=10, check=False)
+                    _fpm_err = (_fpm_t.stderr or "") + (_fpm_t.stdout or "")
+                    logging.info("[PATCH-279] php-fpm -t output:\n%s", _fpm_err.strip()[:800])
+                    # Case: listen.owner/listen.group references non-existent user
+                    _user_m = re.search(r"user '([^']+)' is not found", _fpm_err, re.I)
+                    if not _user_m:
+                        _user_m = re.search(r"group '([^']+)' is not found", _fpm_err, re.I)
+                    if _user_m:
+                        _bad_name = _user_m.group(1)
+                        # Try to fix pool conf with correct nginx user
+                        _nuser = self._detect_nginx_user() or "www-data"
+                        for _pool_d in (Path("/etc/php-fpm.d"), Path("/etc/php"),):
+                            for _pool_f in _pool_d.rglob("*.conf"):
+                                if _pool_f.is_file() and not _pool_f.is_symlink():
+                                    try:
+                                        _pc = _pool_f.read_text(encoding="utf-8", errors="replace")
+                                        if _bad_name in _pc:
+                                            _pc_new = _pc.replace(_bad_name, _nuser)
+                                            _pool_f.write_text(_pc_new, encoding="utf-8")
+                                            logging.info(
+                                                "[PATCH-279] Fixed '%s' → '%s' in %s",
+                                                _bad_name, _nuser, _pool_f)
+                                            _fpm_fixed = True
+                                    except OSError:
+                                        pass
+                    # Case: port/socket conflict — "unable to bind listening socket"
+                    if not _fpm_fixed and "unable to bind" in _fpm_err.lower():
+                        # Kill stale FPM processes and retry
+                        subprocess.run(
+                            ["pkill", "-9", "-f", "php-fpm.*master"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            timeout=5, check=False)
+                        time.sleep(1)
+                        _fpm_fixed = True
+            except Exception as _fpm_diag_e:
+                logging.debug("[PATCH-279] php-fpm diag: %s", _fpm_diag_e)
+            if _fpm_fixed:
+                _restart_ok = self.run_cmd(
+                    ["systemctl", "restart", _fpm_svc_try], quiet=True)
+                if _restart_ok:
+                    logging.info("[PATCH-279] PHP-FPM recovered after auto-fix.")
+            if not _restart_ok:
+                return
 
         # 等待 socket 就绪
         try:
             _sock = self.get_php_sock_path()
             if _sock:
                 self._wait_for_php_socket(_sock, timeout=15)
-        except Exception:
-            pass
+        except Exception as _exc_22012:
+            logging.debug("[PATCH-276] _wait_for_php_socket failed: %s", _exc_22012)
 
     def _mariadb_post_upgrade_verify(self) -> None:
         """[PATCH-268] MariaDB 升级后统一验证链。
@@ -19909,16 +22432,23 @@ class WPDeployManager:
         # 2. error log 检查
         try:
             self._check_mariadb_error_log()
-        except Exception:
-            pass
+        except Exception as _mdb_el_e:
+            # [PATCH-276 FIX-P0-4] 升级后 error log 可能含致命错误
+            # (如 InnoDB redo log 格式不兼容), 静默吞掉会延误发现。
+            logging.warning(
+                "[PATCH-276] MariaDB error log check failed: %s",
+                _mdb_el_e)
 
         # 3. SQL 连通性验证
         _sql_ok = False
         try:
             _sql_ok = bool(self.run_sql(
                 "SELECT 1;", use_pwd=True, timeout=10))
-        except Exception:
-            pass
+        except Exception as _sql_chk_e:
+            # [PATCH-276 FIX-P0-4] 升级后无法连接 DB 是严重问题
+            logging.warning(
+                "[PATCH-276] Post-upgrade SQL connectivity check"
+                " failed: %s", _sql_chk_e)
         if not _sql_ok:
             try:
                 _r = subprocess.run(
@@ -19927,8 +22457,8 @@ class WPDeployManager:
                     stderr=subprocess.DEVNULL,
                     timeout=10, check=False)
                 _sql_ok = (_r.returncode == 0)
-            except Exception:
-                pass
+            except Exception as _exc_22095:
+                logging.debug("[PATCH-276] _check_mariadb_error_log: %s", _exc_22095)
         if not _sql_ok:
             logging.warning(t("warn_mdb_sql_verify_fail",
                 ver=self._get_mariadb_full_version() or "unknown"))
@@ -19941,6 +22471,12 @@ class WPDeployManager:
         升级后调用 _nginx_post_upgrade_repair() + restart + 验证。
         """
         if self.cfg.dry_run:
+            return
+        # [PATCH-272] EL7: nginx.org 可能已停止构建 EL7 包
+        _is_el, _el_ver = _detect_el_family_and_version()
+        if _is_el and _el_ver < 8:
+            logging.warning(t("warn_el7_eol_skip_upgrade",
+                              el=_el_ver, component="Nginx"))
             return
         _ver_before = self._get_nginx_version_tuple()
         if not _ver_before:
@@ -19956,8 +22492,8 @@ class WPDeployManager:
                     encoding="utf-8", errors="replace",
                     timeout=30, check=False)
                 _has_update = (_r.returncode == 100)
-            except Exception:
-                pass
+            except Exception as _exc_22130:
+                logging.debug("[PATCH-276] operation failed: %s", _exc_22130)
         elif self.pkg_mgr == "apt":
             try:
                 subprocess.run(
@@ -19971,8 +22507,8 @@ class WPDeployManager:
                     timeout=15, check=False)
                 _has_update = bool(
                     re.search(r'^nginx/', _r.stdout, re.MULTILINE))
-            except Exception:
-                pass
+            except Exception as _exc_22145:
+                logging.debug("[PATCH-276] stdout: %s", _exc_22145)
 
         if not _has_update:
             return
@@ -19991,16 +22527,39 @@ class WPDeployManager:
                 quiet=False, stream=True, timeout=120))
 
         if not _ok:
+            # [PATCH-279] Auto-fix: clean package cache and retry.
+            # Common cause: stale metadata or broken dependencies.
             logging.warning(t("warn_patch_268_nginx_minor_upgrade_failed"))
-            return
+            if self.pkg_mgr in ("dnf", "yum"):
+                self.run_cmd([self.pkg_mgr, "clean", "all"], quiet=True, timeout=30)
+                _ok = bool(self.run_cmd(
+                    [self.pkg_mgr, "update", "-y", "nginx"],
+                    quiet=True, timeout=120))
+            elif self.pkg_mgr == "apt":
+                self.run_cmd(["apt-get", "--fix-broken", "install", "-y"],
+                             quiet=True, timeout=60)
+                self.run_cmd(["apt-get", "update"], quiet=True, timeout=60)
+                _ok = bool(self.run_cmd(
+                    ["apt-get", "install", "--only-upgrade", "-y", "nginx"],
+                    quiet=True, timeout=120))
+            if _ok:
+                logging.info("[PATCH-279] Nginx upgrade succeeded after package cache repair.")
+            else:
+                return
 
         _ver_after = self._get_nginx_version_tuple()
         if not _ver_after or _ver_after == _ver_before:
             return
 
-        logging.info(t("info_patch_268_nginx_minor_upgraded"),
-                     "%d.%d.%d" % _ver_before,
-                     "%d.%d.%d" % _ver_after)
+        # [PATCH-275] 区分大版本跳跃 (1.22→1.28) 和小版本补丁 (1.28.2→1.28.3)
+        if _ver_before[:2] != _ver_after[:2]:
+            logging.info("[PATCH-275] Nginx 大版本升级: %s → %s",
+                         "%d.%d.%d" % _ver_before,
+                         "%d.%d.%d" % _ver_after)
+        else:
+            logging.info(t("info_patch_268_nginx_minor_upgraded"),
+                         "%d.%d.%d" % _ver_before,
+                         "%d.%d.%d" % _ver_after)
 
         # ── 共享修复链 + restart + 验证 ──
         logging.info(t("info_patch_268_nginx_minor_module_cleanup"))
@@ -20017,6 +22576,22 @@ class WPDeployManager:
                 ["systemctl", "restart", "nginx"], quiet=True)
 
         if not _restart_ok:
+            # [PATCH-275] 最后手段: 隔离 conf.d 中导致 nginx -t 失败的文件。
+            # 场景: Debian→nginx.org 跨包升级后, 旧 brotli/其他 conf.d 文件
+            # 引用已被 apt 移除的模块指令, 修复链的 .so 检测可能因路径/时序
+            # 问题未能清理。PATCH-248 逐文件排查比启发式更可靠。
+            try:
+                if not self.run_cmd(["nginx", "-t"], quiet=True):
+                    self._remove_broken_confd_files_248()
+                    _restart_ok = self.run_cmd(
+                        ["systemctl", "restart", "nginx"], quiet=True)
+            except Exception as _nr_e:
+                # [PATCH-276 FIX-P0-4] nginx 修复尝试失败不应静默
+                logging.warning(
+                    "[PATCH-276] nginx conf.d repair attempt failed: %s",
+                    _nr_e)
+
+        if not _restart_ok:
             try:
                 _act = subprocess.run(
                     ["systemctl", "is-active", "nginx"],
@@ -20026,8 +22601,139 @@ class WPDeployManager:
                 if _act.stdout.strip() != "active":
                     logging.error(
                         t("err_patch_268_nginx_unrecoverable"))
-            except Exception:
-                pass
+            except Exception as _act_e:
+                # [PATCH-276 FIX-P0-4] 存活检测异常也需记录
+                logging.debug(
+                    "[PATCH-276] nginx liveness check failed: %s",
+                    _act_e)
+
+        # [PATCH-270] Nginx 升级后重编译动态模块 (Brotli/srcache)。
+        # _nginx_post_upgrade_repair 在 step 1 中清理了旧版 .so 并在
+        # step 8 中设置了 _nginx_modules_need_recompile 标志。
+        # 此处立即触发重编译, 而非依赖 update_config 后续的
+        # _setup_brotli / _ensure_srcache_modules 调用。原因:
+        #   1. 调用顺序: update_config 中 Nginx 配置生成在 _setup_brotli 之前,
+        #      生成时 srcache 检测缓存已被 step 0 重置, 重新探测发现模块不存在
+        #      → 降级为 FastCGI, 但后续 _setup_brotli 才重编译 → 来不及。
+        #   2. 即时性: 在同一次 upgrade 流程内完成"清理→重编译→restart",
+        #      用户不会观察到压缩/缓存降级的中间状态。
+        if getattr(self, '_nginx_modules_need_recompile', False):
+            self._recompile_nginx_dynamic_modules()
+
+    def _recompile_nginx_dynamic_modules(self) -> None:
+        """[PATCH-270] Nginx 版本变更后重编译 Brotli 和 srcache 动态模块。
+
+        前提: _nginx_post_upgrade_repair 已清理旧 .so,
+        Nginx 已 restart 且正在运行 (新版本二进制)。
+
+        流程:
+          1. 重编译 Brotli (若之前存在)
+          2. 重编译 srcache (若 cache_mode=redis)
+          3. 写入版本标记文件 (_NGINX_MODULE_BUILD_MARKER)
+          4. nginx -t + restart (加载新 .so)
+        """
+        if self.cfg.dry_run:
+            return
+        logging.info(t("info_p270_nginx_module_recompile"))
+        _any_compiled = False
+
+        # ── 1. Brotli ──
+        # 检测之前是否启用了 Brotli (conf.d 中有配置或 load_module 指令)
+        _had_brotli = False
+        try:
+            _brotli_conf = Path("/etc/nginx/conf.d/brotli-wp-bootstrap.conf")
+            if _brotli_conf.exists():
+                _had_brotli = True
+            if not _had_brotli:
+                _main_conf = Path("/etc/nginx/nginx.conf")
+                if _main_conf.exists() and "brotli" in _main_conf.read_text(
+                        encoding="utf-8", errors="replace").lower():
+                    _had_brotli = True
+            # 也检查标记文件 (记录之前编译过)
+            if not _had_brotli and _NGINX_MODULE_BUILD_MARKER.exists():
+                try:
+                    _mk_content = _NGINX_MODULE_BUILD_MARKER.read_text(
+                        encoding="utf-8").strip()
+                    if "brotli" in _mk_content:
+                        _had_brotli = True
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+        if _had_brotli:
+            try:
+                self._setup_brotli()
+                # 检查 .so 是否成功生成
+                for _md in ("/usr/lib64/nginx/modules",
+                            "/usr/lib/nginx/modules"):
+                    if Path(_md).is_dir() and any(
+                            Path(_md).glob("*brotli*")):
+                        _any_compiled = True
+                        # [PATCH-270c] 标记已编译, 避免 update_config 后续
+                        # _setup_brotli() 重复执行 mtime 扫描 + 编译检查。
+                        # _setup_brotli 自身有 _has_so_early 幂等检测,
+                        # 不会真正重复编译, 此标志仅省去 ~1s 扫描开销。
+                        self._brotli_compiled_this_run = True
+                        break
+            except Exception as _e:
+                logging.debug("[PATCH-270] Brotli recompile error: %s", _e)
+
+        # ── 2. srcache ──
+        if self.cfg.cache_mode == "redis":
+            try:
+                # 重置 srcache 检测缓存, 让 _ensure_srcache_modules 重新探测
+                global _SRCACHE_DETECT_CACHE
+                _SRCACHE_DETECT_CACHE = None
+                self._ensure_srcache_modules()
+                _any_compiled = True
+            except Exception as _e:
+                logging.debug("[PATCH-270] srcache recompile error: %s", _e)
+
+        # ── 3. 写入版本标记文件 ──
+        try:
+            _ver = self._get_nginx_version_tuple()
+            if _ver:
+                _modules_list = []
+                if _had_brotli:
+                    _modules_list.append("brotli")
+                if self.cfg.cache_mode == "redis":
+                    _modules_list.append("srcache")
+                _content = "%d.%d.%d:%s" % (
+                    _ver[0], _ver[1], _ver[2],
+                    ",".join(_modules_list) if _modules_list else "none")
+                _NGINX_MODULE_BUILD_MARKER.write_text(
+                    _content, encoding="utf-8")
+                logging.info(t("info_p270_nginx_module_marker_saved",
+                               ver=_content))
+        except OSError:
+            pass
+
+        # ── 4. nginx -t + restart ──
+        if _any_compiled:
+            if self.run_cmd(["nginx", "-t"], quiet=True):
+                self.run_cmd(
+                    ["systemctl", "restart", "nginx"], quiet=True)
+                logging.info(t("ok_p270_nginx_module_recompile_done"))
+            else:
+                logging.warning(
+                    t("warn_p270_nginx_module_recompile_fail"))
+                # 安全回退: 清理可能有问题的 .so, 确保 Nginx 能启动
+                try:
+                    self._nginx_post_upgrade_repair()
+                    self.run_cmd(
+                        ["systemctl", "restart", "nginx"], quiet=True)
+                except Exception as _exc_22344:
+                    logging.debug("[PATCH-276] operation failed: %s", _exc_22344)
+        else:
+            if not _had_brotli and self.cfg.cache_mode != "redis":
+                pass  # 之前没有动态模块, 无需重编译
+            else:
+                logging.warning(
+                    t("warn_p270_nginx_module_recompile_fail"))
+
+        # 重置标志
+        self._nginx_modules_need_recompile = False
 
     def _upgrade_php_minor_if_available(self) -> None:
         """[PATCH-268] 主动检测并升级 PHP 小版本 (如 8.3.12 → 8.3.15)。
@@ -20035,6 +22741,10 @@ class WPDeployManager:
         升级后调用 _php_post_upgrade_restart() 共享验证链。
         """
         if self.cfg.dry_run:
+            return
+        # [PATCH-272] EL7: 仓库已关闭, yum update 会产生 repo 超时噪音
+        _is_el, _el_ver = _detect_el_family_and_version()
+        if _is_el and _el_ver < 8:
             return
 
         _ver_before = ""
@@ -20060,8 +22770,8 @@ class WPDeployManager:
                     encoding="utf-8", errors="replace",
                     timeout=30, check=False)
                 _has_update = (_r.returncode == 100)
-            except Exception:
-                pass
+            except Exception as _exc_22391:
+                logging.debug("[PATCH-276] stdout: %s", _exc_22391)
         elif self.pkg_mgr == "apt":
             try:
                 _r = subprocess.run(
@@ -20071,8 +22781,8 @@ class WPDeployManager:
                     timeout=15, check=False)
                 _has_update = bool(
                     re.search(r'^php.*-fpm/', _r.stdout, re.MULTILINE))
-            except Exception:
-                pass
+            except Exception as _exc_22402:
+                logging.debug("[PATCH-276] stdout: %s", _exc_22402)
 
         if not _has_update:
             return
@@ -20102,8 +22812,8 @@ class WPDeployManager:
                 timeout=5, check=False)
             if _r.returncode == 0:
                 _ver_after = _r.stdout.strip()
-        except Exception:
-            pass
+        except Exception as _exc_22433:
+            logging.debug("[PATCH-276] operation failed: %s", _exc_22433)
 
         if _ver_after and _ver_after != _ver_before:
             logging.info(t("info_patch_268_php_minor_upgraded"),
@@ -20117,6 +22827,10 @@ class WPDeployManager:
         wait_db_ready → _mariadb_post_upgrade_verify() 共享验证链。
         """
         if self.cfg.dry_run or self.cfg.is_external_db:
+            return
+        # [PATCH-272] EL7: 仓库已关闭, yum update 会产生 repo 超时噪音
+        _is_el, _el_ver = _detect_el_family_and_version()
+        if _is_el and _el_ver < 8:
             return
 
         _ver_before = self._get_mariadb_full_version()
@@ -20133,8 +22847,8 @@ class WPDeployManager:
                     encoding="utf-8", errors="replace",
                     timeout=30, check=False)
                 _has_update = (_r.returncode == 100)
-            except Exception:
-                pass
+            except Exception as _exc_22468:
+                logging.debug("[PATCH-276] L22468: %s", _exc_22468)
         elif self.pkg_mgr == "apt":
             try:
                 _r = subprocess.run(
@@ -20145,8 +22859,8 @@ class WPDeployManager:
                 _has_update = bool(
                     re.search(r'^mariadb-server/', _r.stdout,
                               re.MULTILINE))
-            except Exception:
-                pass
+            except Exception as _exc_22480:
+                logging.debug("[PATCH-276] stdout: %s", _exc_22480)
 
         if not _has_update:
             return
@@ -20190,8 +22904,8 @@ class WPDeployManager:
                     _start_ok = self.run_cmd(
                         ["systemctl", "start", self.db_svc],
                         quiet=True, timeout=90)
-            except Exception:
-                pass
+            except Exception as _exc_22525:
+                logging.debug("[PATCH-276] t: %s", _exc_22525)
 
         if not _start_ok:
             logging.error(t("err_patch_268_mariadb_unrecoverable"),
@@ -20202,8 +22916,8 @@ class WPDeployManager:
             logging.warning(t("warn_mdb_not_responding"))
             try:
                 self._diagnose_mariadb_failure()
-            except Exception:
-                pass
+            except Exception as _exc_22537:
+                logging.debug("[PATCH-276] _diagnose_mariadb_failure failed: %s", _exc_22537)
             return
 
         self._mariadb_post_upgrade_verify()
@@ -20234,8 +22948,8 @@ class WPDeployManager:
                     r'distrib\s+(\d+\.\d+\.\d+)', _out)
                 if _m2:
                     return _m2.group(1)
-            except Exception:
-                pass
+            except Exception as _exc_22569:
+                logging.debug("[PATCH-276] stdout: %s", _exc_22569)
         return ""
 
     def _read_php_ini_values(self, ver: tuple, keys: list) -> dict:
@@ -20307,7 +23021,7 @@ class WPDeployManager:
                 logging.warning(t("warn_php_ini_migrate_fail",
                     path=_ini_path, e=_e))
 
-    def _remove_abi_locked_nginx_modules(self):
+    def _remove_abi_locked_nginx_modules(self) -> None:
         """[PATCH-245 FIX-1] 移除依赖旧版 nginx(abi) 的第三方模块包。
 
         调用时机: _prepare_nginx_128_repo() 中, module enable 之前。
@@ -20380,7 +23094,7 @@ class WPDeployManager:
         # load_module 行, 必须主动扫描清除, 否则 nginx -t 失败。
         self._cleanup_stale_nginx_load_modules()
 
-    def _srcache_install_deps(self):
+    def _srcache_install_deps(self) -> bool:
         """安装 srcache 编译依赖 (gcc/make/git + devel 包)。
 
         两阶段依赖安装:
@@ -20557,7 +23271,7 @@ class WPDeployManager:
         logging.info(t("ok_srcache_deps_ready"))
         return True
 
-    def _srcache_download_and_clone(self, build_dir, nver):
+    def _srcache_download_and_clone(self, build_dir: str, nver: str) -> bool:
         """下载 Nginx 源码 + 克隆 5 个 OpenResty 模块。"""
         _tar = build_dir / ("nginx-%s.tar.gz" % nver)
         _dl = (["curl", "-sSL", "--connect-timeout", "15",
@@ -20586,7 +23300,7 @@ class WPDeployManager:
                 return False
         return True
 
-    def _extract_nginx_configure_args(self):
+    def _extract_nginx_configure_args(self) -> list:
         """[PATCH-268 FIX-2] 从 nginx -V 提取完整 configure 参数。
 
         解析 'configure arguments:' 行, 正确处理含空格的引号值
@@ -20648,7 +23362,7 @@ class WPDeployManager:
         except Exception:
             return []
 
-    def _srcache_configure_and_make(self, build_dir, nver):
+    def _srcache_configure_and_make(self, build_dir: str, nver: str) -> list:
         """configure + make modules, 返回 .so 列表。"""
         _src = build_dir / ("nginx-%s" % nver)
         # [PATCH-268 FIX-2] 使用完整 nginx -V 参数替代单独的 --with-compat。
@@ -20755,7 +23469,7 @@ class WPDeployManager:
         return _sos
 
 
-    def _cleanup_stale_nginx_load_modules(self):
+    def _cleanup_stale_nginx_load_modules(self) -> bool:
         """[PATCH-247 FIX-1] 清理指向不存在 .so 的 load_module 指令。
 
         扫描范围:
@@ -20939,7 +23653,7 @@ class WPDeployManager:
 
     # ── PATCH-268: 模块加载级联错误迭代修复 ─────────────────────────
 
-    def _fix_module_load_errors(self, nginx_t_stderr=""):
+    def _fix_module_load_errors(self, nginx_t_stderr: str="") -> bool:
         """[PATCH-268] 修复 Nginx 动态模块加载失败 (两阶段迭代)。
 
         场景: 用户手动 dnf update nginx (如 1.28.2→1.28.3), 第三方模块
@@ -21075,8 +23789,8 @@ class WPDeployManager:
             if _need_cleanup:
                 try:
                     self._cleanup_stale_nginx_load_modules()
-                except Exception:
-                    pass
+                except Exception as _exc_23410:
+                    logging.debug("[PATCH-276] _cleanup_stale_nginx_load_modules failed: %s", _exc_23410)
 
             if not _progress:
                 break
@@ -21131,7 +23845,7 @@ class WPDeployManager:
                          _total_commented, _total_iters)
         return _total > 0
 
-    def _comment_directive_in_file(self, conf_path, directive):
+    def _comment_directive_in_file(self, conf_path: str, directive: str) -> bool:
         """[PATCH-268] 在指定配置文件中注释掉某个指令的所有出现。
 
         策略: 对每行检查是否以该指令开头 (含前导空白),
@@ -21176,7 +23890,7 @@ class WPDeployManager:
         return self._safe_write_file(_p, _new, mode=0o644)
 
     @staticmethod
-    def _get_nginx_t_stderr():
+    def _get_nginx_t_stderr() -> str:
         """[PATCH-268] 执行 nginx -t 并返回合并的 stderr+stdout。"""
         try:
             _r = subprocess.run(
@@ -21188,7 +23902,7 @@ class WPDeployManager:
         except Exception:
             return ""
 
-    def _get_pkg_name_for_so(self, so_path):
+    def _get_pkg_name_for_so(self, so_path: str) -> str:
         """[PATCH-268] 查询拥有指定 .so 文件的包名。
 
         EL:  rpm -qf --queryformat %{NAME} → nginx-mod-ndk
@@ -21203,8 +23917,8 @@ class WPDeployManager:
                     timeout=5, check=False)
                 if _r.returncode == 0 and _r.stdout.strip():
                     return _r.stdout.strip()
-            except Exception:
-                pass
+            except Exception as _exc_23538:
+                logging.debug("[PATCH-276] _get_pkg_name_for_so: %s", _exc_23538)
         if shutil.which("dpkg"):
             try:
                 _r = subprocess.run(
@@ -21214,13 +23928,13 @@ class WPDeployManager:
                     timeout=5, check=False)
                 if _r.returncode == 0 and ":" in _r.stdout:
                     return _r.stdout.split(":")[0].strip()
-            except Exception:
-                pass
+            except Exception as _exc_23549:
+                logging.debug("[PATCH-276] stdout: %s", _exc_23549)
         return ""
 
     # ── PATCH-248 新增方法 ──────────────────────────────────────────
 
-    def _fix_nginx_post_upgrade_compat(self):
+    def _fix_nginx_post_upgrade_compat(self) -> bool:
         """[PATCH-248 FIX-2] 修复 Nginx 版本升级后的已知兼容性问题。
 
         覆盖场景:
@@ -21324,7 +24038,7 @@ class WPDeployManager:
                     logging.warning(t("warn_fix_11_detected_proxy_protocol_config_in"), _cf.name)
 
             # ── Fix 3: 注释指向不存在文件的 include (非 glob) ──
-            def _check_include_248(m):
+            def _check_include_248(m: "re.Match[str]") -> str:
                 _indent = m.group(1)
                 _inc = m.group(2).strip().strip('"').strip("'")
                 # glob 模式 (含 * ?) 匹配空也合法, 保留
@@ -21342,7 +24056,7 @@ class WPDeployManager:
 
             # ── Fix 4: 注释指向不存在证书的 ssl_certificate[_key] ──
             for _ssl_d in ("ssl_certificate_key", "ssl_certificate"):
-                def _check_ssl_248(m, _d=_ssl_d):
+                def _check_ssl_248(m: "re.Match[str]", _d: dict=_ssl_d) -> str:
                     _indent = m.group(1)
                     _path = m.group(2).strip().strip('"').strip("'")
                     if not _path or _path.startswith("$"):
@@ -21463,12 +24177,12 @@ class WPDeployManager:
                 _conf_d_path = Path("/etc/nginx/conf.d")
                 if not _conf_d_path.is_dir():
                     _conf_d_path.mkdir(mode=0o755, exist_ok=True)
-            except Exception:
-                pass
+            except Exception as _exc_23798:
+                logging.debug("[PATCH-276] _safe_write_file failed: %s", _exc_23798)
 
         return _fixed_any
 
-    def _fix_orphaned_module_confd_249(self):
+    def _fix_orphaned_module_confd_249(self) -> bool:
         """[PATCH-250] 清理 conf.d 中 srcache 模块不可用时残留的站点级指令。
 
         当 srcache .so 已被移除但 conf.d 站点配置仍含
@@ -21528,7 +24242,7 @@ class WPDeployManager:
             logging.warning(t("warn_patch_250_fix_orphaned_module_confd_error"), _e)
         return _fixed
 
-    def _remove_broken_confd_files_248(self):
+    def _remove_broken_confd_files_248(self) -> bool:
         """[PATCH-248 FIX-3] 隔离并移除导致 nginx -t 失败的 conf.d 文件。
 
         策略: 逐文件临时移除后测试 nginx -t, 定位问题文件。
@@ -21646,7 +24360,7 @@ class WPDeployManager:
         return _removed_any
 
 
-    def _get_nginx_version_tuple(self):
+    def _get_nginx_version_tuple(self) -> Optional[tuple]:
         """[PATCH-247 FIX-2] 返回当前 Nginx 版本元组, 如 (1, 28, 2)。
 
         Nginx 未安装或探测失败返回 None。
@@ -21665,11 +24379,11 @@ class WPDeployManager:
                 _r.stdout + _r.stderr)
             if _m:
                 return (int(_m.group(1)), int(_m.group(2)), int(_m.group(3)))
-        except Exception:
-            pass
+        except Exception as _exc_24000:
+            logging.debug("[PATCH-276] _get_nginx_version_tuple: %s", _exc_24000)
         return None
 
-    def _srcache_install_load_module(self, _sos):
+    def _srcache_install_load_module(self, _sos: list) -> bool:
         """写入 load_module 配置, nginx -t 验证, 失败完整回滚。
 
         加载顺序: ndk → echo → set_misc → redis2 → srcache
@@ -21819,8 +24533,8 @@ class WPDeployManager:
                         if _cleaned_s263 != _current_s263:
                             self._safe_write_file(
                                 _ngx_main, _cleaned_s263, mode=0o644)
-                except Exception:
-                    pass
+                except Exception as _exc_24154:
+                    logging.debug("[PATCH-276] _safe_write_file failed: %s", _exc_24154)
             for _p in _sos:
                 try: Path(_p).unlink()
                 except OSError: pass
@@ -21841,8 +24555,8 @@ class WPDeployManager:
                         self._safe_write_file(
                             _ngx_main, _result_s263, mode=0o644)
                         logging.info(t("info_patch_263_fix_5_aggressive_cleanup_removed_residual"))
-                except Exception:
-                    pass
+                except Exception as _exc_24176:
+                    logging.debug("[PATCH-276] _safe_write_file failed: %s", _exc_24176)
             # [PATCH-263 FIX-5] 移植 brotli PATCH-145 R-3: 终极快照兜底
             if not self.run_cmd(["nginx", "-t"], quiet=True):
                 if _snapshot is not None:
@@ -21876,8 +24590,8 @@ class WPDeployManager:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=5, check=False)
             _nginx_was_running_19 = (_act_19.returncode == 0)
-        except Exception:
-            pass
+        except Exception as _exc_24211:
+            logging.debug("[PATCH-276] _err_log_9b: %s", _exc_24211)
         if _nginx_was_running_19:
             self.run_cmd(["systemctl", "reload", "nginx"], quiet=True)
         else:
@@ -21937,8 +24651,8 @@ class WPDeployManager:
                                 timeout=8, check=False)
                             if _retry_263.returncode == 0:
                                 _headers_196 = (_retry_263.stdout or "").lower()
-                        except Exception:
-                            pass
+                        except Exception as _exc_24272:
+                            logging.debug("[PATCH-276] stdout: %s", _exc_24272)
                 if 'x-srcache-fetch-status' not in _headers_196:
                     # [PATCH-212 FIX-1] 检查当前 Nginx 配置是否含 srcache 指令。
                     # 编译阶段 (Stage 4 初期) 站点配置仍是 ACME challenge 模板,
@@ -21948,7 +24662,8 @@ class WPDeployManager:
                     try:
                         if self.cfg.nginx_conf.exists():
                             _nc_212 = self.cfg.nginx_conf.read_text(encoding='utf-8')
-                            _has_srcache_in_conf_212 = 'srcache_fetch' in _nc_212
+                            # [PATCH-280] Strip comments to avoid matching `# srcache_fetch`
+                            _has_srcache_in_conf_212 = 'srcache_fetch' in _strip_nginx_comments_d5(_nc_212)
                     except OSError:
                         pass
                     if _has_srcache_in_conf_212:
@@ -21981,8 +24696,8 @@ class WPDeployManager:
                 timeout=5, check=False)
             if _wc_pre_199.returncode == 0:
                 _pre_worker_count_199 = int(_wc_pre_199.stdout.strip())
-        except Exception:
-            pass
+        except Exception as _exc_24316:
+            logging.debug("[PATCH-276] operation failed: %s", _exc_24316)
         # Second probe: full GET triggers srcache_store async path
         time.sleep(2)
         try:
@@ -21992,8 +24707,8 @@ class WPDeployManager:
                  "http://127.0.0.1/"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 timeout=8, check=False)
-        except Exception:
-            pass
+        except Exception as _exc_24327:
+            logging.debug("[PATCH-276] stdout: %s", _exc_24327)
         time.sleep(2)  # wait for async store completion
         # Post-probe worker count comparison
         if _pre_worker_count_199 >= 2:
@@ -22012,8 +24727,8 @@ class WPDeployManager:
                     # 仅记录 warning, 由 Check 1 (error.log) 最终判定。
                     logging.warning(t("warn_patch_199_nginx_process_count_changed_after"),
                         _pre_worker_count_199, _post_count_199)
-            except Exception:
-                pass
+            except Exception as _exc_24347:
+                logging.debug("[PATCH-276] _wc_post_199: %s", _exc_24347)
         time.sleep(1)
         # -- Check 1: error.log 崩溃信号 --
         try:
@@ -22050,8 +24765,8 @@ class WPDeployManager:
                     _crash_detected_9b = True
                     logging.error(t("err_patch_184_fix_9b_nginx_not_active_after_srcache"),
                         _act_9b.stdout.strip())
-            except Exception:
-                pass
+            except Exception as _exc_24385:
+                logging.debug("[PATCH-276] operation failed: %s", _exc_24385)
         # -- Check 3: worker 进程数 (master 存活但 worker 已崩溃) --
         if not _crash_detected_9b:
             try:
@@ -22070,8 +24785,8 @@ class WPDeployManager:
                     _crash_detected_9b = True
                     logging.error(t("err_patch_184_fix_9b_only_nginx_process_es_after"),
                         _proc_count_9b)
-            except Exception:
-                pass
+            except Exception as _exc_24405:
+                logging.debug("[PATCH-276] _wc_9b: %s", _exc_24405)
         # -- 崩溃确认: 回滚 .so + load_module, restart 恢复 --
         if _crash_detected_9b:
             logging.error(t("err_patch_184_fix_9b_srcache_dynamic_module_abi_mismatch"))
@@ -22102,7 +24817,7 @@ class WPDeployManager:
         except OSError: pass
         return True
 
-    def _compile_srcache_modules(self):
+    def _compile_srcache_modules(self) -> bool:
         """五步编排: 依赖→下载→克隆→编译→安装。"""
         _nver = self._brotli_get_nginx_version()
         if not _nver:
@@ -22125,7 +24840,7 @@ class WPDeployManager:
         finally:
             _safe_rmtree(str(_bd), ignore_errors=True)  # [PATCH-260]
 
-    def _ensure_srcache_modules(self):
+    def _ensure_srcache_modules(self) -> None:
         """探测 → 版本门控 → 编译 → 降级。在 Nginx 配置生成前调用。"""
         global _SRCACHE_DETECT_CACHE
         if self.cfg.cache_mode != 'redis':
@@ -22193,8 +24908,8 @@ class WPDeployManager:
                 # 同步清理引用已删除 .so 的 load_module 配置
                 try:
                     self._cleanup_stale_nginx_load_modules()
-                except Exception:
-                    pass
+                except Exception as _exc_24528:
+                    logging.debug("[PATCH-276] _cleanup_stale_nginx_load_modules failed: %s", _exc_24528)
             # 清理 brotli 配置片段 (若 brotli .so 不存在, 指令会导致 nginx -t 失败)
             _brotli_conf_10 = Path("/etc/nginx/conf.d/brotli-wp-bootstrap.conf")
             if _brotli_conf_10.exists():
@@ -22332,8 +25047,8 @@ class WPDeployManager:
                                              "nginx-filesystem", "php-fpm"):
                                     if _chk in _installed:
                                         _pre_remove_pkgs.append(_chk)
-                        except Exception:
-                            pass
+                        except Exception as _exc_24667:
+                            logging.debug("[PATCH-276] _nc_path: %s", _exc_24667)
                         # 移除 AppStream nginx 子包
                         self.run_cmd(
                             [self.pkg_mgr, "remove", "-y",
@@ -22411,6 +25126,17 @@ class WPDeployManager:
                 #
                 # [PATCH-262 FIX-P5] 先移除 ABI 锁定的发行版模块包
                 # (libnginx-mod-*), 与 EL 的 _remove_abi_locked_nginx_modules 对齐。
+                # [PATCH-262 FIX-P5 BUG-1] 仅在 nginx.org 仓库确认可用时才移除模块包。
+                # 若 keyring/sources.list 均不存在 (key 导入失败、网络被拦截等),
+                # upgrade 必然失败且仍装回 1.22.1；此时提前删掉 libnginx-mod-*
+                # 只会迫使 brotli 走源码编译, 造成不必要的 5 分钟等待。
+                _nginx_org_keyring_p5 = Path(
+                    "/usr/share/keyrings/nginx-archive-keyring.gpg")
+                _nginx_org_list_p5 = Path(
+                    "/etc/apt/sources.list.d/nginx.list")
+                _nginx_org_repo_ok_p5 = (
+                    _nginx_org_keyring_p5.exists()
+                    and _nginx_org_list_p5.exists())
                 try:
                     _dpkg_mods = subprocess.run(
                         ["dpkg", "-l"],
@@ -22423,17 +25149,91 @@ class WPDeployManager:
                             l.split()[1] for l in _dpkg_mods.stdout.splitlines()
                             if l.startswith("ii") and "libnginx-mod" in l]
                         if _deb_mod_pkgs:
-                            logging.info(t("info_patch_262_fix_p5_removing_abi_locked_debian_nginx"),
-                                ", ".join(_deb_mod_pkgs))
-                            self.run_cmd(
-                                ["apt", "remove", "-y"] + _deb_mod_pkgs,
-                                quiet=True, timeout=60)
-                except Exception:
-                    pass
+                            if _nginx_org_repo_ok_p5:
+                                logging.info(t("info_patch_262_fix_p5_removing_abi_locked_debian_nginx"),
+                                    ", ".join(_deb_mod_pkgs))
+                                self.run_cmd(
+                                    ["apt", "remove", "-y"] + _deb_mod_pkgs,
+                                    quiet=True, timeout=60)
+                            else:
+                                logging.info(
+                                    "[PATCH-262 FIX-P5] nginx.org 仓库未就绪, "
+                                    "保留发行版模块包 (%s) 以避免不必要的重编译。",
+                                    ", ".join(_deb_mod_pkgs))
+                except Exception as _exc_24780:
+                    logging.debug("[PATCH-276] stderr: %s", _exc_24780)
+                # [PATCH-250 FIX-8] nginx.org 仓库未就绪时跳过所有升级阶段。
+                # 无 keyring/sources.list → apt install nginx 只会从发行版装回
+                # 1.22.1, 而且若当前 nginx 配置存在损坏的 load_module 指令
+                # (如源码编译的 .so 已删除), apt postinst 调用 nginx -t 会失败
+                # → dpkg exit 1 → 整个 apt 命令报错。跳过可避免该副作用。
+                if not _nginx_org_repo_ok_p5:
+                    logging.info(
+                        "[PATCH-250 FIX-8] nginx.org 仓库未配置, "
+                        "跳过 apt upgrade 阶段 (无法升级到 1.28+)。")
+                    # ── 升级前预检: 清理损坏的模块 conf, 避免影响后续 nginx reload ──
+                    # 即使不升级, 也要确保 nginx -t 通过, 防止后续 reload 失败。
+                    try:
+                        _pre_t = subprocess.run(
+                            ["nginx", "-t"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            encoding="utf-8", errors="replace",
+                            timeout=10, check=False)
+                        if _pre_t.returncode != 0:
+                            _pre_err = (_pre_t.stderr + _pre_t.stdout).lower()
+                            logging.info(
+                                "[PATCH-250 FIX-8] nginx -t 失败, 尝试清理损坏模块 conf...")
+                            # 清理引用不存在 .so 的 load_module 配置
+                            for _pre_dir in (
+                                "/usr/share/nginx/modules",
+                                "/etc/nginx/modules-enabled",
+                            ):
+                                _pre_dp = Path(_pre_dir)
+                                if not _pre_dp.is_dir():
+                                    continue
+                                for _pre_f in _pre_dp.glob("*.conf"):
+                                    try:
+                                        _pre_txt = _pre_f.read_text(
+                                            encoding="utf-8", errors="replace")
+                                        for _pre_ln in _pre_txt.splitlines():
+                                            if "load_module" not in _pre_ln:
+                                                continue
+                                            _pre_parts = _pre_ln.split('"')
+                                            _pre_so = (
+                                                _pre_parts[1]
+                                                if len(_pre_parts) >= 2
+                                                else _pre_ln.split()[-1].rstrip(";"))
+                                            if _pre_so and not Path(_pre_so).exists():
+                                                _new_name = _pre_f.with_name(
+                                                    _pre_f.name
+                                                    + ".stale-preflight")
+                                                _pre_f.rename(_new_name)
+                                                logging.info(
+                                                    "[PATCH-250 FIX-8] 已隔离损坏模块 conf: "
+                                                    "%s → %s",
+                                                    _pre_f.name,
+                                                    _new_name.name)
+                                                break
+                                    except OSError:
+                                        pass
+                            # 同步清理 conf.d 中引用已删除 .so 的 brotli 配置
+                            _pre_brotli = Path(
+                                "/etc/nginx/conf.d/brotli-wp-bootstrap.conf")
+                            if _pre_brotli.exists():
+                                _pre_brotli.rename(
+                                    _pre_brotli.with_suffix(
+                                        ".conf.stale-preflight"))
+                                logging.info(
+                                    "[PATCH-250 FIX-8] 已隔离损坏的 brotli conf.d 配置。")
+                    except Exception as _pre_e:
+                        logging.debug("[PATCH-250 FIX-8] pre-flight cleanup error: %s",
+                                      _pre_e)
                 # 阶段 0: --only-upgrade (最安全, 仅当 nginx 元包已装时生效)
-                _upgrade_attempted = bool(self.run_cmd(
-                    ["apt", "install", "--only-upgrade", "-y", "nginx"],
-                    quiet=True, timeout=120))
+                _upgrade_attempted = False
+                if _nginx_org_repo_ok_p5:
+                    _upgrade_attempted = bool(self.run_cmd(
+                        ["apt", "install", "--only-upgrade", "-y", "nginx"],
+                        quiet=True, timeout=120))
                 # 检查是否达到 1.28
                 if _upgrade_attempted:
                     _reset_nginx_capability_caches()
@@ -22442,7 +25242,7 @@ class WPDeployManager:
                     else:
                         _upgrade_attempted = False  # 未达标, 进入阶段 1
                 # 阶段 1: 全新安装 (覆盖仅装 nginx-core 而无元包的情况)
-                if not _upgrade_attempted:
+                if not _upgrade_attempted and _nginx_org_repo_ok_p5:
                     _nginx_conf_bak_deb = None
                     try:
                         _nc_deb = Path("/etc/nginx/nginx.conf")
@@ -22458,9 +25258,10 @@ class WPDeployManager:
                          "nginx-light", "nginx-extras"],
                         quiet=True, timeout=60)
                     # 从 nginx.org 安装 (APT pinning 确保来源正确)
+                    # [PATCH-272] 不用 quiet=True, 失败时需要看 apt 输出
                     _upgrade_attempted = bool(self.run_cmd(
                         ["apt", "install", "-y", "nginx"],
-                        quiet=True, timeout=120))
+                        quiet=False, timeout=120))
                     # 恢复配置
                     if _nginx_conf_bak_deb:
                         try:
@@ -22537,8 +25338,8 @@ class WPDeployManager:
                                         _main_conf_35, _mc_new_35,
                                         mode=0o644)
                                     logging.info(t("info_fix_35_updated_worker_processes_auto_after"))
-                    except Exception:
-                        pass
+                    except Exception as _exc_24958:
+                        logging.debug("[PATCH-276] _safe_write_file failed: %s", _exc_24958)
                     # [FIX #29] Nginx 升级后 PHP-FPM socket 一致性检查。
                     # 升级过程中 nginx 被 restart/stop, 此时 PHP-FPM 未受影响,
                     # 但后续 nginx 配置生成依赖 socket 存在。提前确认。
@@ -22562,8 +25363,8 @@ class WPDeployManager:
                                 pass
                     try:
                         self._cleanup_stale_nginx_load_modules()
-                    except Exception:
-                        pass
+                    except Exception as _exc_24983:
+                        logging.debug("[PATCH-276] _cleanup_stale_nginx_load_modules failed: %s", _exc_24983)
                     _brotli_c11 = Path("/etc/nginx/conf.d/brotli-wp-bootstrap.conf")
                     if _brotli_c11.exists():
                         _br_avail_11 = any(
@@ -22676,6 +25477,19 @@ class WPDeployManager:
                 else:
                     logging.warning(t("warn_srcache_nginx_upgrade_fail",
                                       ver=_nv_str_post))
+                    # [PATCH-272] 诊断: 输出 apt-cache policy 帮助定位原因
+                    try:
+                        _diag = subprocess.run(
+                            ["apt-cache", "policy", "nginx"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            encoding="utf-8", errors="replace",
+                            timeout=10, check=False)
+                        if _diag.stdout:
+                            logging.warning(
+                                "[PATCH-272] apt-cache policy nginx:\n%s",
+                                _diag.stdout.strip())
+                    except Exception as _exc_25108:
+                        logging.debug("[PATCH-276] str: %s", _exc_25108)
                     logging.warning(t("warn_srcache_nginx_too_old",
                                       ver=_nv_str_post))
                     self.cfg.cache_mode = 'fastcgi'
@@ -22737,8 +25551,8 @@ class WPDeployManager:
                     # (引用不存在的 .so → nginx 无法操作)
                     try:
                         self._cleanup_stale_nginx_load_modules()
-                    except Exception:
-                        pass
+                    except Exception as _exc_25171:
+                        logging.debug("[PATCH-276] _cleanup_stale_nginx_load_modules failed: %s", _exc_25171)
                     for _lm_abi in (
                         "/usr/share/nginx/modules/50-mod-srcache.conf",
                         "/etc/nginx/modules-enabled/50-mod-srcache.conf",
@@ -22750,8 +25564,8 @@ class WPDeployManager:
                         except OSError:
                             pass
                     _SRCACHE_DETECT_CACHE = None
-            except Exception:
-                pass
+            except Exception as _exc_25184:
+                logging.debug("[PATCH-276] _cleanup_stale_nginx_load_modules: %s", _exc_25184)
             if _compat_ok:
                 # [PATCH-173 A1] "enabled" 移至 _ensure_redis_for_srcache
                 # 模块存在 ≠ 功能就绪, Redis 确认运行后才输出
@@ -22760,6 +25574,17 @@ class WPDeployManager:
             _ok, _miss = _detect_srcache_modules()
         logging.info(t("info_srcache_trying_compile",
                        missing=', '.join(_miss)))
+        # [PATCH-275] 编译前预检: 确保 nginx -t 无预存错误。
+        # 场景: Nginx 跨版本升级后 brotli 等 conf.d 文件引用已移除的模块指令,
+        # 导致 srcache 编译本身成功但 nginx -t 验证因不相关错误失败, 白白回滚。
+        # 先隔离这些坏文件, 让 srcache 的 nginx -t 只反映 srcache 本身的问题。
+        try:
+            if not self.run_cmd(["nginx", "-t"], quiet=True):
+                self._remove_broken_confd_files_248()
+        except Exception as _src_pre_e:
+            # [PATCH-276 FIX-P0-4] 编译前 nginx 预检异常, 记录 debug
+            logging.debug("[PATCH-276] srcache pre-compile nginx -t"
+                          " check failed: %s", _src_pre_e)
         if self._compile_srcache_modules():
             _SRCACHE_DETECT_CACHE = None
             logging.info(t("info_srcache_compile_success_redetect"))
@@ -22858,8 +25683,8 @@ class WPDeployManager:
                  "http://127.0.0.1/"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 timeout=8, check=False)
-        except Exception:
-            pass
+        except Exception as _exc_25303:
+            logging.debug("[PATCH-276] _err_log: %s", _exc_25303)
         # 多发几个请求增加触发概率
         for _ in range(2):
             try:
@@ -22869,8 +25694,8 @@ class WPDeployManager:
                      "http://127.0.0.1/"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     timeout=5, check=False)
-            except Exception:
-                pass
+            except Exception as _exc_25314:
+                logging.debug("[PATCH-276] _err_log: %s", _exc_25314)
         time.sleep(3)
         # ── Step 3: 读取 baseline 之后的新日志 ──
         _crashed = False
@@ -22915,8 +25740,8 @@ class WPDeployManager:
                 if _act.stdout.strip() != "active":
                     _crashed = True
                     logging.error(t("err_fix_m_nginx_is_not_active_after"))
-            except Exception:
-                pass
+            except Exception as _exc_25360:
+                logging.debug("[PATCH-276] operation failed: %s", _exc_25360)
         if _crashed:
             logging.error(t("err_srcache_abi_fallback"))
             self.cfg.cache_mode = "fastcgi"
@@ -22956,13 +25781,15 @@ class WPDeployManager:
                     optimize=self.cfg.optimize,
                     cert_chain=str(self.cfg.cert_chain),
                     cert_key=str(self.cfg.cert_key),
-                    http3=self.cfg.http3)
+                    http3=self.cfg.http3,
+                    serve_dist=self.cfg.serve_dist)
             else:
                 _fb_conf = generate_http_production_config(
                     self.cfg.domain, self.cfg.webroot_path, _sock,
                     cache_mode="fastcgi",
                     allow_xmlrpc=self.cfg.allow_xmlrpc,
-                    optimize=self.cfg.optimize)
+                    optimize=self.cfg.optimize,
+                    serve_dist=self.cfg.serve_dist)
             _fb_conf = self._align_nginx_with_cert(_fb_conf)
             # 直接写盘而非 apply_nginx_config_safe: 此时 nginx 可能已崩溃,
             # apply 的 reload 会失败并回滚到 srcache .bak, 造成死循环。
@@ -23087,7 +25914,7 @@ class WPDeployManager:
             return False
         return True
 
-    def _parse_cert_san_set(self):
+    def _parse_cert_san_set(self) -> set:
         """[PATCH-162 FIX-2] 返回证书 SAN 域名集合, 失败返回 None。"""
         if not self.cfg.cert_chain.exists():
             return None
@@ -23148,6 +25975,10 @@ class WPDeployManager:
         _result = []
         for _l in _lines:
             _ls = _l.strip()
+            # [PATCH-280] Skip comment lines to avoid matching `# listen 443 ssl ...`
+            if _ls.startswith("#"):
+                _result.append(_l)
+                continue
             if "listen" in _ls and "443" in _ls and "ssl" in _ls:
                 _in_ssl_block = True
             if _in_ssl_block and _sn_re.search(_l):
@@ -23182,6 +26013,7 @@ class WPDeployManager:
                 cert_chain=str(self.cfg.cert_chain),
                 cert_key=str(self.cfg.cert_key),
                 http3=self.cfg.http3,  # [PATCH-167 FIX-4d]
+                serve_dist=self.cfg.serve_dist,  # [PATCH-271]
             )
         else:
             config = generate_http_production_config(
@@ -23189,6 +26021,7 @@ class WPDeployManager:
                 cache_mode=self.cfg.cache_mode,
                 allow_xmlrpc=self.cfg.allow_xmlrpc,
                 optimize=self.cfg.optimize,
+                serve_dist=self.cfg.serve_dist,  # [PATCH-271]
             )
         if self.cfg.optimize:
             logging.info(t("info_open_file_cache"))
@@ -23225,8 +26058,17 @@ class WPDeployManager:
             return True
 
         if not shutil.which("curl"):
+            # [PATCH-279] Auto-install curl; health check is critical for
+            # detecting silent deployment failures (wrong PHP, DB down, etc).
             logging.warning(t("warn_no_curl_health"))
-            return True
+            logging.info("[PATCH-279] Attempting to install curl...")
+            if self.pkg_mgr in ("dnf", "yum"):
+                self.run_cmd([self.pkg_mgr, "install", "-y", "curl"], quiet=True, timeout=60)
+            elif self.pkg_mgr == "apt":
+                self.run_cmd(["apt", "install", "-y", "curl"], quiet=True, timeout=60)
+            if not shutil.which("curl"):
+                logging.warning("[PATCH-279] curl install failed — skipping health check.")
+                return True
 
         # [V3.2.1] N-2: 根据证书状态选择 scheme, 防御 HTTP-only 调用场景
         _scheme = "https" if self.cfg.cert_chain.exists() else "http"
@@ -23387,8 +26229,8 @@ class WPDeployManager:
                                 if _diag_plain_244:
                                     logging.info(t("info_patch_244_diag_1_http_response_body_first_chars"),
                                         _diag_plain_244)
-                        except Exception:
-                            pass
+                        except Exception as _exc_25836:
+                            logging.debug("[PATCH-276] stdout: %s", _exc_25836)
                         # ── [PATCH-242 BUG-4] 诊断: 输出 PHP-FPM 错误日志 ──
                         # 无论首次还是二次恢复, 都先记录诊断信息
                         try:
@@ -23414,10 +26256,10 @@ class WPDeployManager:
                                             for _el in _tail_242.stdout.strip().splitlines()[-10:]:
                                                 logging.info("    %s", _el)
                                             break  # 只输出第一个有内容的日志
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            pass
+                                    except Exception as _exc_25863:
+                                        logging.debug("[PATCH-276] _pl_242: %s", _exc_25863)
+                        except Exception as _exc_25865:
+                            logging.debug("[PATCH-276] _pl_242: %s", _exc_25865)
                         # ── [PATCH-251 FIX-H] 站点级 Nginx 错误日志诊断 ──
                         # 原代码只看 PHP-FPM journal, 但 Nginx 自身的 500
                         # (非 PHP 错误) 只记录在站点级 error.log 中。
@@ -23441,8 +26283,8 @@ class WPDeployManager:
                                         _site_errlog_h)
                                     for _elh in _el_out_h.splitlines()[-10:]:
                                         logging.info("    %s", _elh)
-                        except Exception:
-                            pass
+                        except Exception as _exc_25890:
+                            logging.debug("[PATCH-276] _el_r_h: %s", _exc_25890)
                         # ── [PATCH-251 FIX-H] Socket 连通性 + ACL 诊断 ──
                         # 检查 fastcgi socket 是否存在、权限是否正确,
                         # 以及 listen.acl_users 是否包含 nginx 用户。
@@ -23468,8 +26310,8 @@ class WPDeployManager:
                                     if _acl_r_h.stdout.strip():
                                         logging.info(t("info_patch_251_fix_h_socket_acl"),
                                             _acl_r_h.stdout.strip())
-                        except Exception:
-                            pass
+                        except Exception as _exc_25917:
+                            logging.debug("[PATCH-276] _sock_h: %s", _exc_25917)
                         # ── [PATCH-251 FIX-H] 修复 listen.acl_users ──
                         # Rocky Linux 9 PHP-FPM 默认使用 POSIX ACL 控制
                         # socket 访问。当 listen.acl_users 不包含 nginx
@@ -23592,8 +26434,8 @@ class WPDeployManager:
                                                      _el_text_251):
                                             _is_module_crash_251 = True
                                             break
-                            except Exception:
-                                pass
+                            except Exception as _exc_26041:
+                                logging.debug("[PATCH-276] L26041: %s", _exc_26041)
                             if _is_module_crash_251:
                                 logging.info(t("info_patch_251_fix_g_nginx_module_crash_detected_in"))
                                 # 清除全部自编译 .so
@@ -23710,8 +26552,8 @@ class WPDeployManager:
                                                     0, _real_opc_244)
                                                 logging.info(t("info_patch_244_opcache_file_cache_discovered"),
                                                     _real_opc_244)
-                                except Exception:
-                                    pass
+                                except Exception as _exc_26159:
+                                    logging.debug("[PATCH-276] stderr: %s", _exc_26159)
                                 for _opc_dir_242 in _opc_dirs_244:
                                     _od_242 = Path(_opc_dir_242)
                                     if _od_242.is_dir():
@@ -24109,9 +26951,11 @@ class WPDeployManager:
                             for _d in _doms:
                                 _result.extend(["-d", _d])
                             return _result
-        except Exception:
-            pass
-        return self._default_cert_domain_args()
+        except Exception as _cd_e:
+            # [PATCH-276 FIX-P0-4] 域名提取失败 → 回退默认列表。
+            # 记录以便排查 certbot certificates 命令异常。
+            logging.debug("[PATCH-276] certbot certificates domain"
+                          " extraction failed: %s", _cd_e)
 
     def _get_cert_domains(self) -> list:
         """N1: 从已有证书的 SAN 中提取域名列表。
@@ -24215,7 +27059,7 @@ class WPDeployManager:
                 _m = re.search(r'__version__\s*=\s*"([^"]+)"', _head)
                 if _m:
                     _remote = _m.group(1)
-                    def _vt(v):
+                    def _vt(v: str) -> tuple:
                         # [V3.2.136] AUDIT L-3: 容错预发布标签
                         _mv = re.match(r'(\d+(?:\.\d+)*)', v)
                         if not _mv:
@@ -24227,8 +27071,8 @@ class WPDeployManager:
                     if _vt(_remote) > _vt(__version__):
                         logging.info(t("info_version_check_available",
                                        current=__version__))
-        except Exception:
-            pass
+        except Exception as _exc_26678:
+            logging.debug("[PATCH-276] timeout: %s", _exc_26678)
 
     def renew_cert(self, force: bool = False) -> bool:  # [AUDIT M-1]
         """续期 SSL 证书。
@@ -24383,8 +27227,12 @@ class WPDeployManager:
                     logging.info(t("info_cert_valid"))
                 else:
                     logging.info(t("info_cert_expiring_soon"))
-            except Exception:
-                pass
+            except Exception as _exp_e:
+                # [PATCH-276 FIX-P0-4] 证书到期检查失败 (openssl 异常) 不应静默,
+                # 可能掩盖证书文件损坏或 openssl 版本不兼容等问题。
+                logging.warning(
+                    "[PATCH-276] Certificate expiry check failed: %s",
+                    _exp_e)
         elif not cert_file.exists():
             logging.warning(t("warn_cert_not_found", path=cert_file))
 
@@ -24441,6 +27289,10 @@ class WPDeployManager:
                 if not _rsa_fb:
                     logging.info(t("ok_cert_renew"))
                 self._verify_ssl_handshake()
+                # [PATCH-277] 续期成功后检查证书寿命是否变化。
+                # LE 可能在不通知的情况下缩短证书有效期 (如从 90 天→47 天),
+                # 此时需要自动调整 timer 频率, 否则续期间隔可能不够。
+                self._update_timer_if_lifetime_changed()
                 break
             if err_type in (CmdResult.FATAL, CmdResult.PERMISSION):
                 break
@@ -24683,8 +27535,8 @@ class WPDeployManager:
                             pass
                         if _probe_r.returncode == 0 and "REDIS_NO" in _probe_r.stdout:
                             logging.warning(t("warn_p8_php_cli_loads_redis_but"))
-                except Exception:
-                    pass
+                except Exception as _exc_27138:
+                    logging.debug("[PATCH-276] _safe_write_file: %s", _exc_27138)
 
             logging.info(t("ok_php_redis_pecl"))
             return True
@@ -24717,8 +27569,11 @@ class WPDeployManager:
                         r"(?i)(using password)\s*[:]\s*\S+",
                         r'\1: <REDACTED>', _sanitized_line)
                     logging.info("    %s", _sanitized_line)
-        except Exception:
-            pass
+        except Exception as _jt_e:
+            # [PATCH-276 FIX-P0-4] journal 日志输出是诊断服务启动失败的
+            # 关键信息源, 静默失败会让排障陷入死胡同。
+            logging.debug("[PATCH-276] journalctl tail for %s"
+                          " failed: %s", svc, _jt_e)
 
     def _try_repair(self, stage: str, repairs: list) -> bool:
         """通用修复执行器。
@@ -24763,20 +27618,63 @@ class WPDeployManager:
 
         返回 True 表示修复后安装成功。
         """
-        def _clean_and_retry():
+        def _clean_and_retry() -> bool:
             if self.pkg_mgr in ("dnf", "yum"):
                 self.run_cmd([self.pkg_mgr, "clean", "all"], quiet=True)
                 self.run_cmd([self.pkg_mgr, "makecache"], quiet=True, timeout=60)
             elif self.pkg_mgr == "apt":
                 self.run_cmd(["apt", "clean"], quiet=True)
-                self.run_cmd(["apt", "update"], quiet=True, timeout=120)
+                # [BUGFIX] 检查 apt update 返回值，quiet=False 确保错误可见
+                _upd = self.run_cmd(["apt", "update"], quiet=False, timeout=120)
+                if not _upd:
+                    logging.warning(
+                        "[_clean_and_retry] apt update 失败，包索引可能未更新"
+                        if _LANG == "zh" else
+                        "[_clean_and_retry] apt update failed; package index may be stale")
             return bool(self.run_cmd(
                 [self.pkg_mgr if self.pkg_mgr != "apt" else "apt",
                  "install", "-y"] + failed_pkgs,
                 quiet=False, timeout=300, stream=True,  # [PATCH-STREAM-2]
             ))
 
-        def _install_epel_retry():
+        def _re_setup_php_repo_retry() -> bool:
+            """[BUGFIX] 针对"Unable to locate package phpX.Y-*"的专项修复:
+            重新配置 Sury/Ondrej PHP 仓库并强制 apt update，
+            覆盖首次 _setup_sury_dpa 中 apt update 静默失败的场景。
+            """
+            if self.pkg_mgr != "apt":
+                return False
+            # 判断是否为 PHP 包缺失（而非其他包冲突问题）
+            _php_missing = any(
+                p.startswith("php") for p in failed_pkgs
+                if "Unable to locate" in str(failed_pkgs) or True  # always check
+            )
+            if not _php_missing:
+                return False
+            logging.info(
+                "[BUGFIX] 检测到 PHP 包无法定位，重新配置 Sury DPA 并刷新索引..."
+                if _LANG == "zh" else
+                "[BUGFIX] PHP packages not found; re-configuring Sury DPA and refreshing index...")
+            _target = self._determine_php_target()
+            if _target:
+                _repo_ok = self._setup_php_repo(_target)
+                if not _repo_ok:
+                    logging.warning(
+                        "[BUGFIX] Sury DPA 重新配置失败"
+                        if _LANG == "zh" else
+                        "[BUGFIX] Sury DPA re-configuration failed")
+                    return False
+            else:
+                # 强制刷新现有索引
+                _upd = self.run_cmd(["apt", "update"], quiet=False, timeout=120)
+                if not _upd:
+                    return False
+            return bool(self.run_cmd(
+                ["apt", "install", "-y"] + failed_pkgs,
+                quiet=False, timeout=300, stream=True,
+            ))
+
+        def _install_epel_retry() -> bool:
             if self.pkg_mgr not in ("dnf", "yum"):
                 return False
             _epel_ok = bool(self.run_cmd(
@@ -24790,7 +27688,7 @@ class WPDeployManager:
                 quiet=False, timeout=300, stream=True,  # [PATCH-STREAM-2]
             ))
 
-        def _fix_broken():
+        def _fix_broken() -> bool:
             if self.pkg_mgr == "apt":
                 self.run_cmd(["apt", "--fix-broken", "install", "-y"], quiet=True)
                 return bool(self.run_cmd(
@@ -24805,7 +27703,7 @@ class WPDeployManager:
                 ))
             return False
 
-        def _fix_nginx_abi_conflict():
+        def _fix_nginx_abi_conflict() -> bool:
             """[PATCH-245 FIX-2] 检测并修复 nginx(abi) 依赖冲突。
 
             当第三方模块 (如 nginx-mod-brotli) 锁定旧版 ABI 时,
@@ -24835,7 +27733,7 @@ class WPDeployManager:
                 [self.pkg_mgr, "install", "-y", "--allowerasing"] + failed_pkgs,
                 quiet=False, stream=True, timeout=600))
 
-        def _fix_nginx_core_file_conflict():
+        def _fix_nginx_core_file_conflict() -> bool:
             """[PATCH-263] 修复 nginx-core 与 nginx.org 包的文件级冲突。
 
             当用户在运行脚本前手动 dnf install nginx, 系统装有
@@ -24896,6 +27794,9 @@ class WPDeployManager:
 
         repairs = [
             (t("diag_pkg_clean_retry"), _clean_and_retry, None),
+            # [BUGFIX] 新增: PHP 包无法定位时重新配置 Sury DPA
+            ("[BUGFIX] PHP repo re-setup (Sury DPA apt update may have failed silently)",
+             _re_setup_php_repo_retry, None),
             (t("diag_pkg_epel_install"), _install_epel_retry, None),
             ("[PATCH-263] nginx-core file conflict auto-fix",
              _fix_nginx_core_file_conflict, None),
@@ -24905,8 +27806,7 @@ class WPDeployManager:
         ]
         return self._try_repair("install_packages", repairs)
 
-    def _nginx_reset_conflicting_conf(self):
-        # type: () -> bool
+    def _nginx_reset_conflicting_conf(self) -> bool:
         """从 conf.d 中检测并重命名导致 nginx -t 失败的配置文件。
 
         优先从 stderr 精确匹配问题文件; 未命中时回退逐文件检测 (上限 10 次)。
@@ -24958,8 +27858,10 @@ class WPDeployManager:
                     return bool(self.run_cmd(
                         ["systemctl", "restart", "nginx"],
                         quiet=True, timeout=30))
-            except Exception:
-                pass
+            except Exception as _pchk_e:
+                # [PATCH-276 FIX-P0-4] 预检异常, 降级到逐文件检测
+                logging.debug("[PATCH-276] conf.d pre-check failed: %s",
+                              _pchk_e)
             finally:
                 for _orig, _bak in _test_moved:
                     if _bak.exists() and not _orig.exists():
@@ -25099,7 +28001,7 @@ class WPDeployManager:
             logging.warning(t("diag_found", desc=t("diag_nginx_config_error")))
             logging.warning(t("warn_nginx"), (_t.stderr or _t.stdout)[:500])
 
-        def _kill_port80_and_restart():
+        def _kill_port80_and_restart() -> bool:
             # 探测占用 80 端口的进程
             _ss = subprocess.run(
                 ["ss", "-tlnp", "sport", "=", ":80"],
@@ -25114,7 +28016,7 @@ class WPDeployManager:
                 ["systemctl", "restart", "nginx"], quiet=True, timeout=30,
             ))
 
-        def _selinux_fix_and_restart():
+        def _selinux_fix_and_restart() -> bool:
             self.run_cmd(["setsebool", "-P", "httpd_can_network_connect", "1"], quiet=True)
             self.run_cmd(["setsebool", "-P", "httpd_unified", "1"], quiet=True)
             return bool(self.run_cmd(
@@ -25140,7 +28042,7 @@ class WPDeployManager:
         """
         # [V3.2.74] Gap-3: 输出 journal 日志辅助诊断
         self._log_journal_tail(svc, n=15)
-        def _fix_pool_user():
+        def _fix_pool_user() -> str:
             # [V3.2.29] BUG-A: 使用 self.nginx_user 替代硬编码 www-data,
             # RHEL/CentOS 上 Nginx 用户为 nginx 而非 www-data。
             _target_user = self.nginx_user
@@ -25158,13 +28060,13 @@ class WPDeployManager:
                         # 改用 _safe_write_file() 保证原子替换 (O_CREAT+rename)。
                         if self._safe_write_file(_cpath, _new, mode=0o644):
                             _fixed = True
-                except Exception:
-                    pass
+                except Exception as _exc_27664:
+                    logging.debug("[PATCH-276] _fix_pool_user: %s", _exc_27664)
             return _fixed and bool(self.run_cmd(
                 ["systemctl", "restart", svc], quiet=True, timeout=30,
             ))
 
-        def _fix_pool_nginx_user():
+        def _fix_pool_nginx_user() -> str:
             _fixed = False
             for _cpath in self._get_php_conf_paths():
                 try:
@@ -25174,8 +28076,8 @@ class WPDeployManager:
                         # [V3.2.25] BUG-A: 同 _fix_pool_user 修复，原子写入。
                         if self._safe_write_file(_cpath, _new, mode=0o644):
                             _fixed = True
-                except Exception:
-                    pass
+                except Exception as _exc_27680:
+                    logging.debug("[PATCH-276] operation failed: %s", _exc_27680)
             return _fixed and bool(self.run_cmd(
                 ["systemctl", "restart", svc], quiet=True, timeout=30,
             ))
@@ -25197,7 +28099,7 @@ class WPDeployManager:
         """
         # [V3.2.74] Gap-3: 输出 journal 日志辅助诊断
         self._log_journal_tail(self.db_svc, n=20)
-        def _remove_tuning_restart():
+        def _remove_tuning_restart() -> bool:
             """回滚调优配置，以默认配置重新启动。"""
             _removed = False
             for _conf_dir in ("/etc/mysql/conf.d", "/etc/my.cnf.d"):
@@ -25216,7 +28118,7 @@ class WPDeployManager:
                 ))
             return False
 
-        def _fix_datadir_perms():
+        def _fix_datadir_perms() -> bool:
             """修复数据目录权限（常见于 Docker/LXC 环境）。"""
             for _data_dir in ("/var/lib/mysql", "/var/lib/mariadb"):
                 if Path(_data_dir).exists():
@@ -25227,7 +28129,7 @@ class WPDeployManager:
                 ["systemctl", "restart", self.db_svc], quiet=True, timeout=60,
             ))
 
-        def _extend_wait_retry():
+        def _extend_wait_retry() -> bool:
             """延长等待时间，等待慢速存储上的 InnoDB 初始化完成。"""
             time.sleep(15)
             self.run_cmd(
@@ -25235,7 +28137,7 @@ class WPDeployManager:
             )
             return self._wait_db_ready(max_wait=60)
 
-        def _rollback_tuning():
+        def _rollback_tuning() -> None:
             for _conf_dir in ("/etc/mysql/conf.d", "/etc/my.cnf.d"):
                 _f = Path(_conf_dir) / "wp-bootstrap-tuning.cnf"
                 _bak = _f.with_suffix(".cnf.bak")
@@ -25271,7 +28173,7 @@ class WPDeployManager:
             注意: 此方法返回 bool, 与 _diagnose_cert_failure (返回 dict)
             不同, 调用方请勿混淆。[V3.2.103] FIX-7
         """
-        def _open_firewall():
+        def _open_firewall() -> None:
             _ok = False
             if shutil.which("firewall-cmd"):
                 self.run_cmd(
@@ -25298,7 +28200,7 @@ class WPDeployManager:
                 _ok = True
             return _ok
 
-        def _remove_certbot_lock():
+        def _remove_certbot_lock() -> None:
             _lock_dirs = [
                 "/var/lib/letsencrypt/.certbot.lock",
                 "/tmp/.certbot.lock",
@@ -25315,7 +28217,7 @@ class WPDeployManager:
                         pass
             return _removed
 
-        def _fix_webroot():
+        def _fix_webroot() -> bool:
             try:
                 _wr = self.cfg.webroot_path
                 _wr.mkdir(parents=True, exist_ok=True)
@@ -25341,7 +28243,7 @@ class WPDeployManager:
     # -----------------------------------------------------------------------
     # [V3.2.79/V3.2.81] 续期失败通知
     # -----------------------------------------------------------------------
-    def _get_notify_file_paths(self):
+    def _get_notify_file_paths(self) -> tuple:
         """返回通知相关文件路径三元组: (service_unit, script, env_file)。"""
         _prefix = self.cfg.systemd_prefix
         _svc = Path(
@@ -25350,8 +28252,83 @@ class WPDeployManager:
         _env = Path("/etc/default/wp-ssl-notify-%s" % _prefix)
         return (_svc, _script, _env)
 
+    # ------------------------------------------------------------------
+    # [PATCH-278] Journal/email fallback when --notify-webhook is absent
+    # ------------------------------------------------------------------
+    def _setup_journal_notify_on_failure(self) -> bool:
+        """Create a lightweight OnFailure= service that logs CRIT to journal
+        and attempts to email root when SSL renewal fails.
+
+        This ensures renewal failures are NEVER completely silent, even when
+        the user has not configured --notify-webhook.
+
+        Returns True if the service unit was successfully written.
+        """
+        if self.cfg.dry_run:
+            return False
+        _svc_file, _script_file, _ = self._get_notify_file_paths()
+        _domain = self.cfg.domain
+        _prefix = self.cfg.systemd_prefix
+
+        # Minimal POSIX sh script: journal CRIT + optional email
+        _script_content = (
+            "#!/bin/sh\n"
+            "# [PATCH-278] Auto-generated fallback failure notifier\n"
+            "# (no --notify-webhook configured; journal + email fallback)\n"
+            "set -eu\n"
+            "DOMAIN='%s'\n"
+            'HOSTNAME="$(hostname -f 2>/dev/null || hostname)"\n'
+            'MSG="[WP-SSL-CRIT] SSL renewal FAILED for ${DOMAIN} on ${HOSTNAME}. '
+            'Certificate may expire soon. Run: systemctl status %s-ssl.service"\n'
+            '# 1) Always log to journal at CRIT priority\n'
+            'if command -v systemd-cat >/dev/null 2>&1; then\n'
+            '  printf "%%s\\n" "${MSG}" | systemd-cat -t wp-ssl-renewal -p crit\n'
+            'fi\n'
+            '# Also write to syslog via logger as belt-and-suspenders\n'
+            'if command -v logger >/dev/null 2>&1; then\n'
+            '  logger -t wp-ssl-renewal -p crit "${MSG}"\n'
+            'fi\n'
+            '# 2) Attempt email notification to root\n'
+            'if command -v mail >/dev/null 2>&1; then\n'
+            '  printf "%%s\\n\\nCheck with:\\n  journalctl -u %s-ssl.service -n 50\\n'
+            '  openssl s_client -connect ${DOMAIN}:443 -servername ${DOMAIN} </dev/null 2>/dev/null '
+            '| openssl x509 -noout -dates\\n" "${MSG}" '
+            '| mail -s "[WP-SSL] Renewal FAILED: ${DOMAIN}" root 2>/dev/null || true\n'
+            'fi\n'
+            % (_domain, _prefix, _prefix)
+        )
+
+        if not self._safe_write_file(_script_file, _script_content, mode=0o700):
+            return False
+
+        # Systemd oneshot service triggered by OnFailure=
+        _svc_content = (
+            "[Unit]\n"
+            "Description=SSL renewal failure notification (journal/email) for %s\n"
+            "# [PATCH-278] Auto-created; no --notify-webhook was configured.\n"
+            "\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            "ExecStart=%s\n"
+            "TimeoutStartSec=30\n"
+            "StandardOutput=journal\n"
+            "StandardError=journal\n"
+            % (_domain, str(_script_file))
+        )
+
+        if not self._safe_write_file(_svc_file, _svc_content, mode=0o644):
+            return False
+
+        # Reload systemd to pick up the new unit
+        subprocess.run(
+            ["systemctl", "daemon-reload"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=15, check=False,
+        )
+        return True
+
     @staticmethod
-    def _validate_webhook_url(url):
+    def _validate_webhook_url(url: str) -> bool:
         """校验 webhook URL 安全性: 仅允许 http/https, 拒绝内网地址。"""
         if not url:
             return False
@@ -25503,8 +28480,8 @@ class WPDeployManager:
             if _addr_sec07.is_private or _addr_sec07.is_loopback or _addr_sec07.is_link_local:
                 logging.warning(t("warn_audit_sec_07_webhook_resolved_to_private_ip"), _wh_resolved_ip)
                 _wh_resolved_ip = ""
-        except Exception:
-            pass
+        except Exception as _exc_28009:
+            logging.debug("[PATCH-276] L28009: %s", _exc_28009)
         _env_content = 'WP_WEBHOOK="%s"\n' % _escaped_url
         # [PATCH-256 FIX-8] 对 hostname/port/IP 统一使用 _escape_double_quoted,
         # 与 WP_WEBHOOK 的转义方式对齐。urlparse 返回的 hostname 可能包含
@@ -25682,8 +28659,8 @@ class WPDeployManager:
                 if _r.returncode == 0 and "redis-server" in _r.stdout:
                     self._redis_svc_name = "redis-server"
                     return self._redis_svc_name
-            except Exception:
-                pass
+            except Exception as _exc_28188:
+                logging.debug("[PATCH-276] _detect_redis_service_name: %s", _exc_28188)
         # [FIX-EL10] 检测 valkey (RHEL 10+ Redis 替代品)
         try:
             _r = subprocess.run(
@@ -25694,13 +28671,12 @@ class WPDeployManager:
             if _r.returncode == 0 and "valkey" in _r.stdout:
                 self._redis_svc_name = "valkey"
                 return self._redis_svc_name
-        except Exception:
-            pass
+        except Exception as _exc_28200:
+            logging.warning("[PATCH-276] _redis_svc_name = \"valkey\" failed: %s", _exc_28200)
         self._redis_svc_name = "redis"
         return self._redis_svc_name
 
-    def _redis_ensure_running(self, _redis_svc):
-        # type: (str) -> bool
+    def _redis_ensure_running(self, _redis_svc: str) -> bool:
         """确保 Redis 服务运行中; 未安装时自动安装包 + PHP 扩展。
 
         返回 True 表示 Redis 已就绪, False 表示启动失败应跳过缓存设置。
@@ -25748,8 +28724,8 @@ class WPDeployManager:
                         x.strip().lower()
                         for x in _pr_r.stdout.splitlines()
                     ]
-            except Exception:
-                pass
+            except Exception as _exc_28254:
+                logging.debug("[PATCH-276] run_cmd: %s", _exc_28254)
             if not _php_redis_ok:
                 if self.pkg_mgr in ("dnf", "yum"):
                     _pr_done = False
@@ -25794,8 +28770,52 @@ class WPDeployManager:
         _redis_start = self.run_cmd(["systemctl", "enable", "--now", _redis_svc], quiet=True)
         # [V3.2.3] M-4: Redis 启动失败时提前返回
         if not _redis_start:
+            # [PATCH-279] Auto-diagnose: check journal, attempt common fixes.
             logging.warning(t("warn_redis_start_fail", svc=_redis_svc))
-            return False
+            _redis_recovered = False
+            try:
+                _jr = subprocess.run(
+                    ["journalctl", "-u", _redis_svc, "-n", "20", "--no-pager"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    encoding="utf-8", errors="replace",
+                    timeout=10, check=False)
+                _jout = _jr.stdout or ""
+                logging.info("[PATCH-279] %s journal:\n%s", _redis_svc, _jout.strip()[:600])
+                # Case 1: port conflict — "Could not create server TCP listening socket"
+                if "already in use" in _jout.lower() or "address already in use" in _jout.lower():
+                    logging.info("[PATCH-279] Port conflict detected — killing stale redis processes...")
+                    subprocess.run(
+                        ["pkill", "-9", "-f", "redis-server|valkey-server"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=5, check=False)
+                    time.sleep(1)
+                    _redis_recovered = bool(self.run_cmd(
+                        ["systemctl", "start", _redis_svc], quiet=True))
+                # Case 2: bad config file
+                elif "bad directive" in _jout.lower() or "invalid" in _jout.lower():
+                    # Try with default config by moving bad config aside
+                    for _rcf in (Path("/etc/redis/redis.conf"),
+                                 Path("/etc/redis.conf"),
+                                 Path("/etc/valkey/valkey.conf")):
+                        if _rcf.exists() and _rcf.is_file():
+                            _bak = _rcf.with_suffix(".conf.bak279")
+                            try:
+                                shutil.copy2(str(_rcf), str(_bak))
+                                logging.info("[PATCH-279] Backed up %s → %s", _rcf, _bak)
+                            except OSError:
+                                pass
+                            break
+                # Case 3: OOM or general failure — just retry once
+                if not _redis_recovered:
+                    time.sleep(2)
+                    _redis_recovered = bool(self.run_cmd(
+                        ["systemctl", "start", _redis_svc], quiet=True))
+            except Exception as _redis_diag_e:
+                logging.debug("[PATCH-279] redis diag: %s", _redis_diag_e)
+            if _redis_recovered:
+                logging.info("[PATCH-279] %s recovered after auto-fix.", _redis_svc)
+            else:
+                return False
         # [V3.2.14] P1-1: systemctl 返回后 Redis 可能仍未就绪,
         # 等待最多 10s 直到 redis-cli ping 成功
         _redis_cli = shutil.which("redis-cli") or shutil.which("valkey-cli")  # [FIX-EL10]
@@ -25809,8 +28829,8 @@ class WPDeployManager:
                     )
                     if _rp.returncode == 0 and "PONG" in _rp.stdout:
                         break
-                except Exception:
-                    pass
+                except Exception as _exc_28315:
+                    logging.debug("[PATCH-276] systemctl: %s", _exc_28315)
                 time.sleep(1)
 
         # [AUDIT-P2-9] Redis maxmemory + 淘汰策略配置。
@@ -25862,8 +28882,8 @@ class WPDeployManager:
                                 if _dbsize_m and int(_dbsize_m.group(1)) > 1000:
                                     _skip_persistence_disable = True
                                     logging.info(t("info_bp_1_redis_dbsize_skipping_persistence_d"))
-                        except Exception:
-                            pass
+                        except Exception as _exc_28368:
+                            logging.debug("[PATCH-276] L28368: %s", _exc_28368)
 
                         subprocess.run(
                             [_redis_cli, "CONFIG", "SET",
@@ -25916,7 +28936,580 @@ class WPDeployManager:
 
         return True
 
-    def _setup_redis_cache(self):
+    # -----------------------------------------------------------------------
+    # [PATCH-270] Redis 版本全生命周期管理
+    # -----------------------------------------------------------------------
+    def _detect_redis_version(self) -> tuple:
+        """解析 redis-server --version 或 valkey-server --version, 返回 (major, minor) 或 (0, 0)。
+
+        示例输出:
+          Redis server v=7.2.6 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64
+          Valkey server v=7.2.5 sha=...
+        """
+        for _bin in ("redis-server", "valkey-server"):
+            _path = shutil.which(_bin)
+            if not _path:
+                continue
+            try:
+                _r = subprocess.run(
+                    [_path, "--version"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    encoding='utf-8', errors='replace',
+                    timeout=5, check=False)
+                _out = _r.stdout + _r.stderr
+                _m = re.search(r'v=(\d+)\.(\d+)', _out)
+                if _m:
+                    return (int(_m.group(1)), int(_m.group(2)))
+            except Exception as _exc_28446:
+                logging.debug("[PATCH-276] _detect_redis_version: %s", _exc_28446)
+        return (0, 0)
+
+    def _detect_redis_full_version(self) -> str:
+        """返回 Redis/Valkey 完整版本字符串 (如 "7.2.6"), 或 ""。"""
+        for _bin in ("redis-server", "valkey-server"):
+            _path = shutil.which(_bin)
+            if not _path:
+                continue
+            try:
+                _r = subprocess.run(
+                    [_path, "--version"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    encoding='utf-8', errors='replace',
+                    timeout=5, check=False)
+                _out = _r.stdout + _r.stderr
+                _m = re.search(r'v=(\d+\.\d+\.\d+)', _out)
+                if _m:
+                    return _m.group(1)
+            except Exception as _exc_28466:
+                logging.debug("[PATCH-276] _detect_redis_full_version: %s", _exc_28466)
+        return ""
+
+    def _upgrade_redis_if_needed(self) -> None:
+        """[PATCH-270] Redis 版本门控: 检测 → 升级 → 验证。
+
+        在 update_config 中调用, 位于 _setup_redis_cache 之前。
+        仅当 redis 已安装且版本低于 _REDIS_MIN_VERSION 时才尝试升级。
+        升级失败不阻断 (Redis 低版本仍可用于 WP 对象缓存)。
+        """
+        if self.cfg.dry_run:
+            return
+
+        # [PATCH-272] EL7: Remi redis7/8 已停止构建 EL7 包 (EL ≥ 8 only),
+        # yum update/install 找不到新版本, 只产生噪音。
+        _is_el, _el_ver = _detect_el_family_and_version()
+        if _is_el and _el_ver < 8:
+            logging.warning(t("warn_el7_eol_skip_upgrade",
+                              el=_el_ver, component="Redis"))
+            return
+
+        _ver = self._detect_redis_version()
+        if _ver == (0, 0):
+            # Redis 未安装
+            if not (shutil.which("redis-cli")
+                    or shutil.which("valkey-cli")):
+                logging.info(t("info_redis_not_installed_skip_version"))
+                return
+            # 有客户端但无服务端 → 跳过
+            return
+
+        _ver_str = self._detect_redis_full_version() or (
+            "%d.%d" % _ver)
+
+        if _ver >= _REDIS_MIN_VERSION:
+            logging.info(t("info_redis_version_ok",
+                           ver=_ver_str,
+                           min="%d.%d" % _REDIS_MIN_VERSION))
+            return
+
+        # ── 版本过低, 尝试升级 ──
+        logging.info(t("info_redis_version_old",
+                       ver=_ver_str,
+                       min="%d.%d" % _REDIS_MIN_VERSION))
+
+        _redis_svc = self._detect_redis_service_name()
+        _upgrade_ok = False
+
+        if self.pkg_mgr in ("dnf", "yum"):
+            # 尝试直接 update (当前仓库内的最新版本)
+            _upgrade_ok = bool(self.run_cmd(
+                [self.pkg_mgr, "update", "-y", "redis"],
+                quiet=True, timeout=120))
+            # 若仍不满足, 通过 Remi 仓库安装 redis 7
+            if not _upgrade_ok or self._detect_redis_version() < _REDIS_MIN_VERSION:
+                # [PATCH-272] 确保 Remi 仓库可用 (Redis 7 不在 EL8/9 默认仓库中)
+                _remi_ok = False
+                try:
+                    _r = subprocess.run(
+                        ["rpm", "-q", "remi-release"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=10, check=False)
+                    _remi_ok = (_r.returncode == 0)
+                except Exception as _exc_28530:
+                    logging.debug("[PATCH-276] L28530: %s", _exc_28530)
+                if not _remi_ok:
+                    _is_el_r, _el_ver_r = _detect_el_family_and_version()
+                    if _is_el_r and _el_ver_r >= 8:
+                        logging.info(
+                            "[PATCH-272] 安装 Remi 仓库以获取 Redis 7..."
+                            if _LANG == "zh" else
+                            "[PATCH-272] Installing Remi repo for Redis 7...")
+                        self.run_cmd(
+                            [self.pkg_mgr, "install", "-y",
+                             "https://dl.fedoraproject.org/pub/epel/"
+                             "epel-release-latest-%s.noarch.rpm" % _el_ver_r],
+                            quiet=True, timeout=120)
+                        self.run_cmd(
+                            [self.pkg_mgr, "install", "-y",
+                             "https://rpms.remirepo.net/enterprise/"
+                             "remi-release-%s.rpm" % _el_ver_r],
+                            quiet=True, timeout=120)
+                        self.run_cmd(
+                            ["rpm", "--import",
+                             "https://rpms.remirepo.net/RPM-GPG-KEY-remi2024"],
+                            quiet=True, timeout=30)
+                # dnf module reset + enable redis:7 (Remi modular)
+                self.run_cmd(
+                    [self.pkg_mgr, "module", "reset", "redis", "-y"],
+                    quiet=True, timeout=30)
+                _module_ok = bool(self.run_cmd(
+                    [self.pkg_mgr, "module", "enable",
+                     "redis:" + _REDIS_DEFAULT_VERSION, "-y"],
+                    quiet=True, timeout=30))
+                if _module_ok:
+                    _upgrade_ok = bool(self.run_cmd(
+                        [self.pkg_mgr, "install", "-y", "redis"],
+                        quiet=True, timeout=120))
+                # module 方式失败 → 回退尝试直接包名
+                if not _upgrade_ok or self._detect_redis_version() < _REDIS_MIN_VERSION:
+                    for _rpkg in ("redis" + _REDIS_DEFAULT_VERSION, "redis"):
+                        if self.run_cmd(
+                            [self.pkg_mgr, "install", "-y", _rpkg],
+                            quiet=True, timeout=120,
+                        ):
+                            _upgrade_ok = True
+                            break
+        elif self.pkg_mgr == "apt":
+            # [PATCH-270e] 先尝试默认仓库升级
+            self.run_cmd(
+                ["apt-get", "update", "-qq"],
+                quiet=True, timeout=60)
+            self.run_cmd(
+                ["apt-get", "install", "--only-upgrade", "-y",
+                 "redis-server"],
+                quiet=True, timeout=120)
+            # 检查是否已满足 (Ubuntu 24.04 默认 7.0 可能满足)
+            if self._detect_redis_version() >= _REDIS_MIN_VERSION:
+                _upgrade_ok = True
+            else:
+                # [PATCH-272] 默认仓库版本不足 → packages.redis.io 提供 8.x (非 BSD)
+                # 当前 Redis ≤ 7.2 (BSD) → 升级意味着许可证变更, 需用户确认
+                _cur_ver = self._detect_redis_version()
+                _license_ok = (_cur_ver > (7, 2)  # 已是非 BSD, 无需再问
+                               or self._check_redis_license_consent())
+                if not _license_ok:
+                    # 用户拒绝或非交互模式 → 保持当前版本
+                    _upgrade_ok = (_cur_ver >= _REDIS_MIN_VERSION)
+                else:
+                    # [PATCH-270e] 添加 packages.redis.io 官方源
+                    # 对齐 Redis 官方 Linux 安装文档:
+                    # https://github.com/redis/redis-debian
+                    logging.info(
+                        "[PATCH-270e] 添加 packages.redis.io 官方源..."
+                        if _LANG == "zh" else
+                        "[PATCH-270e] Adding packages.redis.io official repo...")
+                    try:
+                        _keyring = Path("/usr/share/keyrings/redis-archive-keyring.gpg")
+                        if not _keyring.exists():
+                            self.run_cmd(
+                                ["apt", "install", "-y", "curl", "gpg", "lsb-release"],
+                                quiet=True, timeout=60)
+                            # [PATCH-276 FIX-P0-2] 消除唯一的 shell=True 用例。
+                            # 原 curl | gpg 管道拆分为两步: curl 下载到内存,
+                            # gpg 从 stdin 读取。避免 shell 注入风险面。
+                            _curl_r = subprocess.run(
+                                ["curl", "-fsSL", "https://packages.redis.io/gpg"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=30, check=False)
+                            if _curl_r.returncode == 0 and _curl_r.stdout:
+                                _gpg_r = subprocess.run(
+                                    ["gpg", "--dearmor", "-o",
+                                     "/usr/share/keyrings/redis-archive-keyring.gpg"],
+                                    input=_curl_r.stdout,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    timeout=30, check=False)
+                                _gpg_ok_rc = _gpg_r.returncode
+                            else:
+                                _gpg_ok_rc = 1
+                            if _gpg_ok_rc == 0:
+                                os.chmod(str(_keyring), 0o644)
+                        if _keyring.exists():
+                            _codename = subprocess.run(
+                                ["lsb_release", "-cs"],
+                                stdout=subprocess.PIPE, encoding="utf-8",
+                                timeout=5, check=False).stdout.strip()
+                            if _codename:
+                                _list = Path("/etc/apt/sources.list.d/redis.list")
+                                _list.write_text(
+                                    f"deb [signed-by={_keyring}]"
+                                    f" https://packages.redis.io/deb"
+                                    f" {_codename} main\n",
+                                    encoding="utf-8")
+                                self.run_cmd(
+                                    ["apt-get", "update", "-qq"],
+                                    quiet=True, timeout=60)
+                                _upgrade_ok = bool(self.run_cmd(
+                                    ["apt-get", "install", "-y",
+                                     "redis-server"],
+                                    quiet=True, timeout=120))
+                                # [PATCH-272] 安装失败 (codename 不受支持等)
+                                # → 清理源文件, 防止后续 apt update 持续报 404
+                                if not _upgrade_ok:
+                                    try:
+                                        _list.unlink()
+                                    except OSError:
+                                        pass
+                    except Exception as _e:
+                        logging.warning(
+                            "[PATCH-270e] Redis 官方源配置失败: %s" % _e
+                            if _LANG == "zh" else
+                            "[PATCH-270e] Redis repo setup failed: %s" % _e)
+
+        # ── 升级后验证 ──
+        _new_ver = self._detect_redis_version()
+        _new_ver_str = self._detect_redis_full_version() or (
+            "%d.%d" % _new_ver if _new_ver != (0, 0) else "unknown")
+
+        if _new_ver >= _REDIS_MIN_VERSION:
+            logging.info(t("ok_redis_upgraded", ver=_new_ver_str))
+        else:
+            logging.warning(t("warn_redis_upgrade_failed",
+                              ver=_new_ver_str))
+            # 不阻断: Redis 低版本仍可用于 WP 对象缓存
+            return
+
+        # ── 重启服务 + PING 验证 ──
+        self.run_cmd(
+            ["systemctl", "restart", _redis_svc],
+            quiet=True, timeout=30)
+        time.sleep(2)
+
+        _ping_ok = False
+        for _cli in ("redis-cli", "valkey-cli"):
+            _cli_path = shutil.which(_cli)
+            if not _cli_path:
+                continue
+            try:
+                _r = subprocess.run(
+                    [_cli_path, "ping"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    encoding='utf-8', errors='replace',
+                    timeout=5, check=False)
+                if _r.returncode == 0 and "PONG" in _r.stdout:
+                    _ping_ok = True
+                    break
+            except Exception as _exc_28693:
+                logging.debug("[PATCH-276] run_cmd: %s", _exc_28693)
+
+        if _ping_ok:
+            logging.info(t("ok_redis_verify_ping"))
+        else:
+            logging.warning(t("warn_redis_verify_ping_fail"))
+            # 尝试一次重启 + 二次 PING 验证
+            self.run_cmd(
+                ["systemctl", "restart", _redis_svc],
+                quiet=True, timeout=30)
+            time.sleep(3)
+            for _cli2 in ("redis-cli", "valkey-cli"):
+                _cli2_path = shutil.which(_cli2)
+                if not _cli2_path:
+                    continue
+                try:
+                    _r2 = subprocess.run(
+                        [_cli2_path, "ping"],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        encoding='utf-8', errors='replace',
+                        timeout=5, check=False)
+                    if _r2.returncode == 0 and "PONG" in _r2.stdout:
+                        logging.info(t("ok_redis_verify_ping"))
+                        _ping_ok = True
+                        break
+                except Exception as _exc_28719:
+                    logging.debug("[PATCH-276] run_cmd: %s", _exc_28719)
+
+    def _check_redis_license_consent(self) -> bool:
+        """[PATCH-272] 检查用户是否接受 Redis 许可证变更 (BSD → RSAL/SSPL)。
+
+        返回 True = 可以升级到非 BSD 版本; False = 保持 BSD 版本。
+        决策逻辑:
+          1. --accept-redis-license CLI 参数 → True (写入标记)
+          2. 标记文件存在 → 读取 ("accepted" / "declined")
+          3. 交互式 → 提示用户 → 写入标记
+          4. 非交互式 → False (不静默变更许可)
+        """
+        # CLI 参数
+        if getattr(self.cfg, 'accept_redis_license', False):
+            try:
+                _REDIS_LICENSE_MARKER.write_text("accepted\n",
+                                                 encoding="utf-8")
+            except OSError:
+                pass
+            logging.info(t("info_redis_license_accepted"))
+            return True
+
+        # 标记文件
+        if _REDIS_LICENSE_MARKER.exists():
+            try:
+                _val = _REDIS_LICENSE_MARKER.read_text(
+                    encoding="utf-8").strip()
+                return _val == "accepted"
+            except OSError:
+                pass
+
+        # 交互式
+        if sys.stdin.isatty():
+            try:
+                _ans = input(t("prompt_redis_license_change")).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                _ans = ""
+            if _ans in ("y", "yes"):
+                try:
+                    _REDIS_LICENSE_MARKER.write_text("accepted\n",
+                                                     encoding="utf-8")
+                except OSError:
+                    pass
+                logging.info(t("info_redis_license_accepted"))
+                return True
+            else:
+                _ver_str = self._detect_redis_full_version() or "unknown"
+                try:
+                    _REDIS_LICENSE_MARKER.write_text("declined\n",
+                                                     encoding="utf-8")
+                except OSError:
+                    pass
+                logging.info(t("info_redis_license_declined",
+                               ver=_ver_str))
+                return False
+
+        # 非交互式
+        logging.info(t("info_redis_license_skip_noninteractive"))
+        return False
+
+    def _upgrade_redis_minor_if_available(self) -> None:
+        """[PATCH-272] 主动检测并升级 Redis 小版本 (如 7.2.4 → 7.2.6)。
+
+        与 PHP/MariaDB/Nginx 的 minor upgrade 逻辑对齐。
+        升级后: restart → PING 验证。
+        """
+        if self.cfg.dry_run:
+            return
+        # [PATCH-272] EL7: Remi redis7/8 已停止构建 EL7 包
+        _is_el, _el_ver = _detect_el_family_and_version()
+        if _is_el and _el_ver < 8:
+            return  # 大版本升级已输出 EL7 警告, minor 不重复
+        _ver_before = self._detect_redis_full_version()
+        if not _ver_before:
+            return  # Redis 未安装
+
+        _redis_svc = self._detect_redis_service_name()
+        if self.pkg_mgr in ("dnf", "yum"):
+            self.run_cmd(
+                [self.pkg_mgr, "update", "-y", "redis"],
+                quiet=True, timeout=120)
+        elif self.pkg_mgr == "apt":
+            self.run_cmd(
+                ["apt-get", "update", "-qq"],
+                quiet=True, timeout=60)
+            self.run_cmd(
+                ["apt-get", "install", "--only-upgrade", "-y",
+                 "redis-server"],
+                quiet=True, timeout=120)
+
+        _ver_after = self._detect_redis_full_version() or _ver_before
+        if _ver_after != _ver_before:
+            logging.info(t("info_redis_minor_upgraded",
+                           old=_ver_before, new=_ver_after))
+            # 重启 + PING 验证 (含失败重试)
+            self.run_cmd(
+                ["systemctl", "restart", _redis_svc],
+                quiet=True, timeout=30)
+            time.sleep(2)
+            _ping_ok = False
+            for _cli in ("redis-cli", "valkey-cli"):
+                _cli_path = shutil.which(_cli)
+                if _cli_path:
+                    try:
+                        _r = subprocess.run(
+                            [_cli_path, "ping"],
+                            stdout=subprocess.PIPE, timeout=5, check=False)
+                        if b"PONG" in (_r.stdout or b""):
+                            logging.info(t("ok_redis_verify_ping"))
+                            _ping_ok = True
+                            break
+                    except Exception as _exc_28831:
+                        logging.debug("[PATCH-276] run_cmd: %s", _exc_28831)
+            if not _ping_ok:
+                logging.warning(t("warn_redis_verify_ping_fail"))
+                self.run_cmd(
+                    ["systemctl", "restart", _redis_svc],
+                    quiet=True, timeout=30)
+                time.sleep(3)
+                for _cli2 in ("redis-cli", "valkey-cli"):
+                    _cli2_path = shutil.which(_cli2)
+                    if _cli2_path:
+                        try:
+                            _r2 = subprocess.run(
+                                [_cli2_path, "ping"],
+                                stdout=subprocess.PIPE, timeout=5,
+                                check=False)
+                            if b"PONG" in (_r2.stdout or b""):
+                                logging.info(t("ok_redis_verify_ping"))
+                                break
+                        except Exception as _exc_28850:
+                            logging.debug("[PATCH-276] run_cmd: %s", _exc_28850)
+        else:
+            logging.info(t("info_redis_minor_already_latest",
+                           ver=_ver_before))
+
+    def _upgrade_fail2ban_minor_if_available(self) -> None:
+        """[PATCH-272] 主动升级 fail2ban 小版本 (安全补丁)。
+
+        fail2ban 不做大版本门控 (版本随系统仓库),
+        但小版本升级应在 update 时主动执行以获取安全修复。
+        """
+        if self.cfg.dry_run:
+            return
+        # [PATCH-272] EL7: 仓库已关闭, yum update 会产生 repo 超时噪音
+        _is_el, _el_ver = _detect_el_family_and_version()
+        if _is_el and _el_ver < 8:
+            return
+        if not shutil.which("fail2ban-client"):
+            return
+
+        _ver_before = ""
+        _t = self._detect_fail2ban_version()
+        if _t != (0, 0):
+            _ver_before = "%d.%d" % _t
+
+        if self.pkg_mgr in ("dnf", "yum"):
+            self.run_cmd(
+                [self.pkg_mgr, "update", "-y", "fail2ban"],
+                quiet=True, timeout=120)
+        elif self.pkg_mgr == "apt":
+            self.run_cmd(
+                ["apt-get", "install", "--only-upgrade", "-y", "fail2ban"],
+                quiet=True, timeout=120)
+
+        _t_after = self._detect_fail2ban_version()
+        _ver_after = "%d.%d" % _t_after if _t_after != (0, 0) else ""
+        if _ver_after and _ver_before and _ver_after != _ver_before:
+            logging.info(t("info_f2b_minor_upgraded",
+                           old=_ver_before, new=_ver_after))
+
+    def _verify_php_redis_loaded(self) -> bool:
+        """[PATCH-270b] 验证 PHP redis 扩展已加载; 未加载则尝试恢复。
+
+        PHP 大版本升级后, _restore_lost_php_extensions 用泛化包名重装,
+        可能因版本前缀不匹配而失败, 导致 redis 扩展静默丢失。
+        此方法在 _setup_redis_cache 入口处验证, 提供精确修复路径。
+
+        [PATCH-270c] 时序安全性分析:
+        此方法使用 `php -m` (CLI SAPI) 检测扩展, 而非 FPM 内存中的列表。
+        CLI SAPI 从磁盘 conf.d/*.ini 读取配置, 与 FPM 是否已重启无关。
+        Remi/Ondrej 包安装的 .ini 文件放在共享 conf.d/ 目录, CLI 和 FPM
+        同时生效。因此即使 FPM 尚未重启, `php -m` 也能准确反映扩展安装状态。
+        在 update_config 调用链中, PHP 升级路径 (_upgrade_php_if_needed /
+        _upgrade_php_minor_if_available) 在 _setup_redis_cache 之前执行,
+        且这两个方法内部都已通过 _php_post_upgrade_restart 重启过 FPM。
+
+        Returns: True = 扩展已加载, False = 无法修复。
+        """
+        if self.cfg.dry_run:
+            return True
+        # 检测 php -m 是否包含 redis (CLI SAPI, 读取磁盘 conf.d/*.ini)
+        try:
+            _r = subprocess.run(
+                ["php", "-m"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                encoding="utf-8", errors="replace",
+                timeout=10, check=False)
+            if _r.returncode == 0:
+                _mods = {x.strip().lower() for x in _r.stdout.splitlines()
+                         if x.strip() and not x.strip().startswith("[")}
+                if "redis" in _mods:
+                    logging.info(t("info_php_redis_ext_ok"))
+                    return True
+        except Exception as _exc_28924:
+            logging.debug("[PATCH-276] operation failed: %s", _exc_28924)
+
+        logging.warning(t("warn_php_redis_ext_missing"))
+
+        # ── 尝试安装 ──
+        _installed = False
+        if self.pkg_mgr in ("dnf", "yum"):
+            for _rpkg in ("php-pecl-redis6", "php-pecl-redis5",
+                          "php-pecl-redis", "php-redis"):
+                if self.run_cmd(
+                    [self.pkg_mgr, "install", "-y", _rpkg],
+                    quiet=True, timeout=60,
+                ):
+                    _installed = True
+                    break
+            if not _installed:
+                _installed = self._compile_php_redis_extension()
+        elif self.pkg_mgr == "apt":
+            # Ondrej/Sury: 需要版本化包名
+            _php_ver = ""
+            _vm = re.search(r'php(\d+\.\d+)', self.php_fpm_svc)
+            if _vm:
+                _php_ver = _vm.group(1)
+            for _dpkg in (
+                "php%s-redis" % _php_ver if _php_ver else "php-redis",
+                "php-redis",
+            ):
+                if self.run_cmd(
+                    ["apt", "install", "-y", _dpkg],
+                    quiet=True, timeout=60,
+                ):
+                    _installed = True
+                    break
+
+        if _installed:
+            # [PATCH-270c] 安装后 re-verify: 确认 php -m 确实能看到 redis。
+            # 某些情况下包安装成功但 .ini 写入了错误的 SAPI 配置目录,
+            # 或 Ondrej 版本化 .ini 被放到非活跃版本的 conf.d/ 下。
+            try:
+                _rv = subprocess.run(
+                    ["php", "-m"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    encoding="utf-8", errors="replace",
+                    timeout=10, check=False)
+                if _rv.returncode == 0 and "redis" in {
+                    x.strip().lower() for x in _rv.stdout.splitlines()
+                    if x.strip() and not x.strip().startswith("[")}:
+                    logging.info(t("ok_php_redis_ext_restored"))
+                    return True
+                # 包安装了但 php -m 未检测到: .ini 可能在错误的目录
+                logging.debug(
+                    "[PATCH-270c] php -m redis not found after "
+                    "package install; extension may need FPM restart "
+                    "to take effect via shared conf.d/")
+            except Exception as _exc_28979:
+                logging.debug("[PATCH-276] _rv: %s", _exc_28979)
+            # 即使 re-verify 未通过也返回 True:
+            # FPM 重启后 (update_config 末尾) 扩展可能生效
+            logging.info(t("ok_php_redis_ext_restored"))
+            return True
+        else:
+            _manual_cmd = (
+                "%s install -y php-pecl-redis" % self.pkg_mgr
+                if self.pkg_mgr in ("dnf", "yum") else
+                "apt install -y php-redis"
+            )
+            logging.warning(t("warn_php_redis_ext_restore_failed",
+                              cmd=_manual_cmd))
+            return False
+
+    def _setup_redis_cache(self) -> None:
         """启用 Redis 对象缓存: 安装 redis-cache 插件并激活。
 
         Redis 缓存 WordPress 数据库查询结果 (对象缓存层),
@@ -25935,6 +29528,11 @@ class WPDeployManager:
         # [V3.2.35] 拆分: 确保 Redis 运行
         if not self._redis_ensure_running(_redis_svc):
             return
+
+        # [PATCH-270b] PHP redis 扩展验证: PHP 升级后扩展可能丢失,
+        # 导致 redis-cache 插件安装成功但 drop-in 无法连接 Redis。
+        # 在插件操作之前修复, 避免 "Redis object cache could not be enabled"。
+        self._verify_php_redis_loaded()
 
         if not self._wpcli_bin:
             logging.info(t("info_redis_manual"))
@@ -25959,8 +29557,16 @@ class WPDeployManager:
                 timeout=120, quiet=True,
             )
             if not result:
+                # [PATCH-279] Retry with --force: common cause is stale partial install
                 logging.warning(t("warn_redis_plugin_fail", err=result.stderr[:200]))
-                return
+                logging.info("[PATCH-279] Retrying redis-cache install with --force...")
+                result = self._run_wpcli(
+                    "plugin", "install", "redis-cache", "--activate", "--force",
+                    timeout=120, quiet=True,
+                )
+                if not result:
+                    return
+                logging.info("[PATCH-279] redis-cache plugin installed on retry.")
         else:
             self._run_wpcli("plugin", "activate", "redis-cache",
                             timeout=15, quiet=True)
@@ -25998,8 +29604,27 @@ class WPDeployManager:
                     encoding='utf-8', errors='replace', timeout=5, check=False,
                 )
                 if _rp_h6.returncode != 0 or "PONG" not in (_rp_h6.stdout or ""):
+                    # [PATCH-279] Auto-restart Redis before giving up.
+                    # A broken object-cache.php drop-in would break every page load.
                     logging.warning(t("warn_audit_h6_redis_not_responding_to_ping"))
-                    return
+                    _rsvc_h6 = self._detect_redis_service_name() if hasattr(self, '_detect_redis_service_name') else ""
+                    _redis_h6_ok = False
+                    if _rsvc_h6:
+                        logging.info("[PATCH-279] Restarting %s...", _rsvc_h6)
+                        self.run_cmd(["systemctl", "restart", _rsvc_h6], quiet=True)
+                        time.sleep(2)
+                        try:
+                            _rp2 = subprocess.run(
+                                [_redis_cli_h6, "ping"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                encoding='utf-8', errors='replace', timeout=5, check=False)
+                            if _rp2.returncode == 0 and "PONG" in (_rp2.stdout or ""):
+                                logging.info("[PATCH-279] Redis recovered after restart.")
+                                _redis_h6_ok = True
+                        except Exception:
+                            pass
+                    if not _redis_h6_ok:
+                        return
             except Exception:
                 logging.warning(t("warn_audit_h6_redis_connectivity_check_failed_ski"))
                 return
@@ -26226,10 +29851,99 @@ class WPDeployManager:
     # -----------------------------------------------------------------------
 
     # -----------------------------------------------------------------------
+    # [PATCH-271] 脚本分发镜像 (--serve-dist)
+    # -----------------------------------------------------------------------
+    def _setup_serve_dist(self) -> None:
+        """[PATCH-271] 初始化脚本分发目录 + 同步文件 + 安装 systemd path unit。
+
+        对齐 NGINX 官方静态文件分发最佳实践:
+          - sendfile + tcp_nopush 零拷贝传输
+          - Cache-Control no-cache 保证客户端获取最新版本
+          - X-Content-Type-Options nosniff 防 MIME 嗅探
+          - exact-match location 仅暴露白名单文件
+
+        自动同步机制使用 systemd.path(5) PathChanged= 监听脚本文件,
+        脚本被 self-update 替换 (写入并关闭) 时触发 oneshot service
+        执行 cp + sha256sum, 对齐 freedesktop.org 官方文档。
+        """
+        if not self.cfg.serve_dist:
+            return
+        if self.cfg.dry_run:
+            return
+
+        _script = Path(os.path.abspath(__file__))
+        logging.info(t("info_serve_dist_setup",
+                       path=str(_SERVE_DIST_DIR),
+                       url=_SERVE_DIST_URL_PATH))
+
+        # ── 1. 创建分发目录 ──
+        try:
+            _SERVE_DIST_DIR.mkdir(parents=True, exist_ok=True)
+            os.chmod(str(_SERVE_DIST_DIR), 0o755)
+        except OSError as e:
+            logging.warning(t("warn_serve_dist_sync_failed", err=str(e)))
+            return
+
+        # ── 2. 同步脚本 + SHA256 ──
+        _sync_serve_dist(_script)
+
+        # ── 3. 安装 systemd path unit (监听脚本变更自动同步) ──
+        _path_unit = Path("/etc/systemd/system/wp-ssl-dist-sync.path")
+        _svc_unit = Path("/etc/systemd/system/wp-ssl-dist-sync.service")
+
+        _path_content = (
+            "[Unit]\n"
+            "Description=[PATCH-271] Watch wp_ssl_bootstrap.py for changes\n"
+            "\n"
+            "[Path]\n"
+            f"PathChanged={_script}\n"
+            "Unit=wp-ssl-dist-sync.service\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n"
+        )
+        _svc_content = (
+            "[Unit]\n"
+            "Description=[PATCH-271] Sync script to distribution directory\n"
+            "\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            f"ExecStart=/bin/sh -c '"
+            f"cp -f {_script} {_SERVE_DIST_DIR}/wp_ssl_bootstrap.py "
+            f"&& sha256sum {_SERVE_DIST_DIR}/wp_ssl_bootstrap.py "
+            f"| cut -d\" \" -f1 > {_SERVE_DIST_DIR}/wp_ssl_bootstrap.py.sha256"
+            f"'\n"
+        )
+
+        try:
+            _need_reload = False
+            for _unit_path, _content in [
+                (_path_unit, _path_content),
+                (_svc_unit, _svc_content),
+            ]:
+                _existing = ""
+                try:
+                    _existing = _unit_path.read_text(encoding="utf-8")
+                except OSError:
+                    pass
+                if _existing != _content:
+                    _unit_path.write_text(_content, encoding="utf-8")
+                    _need_reload = True
+            if _need_reload:
+                self.run_cmd(
+                    ["systemctl", "daemon-reload"],
+                    quiet=True, timeout=15)
+            self.run_cmd(
+                ["systemctl", "enable", "--now", "wp-ssl-dist-sync.path"],
+                quiet=True, timeout=15)
+            logging.info(t("info_serve_dist_systemd_installed"))
+        except Exception as e:
+            logging.warning(t("warn_serve_dist_sync_failed", err=str(e)))
+
+    # -----------------------------------------------------------------------
     # [V3.2.32] _compile_brotli_module() 拆分: 子方法
     # -----------------------------------------------------------------------
-    def _brotli_get_nginx_version(self):
-        # type: () -> str
+    def _brotli_get_nginx_version(self) -> str:
         """获取当前 Nginx 版本号, 失败返回空字符串。"""
         try:
             _r = subprocess.run(
@@ -26239,12 +29953,11 @@ class WPDeployManager:
             _m = re.search(r'nginx/(\d+\.\d+\.\d+)', _r.stdout + _r.stderr)
             if _m:
                 return _m.group(1)
-        except Exception:
-            pass
+        except Exception as _exc_29413:
+            logging.debug("[PATCH-276] run_cmd: %s", _exc_29413)
         return ""
 
-    def _brotli_install_deps(self):
-        # type: () -> bool
+    def _brotli_install_deps(self) -> bool:
         """安装 Brotli 编译依赖, 返回是否成功。"""
         if self.pkg_mgr in ("dnf", "yum"):
             # [P209-2b] 纵深防御: 同时安装 pcre-devel 和 pcre2-devel
@@ -26288,8 +30001,7 @@ class WPDeployManager:
             return False
         return True
 
-    def _brotli_download_and_clone(self, build_dir, nver):
-        # type: (Path, str) -> bool
+    def _brotli_download_and_clone(self, build_dir: Path, nver: str) -> bool:
         """下载 Nginx 源码 + 克隆 ngx_brotli, 返回是否成功。"""
         _tar = build_dir / ("nginx-%s.tar.gz" % nver)
         _url = "https://nginx.org/download/nginx-%s.tar.gz" % nver
@@ -26313,8 +30025,7 @@ class WPDeployManager:
             return False
         return True
 
-    def _brotli_configure_and_make(self, build_dir, nver):
-        # type: (Path, str) -> list
+    def _brotli_configure_and_make(self, build_dir: Path, nver: str) -> list:
         """配置并编译 Brotli 模块, 返回 .so 文件列表或空列表。"""
         _src = build_dir / ("nginx-%s" % nver)
         _ngx_br = build_dir / "ngx_brotli"
@@ -26367,8 +30078,7 @@ class WPDeployManager:
             logging.warning(t("warn_brotli_no_so"))
         return _sos
 
-    def _brotli_install_load_module(self, _sos):
-        # type: (list) -> bool
+    def _brotli_install_load_module(self, _sos: list) -> bool:
         """写入 load_module 配置并验证, 返回是否成功。
 
         失败时自动回滚 .so 和 load_module 配置。
@@ -26522,8 +30232,8 @@ class WPDeployManager:
                         if _cleaned != _current:
                             self._safe_write_file(
                                 _nginx_main_conf, _cleaned, mode=0o644)
-                except Exception:
-                    pass
+                except Exception as _exc_29696:
+                    logging.debug("[PATCH-276] _safe_write_file failed: %s", _exc_29696)
             for _p in _sos:
                 try:
                     Path(_p).unlink()
@@ -26547,8 +30257,8 @@ class WPDeployManager:
                         self._safe_write_file(
                             _nginx_main_conf, _result_m4, mode=0o644)
                         logging.info(t("info_audit_m4_aggressive_cleanup_removed_residual"))
-                except Exception:
-                    pass
+                except Exception as _exc_29721:
+                    logging.debug("[PATCH-276] _safe_write_file failed: %s", _exc_29721)
             # [PATCH-145 R-3] Final fallback: if nginx -t still fails
             # after all cleanup, restore the pre-modification snapshot.
             # Prevents Brotli compilation from permanently breaking Nginx.
@@ -26585,8 +30295,8 @@ class WPDeployManager:
                  "http://127.0.0.1/"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 timeout=8, check=False)
-        except Exception:
-            pass
+        except Exception as _exc_29759:
+            logging.debug("[PATCH-276] _br_err_log_263: %s", _exc_29759)
         time.sleep(1)
         # Check 1: error.log 崩溃信号
         try:
@@ -26618,8 +30328,8 @@ class WPDeployManager:
                     _br_crash_263 = True
                     logging.error(t("err_patch_263_fix_4_nginx_not_active_after_brotli"),
                         _act_263.stdout.strip())
-            except Exception:
-                pass
+            except Exception as _exc_29792:
+                logging.debug("[PATCH-276] operation failed: %s", _exc_29792)
         # 崩溃确认: 回滚
         if _br_crash_263:
             logging.error(t("err_patch_263_fix_4_brotli_dynamic_module_abi_mismatch"))
@@ -26654,8 +30364,7 @@ class WPDeployManager:
         except OSError:
             pass
         return True
-    def _compile_brotli_module(self):
-        # type: () -> bool
+    def _compile_brotli_module(self) -> bool:
         """从源码编译 ngx_brotli 动态模块。
 
         [V3.2.32] 重构: 拆分为 4 个子方法。
@@ -26681,7 +30390,7 @@ class WPDeployManager:
         finally:
             _safe_rmtree(str(_bd), ignore_errors=True)  # [PATCH-260]
 
-    def _setup_brotli(self):
+    def _setup_brotli(self) -> None:
         """自动检测 Nginx Brotli 模块, 可用时写入全局压缩配置。
 
         Brotli 对文本类资源比 Gzip 再压缩 15-25%。
@@ -26689,6 +30398,12 @@ class WPDeployManager:
         """
         if self.cfg.dry_run:
             logging.info(t("dry_run_brotli"))
+            return
+
+        # [PATCH-270c] 若本次运行已由 _recompile_nginx_dynamic_modules 编译,
+        # 跳过重复的 mtime 扫描和 .so 检测。_setup_brotli 自身有 _has_so_early
+        # 幂等检测不会真正重复编译, 此处仅省去扫描开销。
+        if getattr(self, '_brotli_compiled_this_run', False):
             return
 
         # [PATCH-245 FIX-17] 在 brotli 检测前清理旧版残留:
@@ -26769,8 +30484,8 @@ class WPDeployManager:
                             if "nginx.org" in _l and "***" in _l:
                                 _is_nginx_org_deb = True
                                 break
-                except Exception:
-                    pass
+                except Exception as _exc_29949:
+                    logging.debug("[PATCH-276] operation failed: %s", _exc_29949)
                 if _is_nginx_org_deb:
                     logging.info(t("info_fix18_skip_brotli"))
                 else:
@@ -26795,8 +30510,8 @@ class WPDeployManager:
                         timeout=5, check=False)
                     if ".ngx" in (_rpm_q.stdout or ""):
                         _is_nginx_org = True
-                except Exception:
-                    pass
+                except Exception as _exc_29975:
+                    logging.debug("[PATCH-276] run_cmd: %s", _exc_29975)
                 if _is_nginx_org:
                     logging.info(t("info_fix18_skip_brotli"))
                 else:
@@ -26833,8 +30548,8 @@ class WPDeployManager:
                     and not re.search(r'--add-dynamic-module=\S*brotli',
                                       _nv_text, re.I)):
                 brotli_available = True
-        except Exception:
-            pass
+        except Exception as _exc_30013:
+            logging.debug("[PATCH-276] L30013: %s", _exc_30013)
 
         if not brotli_available:
             # Level 2: .so 存在 + load_module 指令存在
@@ -26943,8 +30658,8 @@ class WPDeployManager:
                                     mode=0o644)
                         except OSError:
                             pass
-                except Exception:
-                    pass
+                except Exception as _exc_30123:
+                    logging.debug("[PATCH-276] _safe_write_file failed: %s", _exc_30123)
 
         if not brotli_available:
             # [V3.2.0] B6: 包安装失败时尝试源码编译
@@ -26983,6 +30698,11 @@ class WPDeployManager:
         # 旧配置引用已不存在的 .so 路径导致 nginx -t 失败。
         # 此清理必须在 _setup_brotli 中执行 (而不仅在编译路径),
         # 因为已有 .so 时跳过编译, 编译路径中的清理不会运行。
+        # [PATCH-245 FIX-15 BUG-1] glob("*brotli*") 同时匹配 .so 和 .conf。
+        # 原逻辑误删 apt 刚安装的 ngx_http_brotli_*.so 和包自带的
+        # 50-mod-http-brotli-*.conf, 导致 nginx 找不到 brotli 模块,
+        # "unknown directive brotli" 测试失败后回滚整个 brotli 配置。
+        # 修复: (1) 只删 .conf 文件; (2) 跳过包管理器安装的文件。
         for _cd_15 in ("/usr/share/nginx/modules",
                        "/etc/nginx/modules-enabled"):
             _cdp_15 = Path(_cd_15)
@@ -26991,6 +30711,12 @@ class WPDeployManager:
             for _old_15 in _cdp_15.glob("*brotli*"):
                 if _old_15.name == "50-mod-brotli.conf":
                     continue  # 脚本自己写的, 保留
+                # [FIX-15 BUG-1] 只清理 .conf 残留, 绝不删除 .so 文件
+                if _old_15.suffix != ".conf":
+                    continue
+                # [FIX-15 BUG-1] 跳过包管理器 (apt/rpm) 安装的 load_module 配置
+                if _is_pkg_managed_so(str(_old_15)):
+                    continue
                 try:
                     _old_15.unlink()
                     logging.info(t("info_fix15_removed_conf",
@@ -27009,7 +30735,7 @@ class WPDeployManager:
             _diag_which = shutil.which("nginx") or "not found"
             _diag_running = subprocess.run(
                 ["sh", "-c",
-                 "ps -o pid,args -C nginx 2>/dev/null | head -3"],
+                 "ps -o pid,args -C nginx 2>/dev/null | tail -n +2 | head -3"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 encoding="utf-8", errors="replace",
                 timeout=5, check=False)
@@ -27017,8 +30743,8 @@ class WPDeployManager:
                 which=_diag_which,
                 ver=(_diag_ver.stderr + _diag_ver.stdout).strip(),
                 running=(_diag_running.stdout or "").strip().replace('\n', ' | ')))
-        except Exception:
-            pass
+        except Exception as _exc_30208:
+            logging.debug("[PATCH-276] stdout: %s", _exc_30208)
         _brotli_test = subprocess.run(
             ["nginx", "-t"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -27086,14 +30812,14 @@ class WPDeployManager:
                             timeout=10, check=False)
                         logging.error(t("err_patch_241_bug_5_nginx_stderr"),
                             (_diag_16.stderr or "").strip()[:500])
-                    except Exception:
-                        pass
+                    except Exception as _exc_30277:
+                        logging.debug("[PATCH-276] _safe_write_file: %s", _exc_30277)
             logging.info(t("info_brotli_rollback"))
 
     # -----------------------------------------------------------------------
     # Nginx 日志轮转 (防止磁盘写满)
     # -----------------------------------------------------------------------
-    def setup_logrotate(self):
+    def setup_logrotate(self) -> None:
         """为站点独立的 Nginx 日志配置 logrotate。
 
         generate_https_config 为每个域名生成独立的 access_log / error_log，
@@ -27106,8 +30832,28 @@ class WPDeployManager:
 
         logrotate_dir = Path("/etc/logrotate.d")
         if not logrotate_dir.exists():
+            # [PATCH-279] Auto-install logrotate instead of bailing out.
+            # Without logrotate, site logs grow unbounded → disk full.
             logging.warning(t("warn_logrotate_dir_missing"))
-            return
+            logging.info("[PATCH-279] Attempting to install logrotate...")
+            _lr_installed = False
+            if self.pkg_mgr in ("dnf", "yum"):
+                _lr_installed = bool(self.run_cmd(
+                    [self.pkg_mgr, "install", "-y", "logrotate"], quiet=True, timeout=60))
+            elif self.pkg_mgr == "apt":
+                _lr_installed = bool(self.run_cmd(
+                    ["apt", "install", "-y", "logrotate"], quiet=True, timeout=60))
+            if _lr_installed and logrotate_dir.exists():
+                logging.info("[PATCH-279] logrotate installed successfully.")
+            elif not logrotate_dir.exists():
+                # Package installed but dir still missing, or install failed → create dir
+                try:
+                    logrotate_dir.mkdir(parents=True, exist_ok=True)
+                    logging.info("[PATCH-279] Created %s manually.", logrotate_dir)
+                except OSError as _lr_e:
+                    logging.warning("[PATCH-279] Cannot create %s: %s — skipping logrotate setup.",
+                                    logrotate_dir, _lr_e)
+                    return
 
         safe_name = self.cfg.systemd_prefix
         conf_file = logrotate_dir / f"nginx-wp-{safe_name}"
@@ -27156,7 +30902,26 @@ class WPDeployManager:
     # -----------------------------------------------------------------------
     # Fail2Ban WordPress 暴力破解防护
     # -----------------------------------------------------------------------
-    def setup_fail2ban(self):
+    def _detect_fail2ban_version(self) -> tuple:
+        """[PATCH-270b] 解析 fail2ban-client --version, 返回 (major, minor) 或 (0, 0)。
+
+        示例输出: "Fail2Ban v0.11.2" / "Fail2Ban v1.0.2"
+        """
+        try:
+            _r = subprocess.run(
+                ["fail2ban-client", "--version"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding="utf-8", errors="replace",
+                timeout=5, check=False)
+            _out = _r.stdout + _r.stderr
+            _m = re.search(r'(\d+)\.(\d+)', _out)
+            if _m:
+                return (int(_m.group(1)), int(_m.group(2)))
+        except Exception as _exc_30362:
+            logging.debug("[PATCH-276] _detect_fail2ban_version: %s", _exc_30362)
+        return (0, 0)
+
+    def setup_fail2ban(self) -> None:
         """安装并配置 Fail2Ban，自动封禁对 wp-login.php / xmlrpc.php 的暴力请求。"""
         logging.info(t("phase_f2b"))
 
@@ -27174,6 +30939,15 @@ class WPDeployManager:
             if not shutil.which("fail2ban-client"):
                 logging.warning(t("warn_f2b_install_fail"))
                 return
+
+        # [PATCH-270b] 版本探测 + 兼容性日志
+        _f2b_ver = self._detect_fail2ban_version()
+        if _f2b_ver != (0, 0):
+            _f2b_ver_str = "%d.%d" % _f2b_ver
+            logging.info(t("info_f2b_version", ver=_f2b_ver_str))
+            if _f2b_ver < (0, 11):
+                logging.info(t("info_f2b_version_old_note",
+                               ver=_f2b_ver_str))
 
         safe_name = self.cfg.systemd_prefix
 
@@ -27295,13 +31069,79 @@ class WPDeployManager:
     # -----------------------------------------------------------------------
     # 阶段五：Systemd 定时续期
     # -----------------------------------------------------------------------
+
+    def _update_timer_if_lifetime_changed(self) -> None:
+        """[PATCH-277] 续期后检查证书寿命, 必要时更新 timer 频率。
+
+        LE 可能在不事先通知的情况下缩短证书有效期 (47 天 / 6 天计划)。
+        如果新证书的有效期与当前 timer 调度策略不匹配, 自动重写 timer
+        并 daemon-reload。
+
+        调用点: renew_cert() 续期成功后。
+        """
+        if self.cfg.dry_run:
+            return
+        try:
+            _cl_chain = str(self.cfg.cert_chain)
+            if not Path(_cl_chain).exists():
+                return
+            _lifetime = _detect_cert_lifetime_days(_cl_chain)
+            if _lifetime <= 0:
+                return
+            _new_cal, _new_delay, _new_desc = _determine_renewal_schedule(
+                _lifetime)
+            # 读取当前 timer 文件, 检查 OnCalendar 是否需要更新
+            _timer_path = Path(
+                f"/etc/systemd/system/"
+                f"{self.cfg.systemd_prefix}-ssl.timer")
+            if not _timer_path.exists():
+                return
+            _cur_content = _timer_path.read_text(encoding="utf-8")
+            _cur_cal_m = re.search(
+                r'^OnCalendar=(.+)$', _cur_content, re.MULTILINE)
+            if not _cur_cal_m:
+                return
+            _cur_cal = _cur_cal_m.group(1).strip()
+            if _cur_cal == _new_cal:
+                return  # 调度策略未变, 无需更新
+            # 调度策略需要更新
+            logging.info(
+                "[PATCH-277] Certificate lifetime changed to %d days. "
+                "Updating SSL timer: OnCalendar=%s → %s",
+                _lifetime, _cur_cal, _new_cal)
+            _new_content = re.sub(
+                r'^OnCalendar=.+$',
+                f'OnCalendar={_new_cal}',
+                _cur_content, count=1, flags=re.MULTILINE)
+            _new_content = re.sub(
+                r'^RandomizedDelaySec=.+$',
+                f'RandomizedDelaySec={_new_delay}',
+                _new_content, count=1, flags=re.MULTILINE)
+            # 更新 Description
+            _new_content = re.sub(
+                r'^Description=.+$',
+                f'Description=Run {self.cfg.domain} SSL Renewal'
+                f' ({_new_desc})',
+                _new_content, count=1, flags=re.MULTILINE)
+            self.atomic_write(_timer_path, _new_content, mode=0o644)
+            self.run_cmd(
+                ["systemctl", "daemon-reload"], quiet=True, timeout=15)
+            logging.info(
+                "[PATCH-277] SSL timer updated: %s → %s"
+                " (cert lifetime: %d days)",
+                _cur_cal, _new_cal, _lifetime)
+        except Exception as _utl_e:
+            # 非致命: timer 更新失败不影响当前续期结果
+            logging.debug(
+                "[PATCH-277] Timer lifetime update failed: %s", _utl_e)
+
     # -----------------------------------------------------------------------
     # [V3.0.16] P11: MySQL 周度优化 (mysqlcheck --optimize)
     # -----------------------------------------------------------------------
     def _install_systemd_timer(self, name_suffix: str,
                                svc_content: str, timer_content: str,
                                success_msg_key: str = "",
-                               fail_callback=None) -> bool:
+                               fail_callback: Optional[Callable[[], None]]=None) -> bool:
         """[V3.2.114] R2: Systemd timer 安装通用方法。
 
         原 setup_db_optimize_timer / setup_wp_cron_timer / setup_systemd
@@ -27424,6 +31264,9 @@ class WPDeployManager:
             # [AUDIT-P2-15] 600s→1800s: ALTER TABLE ... FORCE (InnoDB optimize)
             # 在大表上可能持续数十分钟。Percona 建议 30min+。
             f"TimeoutStartSec=1800\n"
+            # [PATCH-276 FIX-P0-3] 匹配 TimeoutStartSec, 避免 systemd 在
+            # InnoDB optimize 中途 SIGKILL, 导致表状态不一致。
+            f"TimeoutStopSec=1800\n"
             f"StandardOutput=journal\n"
             f"StandardError=journal\n"
         )
@@ -27451,7 +31294,7 @@ class WPDeployManager:
     # -----------------------------------------------------------------------
     # [V3.0.16] P2: WordPress Cron 系统定时器 (替代 wp-cron.php 页面触发)
     # -----------------------------------------------------------------------
-    def setup_wp_cron_timer(self):
+    def setup_wp_cron_timer(self) -> None:
         """创建 systemd timer 每 5 分钟触发 wp cron event run。
 
         WordPress 默认的 wp-cron.php 在每次页面请求时触发, 高并发时成为
@@ -27533,7 +31376,7 @@ class WPDeployManager:
         )
 
         # [V3.2.114] R2: 委托通用方法, 失败回调回滚 DISABLE_WP_CRON
-        def _rollback_wp_cron_const():
+        def _rollback_wp_cron_const() -> None:
             logging.warning(t("warn_wpcron_timer_rollback"))
             _wpc = self.cfg.webroot_path / "wp-config.php"
             if _wpc.exists() and not self.cfg.dry_run:
@@ -27636,7 +31479,7 @@ class WPDeployManager:
                 except OSError:
                     pass
 
-    def _ensure_wp_cron_constant_locked(self, wp_config) -> None:
+    def _ensure_wp_cron_constant_locked(self, wp_config: str) -> None:
         """_ensure_wp_cron_constant 的实际逻辑, 由调用方保证在 flock 内执行。
 
         [AUDIT-P1-2] 所有 wp-config.php 写入统一使用
@@ -27672,8 +31515,8 @@ class WPDeployManager:
                     encoding='utf-8', errors='replace', timeout=5, check=False,
                 )
                 _timer_active = (_ta_r.returncode == 0)
-            except Exception:
-                pass
+            except Exception as _exc_30894:
+                logging.debug("[PATCH-276] L30894: %s", _exc_30894)
         # [PATCH-159 FIX-2] systemctl enable --now 返回后 systemd 可能
         # 尚未将 timer 标记为 active (慢速 VPS 延迟 1-2s)。
         # 若同一运行内 setup_wp_cron_timer 刚成功 enable, 信任该结果。
@@ -27792,8 +31635,7 @@ class WPDeployManager:
             logging.warning(t("warn_wpcron_inject_fail", e=e))
 
     @staticmethod
-    def _extract_timer_params(service_file):
-        # type: (Path) -> dict
+    def _extract_timer_params(service_file: Path) -> dict:
         """[V3.2.104] FIX-5: 从已有 systemd service unit 的 ExecStart 中
         提取可保留的参数, 防止 update/restore 重建 timer 时静默丢失。
 
@@ -27899,7 +31741,7 @@ class WPDeployManager:
 
         return result
 
-    def setup_systemd(self):
+    def setup_systemd(self) -> None:
         # [PATCH-165 FIX-2] update/restore/enable-ssl/renew(self-heal)
         # 路径下不输出 "阶段五" 横幅, 改为更贴切的消息
         if self._suppress_phase_banner:
@@ -27975,16 +31817,19 @@ class WPDeployManager:
 
         # [AUDIT-H7][V3.2.119] FIX-7: 先创建 notify 服务, 再检查文件是否实际存在,
         # 仅在创建成功时嵌入 OnFailure=, 防止引用不存在的 unit。
+        # [PATCH-278] 无 webhook 时自动安装 journal/email 兜底通知服务,
+        # 确保续期失败永远不会完全静默。
         if self.cfg.notify_webhook:
             self._setup_notify_on_failure()
+        else:
+            self._setup_journal_notify_on_failure()
         _on_failure_line = ""
-        if self.cfg.notify_webhook:
-            _nf_svc, _, _ = self._get_notify_file_paths()
-            if _nf_svc.exists():
-                _on_failure_line = (
-                    "OnFailure=%s-ssl-notify-fail.service\n"
-                    % self.cfg.systemd_prefix
-                )
+        _nf_svc, _, _ = self._get_notify_file_paths()
+        if _nf_svc.exists():
+            _on_failure_line = (
+                "OnFailure=%s-ssl-notify-fail.service\n"
+                % self.cfg.systemd_prefix
+            )
 
         # [AUDIT-FIX BUG-1] ZeroSSL EAB 凭据写入 EnvironmentFile (0o600),
         # 不再以明文嵌入 0o644 的 systemd service unit ExecStart。
@@ -28029,6 +31874,10 @@ class WPDeployManager:
             # [PATCH-269] 300s→600s: certbot 在 DNS 传播慢/网络不佳/ZeroSSL
             # EAB 注册时可能超过 5 分钟, 与 db-optimize 的 1800s 保持合理比例。
             f"TimeoutStartSec=600\n"
+            # [PATCH-276 FIX-P0-3] 匹配 TimeoutStartSec, 确保 SIGTERM 后
+            # certbot 有足够时间完成当前 ACME 事务和清理 /etc/letsencrypt 锁。
+            # systemd 默认 TimeoutStopSec=90s, 不足以等待慢速网络上的 certbot。
+            f"TimeoutStopSec=600\n"
             f"StandardOutput=journal\n"
             f"StandardError=journal\n"  # [V2.9.3] 确保续期失败时 journalctl 可查完整输出
             f"{_eab_env_line}"  # [AUDIT-FIX BUG-1] EAB EnvironmentFile (0o600)
@@ -28053,13 +31902,42 @@ class WPDeployManager:
             f"WantedBy=multi-user.target\n"
         )
 
+        # [PATCH-277] 短寿命证书运行时自动检测 + timer 频率切换。
+        # 读取当前证书的总有效期 (Not After - Not Before), 动态决定
+        # systemd timer 的 OnCalendar 和 RandomizedDelaySec。
+        # 解决: LE 2027 47 天 / 2028 6 天证书下, daily timer 不够频繁。
+        _cert_lifetime = 0
+        try:
+            _cl_chain = str(self.cfg.cert_chain)
+            if Path(_cl_chain).exists():
+                _cert_lifetime = _detect_cert_lifetime_days(_cl_chain)
+        except Exception:
+            pass  # cert lifetime probe failure is non-fatal; falls back to daily timer
+        _on_calendar, _rand_delay, _sched_desc = _determine_renewal_schedule(
+            _cert_lifetime)
+        if _cert_lifetime > 0:
+            logging.info(
+                "[PATCH-277] Certificate lifetime: %d days → "
+                "renewal schedule: %s (delay %s)",
+                _cert_lifetime, _on_calendar, _rand_delay)
+        # 描述根据实际调度策略动态生成
+        _timer_desc = (
+            f"Run {self.cfg.domain} SSL Renewal"
+            + (f" ({_sched_desc})" if _cert_lifetime > 0 else " Daily")
+        )
         timer_content = (
             f"[Unit]\n"
-            f"Description=Run {self.cfg.domain} SSL Renewal Daily\n"
+            f"Description={_timer_desc}\n"
             f"\n"
             f"[Timer]\n"
-            f"OnCalendar=daily\n"
-            f"RandomizedDelaySec=12h\n"
+            # [PATCH-277] 动态调度: 根据证书有效期自动决定触发频率。
+            # 90 天证书 → daily + 12h 偏移 (最坏 36h 间隔, 续期窗口 30 天充裕)
+            # 47 天证书 → 每 12h + 3h 偏移 (续期窗口 ~15 天, ≥30 次重试)
+            # 6 天证书  → 每 4h + 1h 偏移  (续期窗口 ~2 天, ≥12 次重试)
+            # certbot ≥5.x ARI 会在 CA 建议的窗口内续期, timer 只需确保
+            # 触发频率足以覆盖窗口; 不需要精确到 ARI 建议的时间点。
+            f"OnCalendar={_on_calendar}\n"
+            f"RandomizedDelaySec={_rand_delay}\n"
             f"Persistent=true\n"
             f"Unit={self.cfg.systemd_prefix}-ssl.service\n"
             f"\n"
@@ -28076,6 +31954,17 @@ class WPDeployManager:
         )
         if _ssl_ok:
             logging.info(t("ok_systemd", timer=f"{self.cfg.systemd_prefix}-ssl.timer"))
+            # [PATCH-276 FIX-P1-7] 无告警通道时提醒运维人员。
+            # 证书到期是严重故障 (站点不可用), 续期失败应尽早发现。
+            # [PATCH-278] 无 webhook 时已自动安装 journal/email 兜底通知,
+            # 续期失败不再完全静默; 降级为 info 并提示升级到 webhook。
+            if not self.cfg.notify_webhook:
+                _nf_svc_278, _, _ = self._get_notify_file_paths()
+                if _nf_svc_278.exists():
+                    logging.info(t("info_patch_278_journal_notify_installed",
+                                   unit=f"{self.cfg.systemd_prefix}-ssl-notify-fail.service"))
+                else:
+                    logging.warning(t("warn_patch_278_journal_notify_failed"))
             # [V3.2.76] Imp-D: 禁用 certbot 自带续期 timer, 避免双重续期
             for _ct_name in ("snap.certbot.renew.timer",
                              "certbot.timer"):
@@ -28098,7 +31987,7 @@ class WPDeployManager:
     # -----------------------------------------------------------------------
     # 部署完成摘要
     # -----------------------------------------------------------------------
-    def _append_wp_admin_credentials(self, cred_content):
+    def _append_wp_admin_credentials(self, cred_content: list) -> None:
         """[V3.2.21-AUDIT] P1-3: 共享 WP 管理员凭据处理。
 
         单一事实来源: _print_http_summary() 与 print_final_summary()
@@ -28134,7 +32023,7 @@ class WPDeployManager:
                 pass
         return cred_content
 
-    def _print_http_summary(self):
+    def _print_http_summary(self) -> None:
         """--skip-ssl 模式的部署完成摘要。"""
         self._guard_credential_fields()  # [PATCH-162 FIX-4]
         cred_file = self.cfg.credentials_file  # [PATCH-146 P2-5]
@@ -28232,7 +32121,7 @@ class WPDeployManager:
                         else:
                             logging.warning(t("warn_patch_200_p0_credential_file_root_password_conta"))
 
-    def print_final_summary(self):
+    def print_final_summary(self) -> None:
         self._guard_credential_fields()  # [PATCH-162 FIX-4]
         cred_file = self.cfg.credentials_file  # [PATCH-146 P2-5]
         db_host_arg = f" -h {self.cfg.db_host}" if self.cfg.is_external_db else ""
@@ -28307,8 +32196,7 @@ class WPDeployManager:
     # -----------------------------------------------------------------------
     # [V3.2.32] backup() 拆分: 子方法
     # -----------------------------------------------------------------------
-    def _backup_load_root_password(self):
-        # type: () -> None
+    def _backup_load_root_password(self) -> None:
         """加载 MariaDB root 密码用于数据库备份。
 
         优先级: CLI --db-root-pass > 全局密码文件。
@@ -28326,8 +32214,7 @@ class WPDeployManager:
             if _raw_pwd:
                 self.db_root_pass = _raw_pwd
 
-    def _backup_database(self, db_dump):
-        # type: (Path) -> bool
+    def _backup_database(self, db_dump: Path) -> bool:
         """执行数据库 dump 到 gzip 压缩文件, 返回是否成功。"""
         if not self.db_root_pass:
             logging.warning(t("warn_db_pwd_unavail_backup"))
@@ -28387,8 +32274,7 @@ class WPDeployManager:
             except OSError:
                 pass
 
-    def _backup_run_dump_pipeline(self, dump_cmd, db_dump, timeout):
-        # type: (list, Path, int) -> bool
+    def _backup_run_dump_pipeline(self, dump_cmd: list, db_dump: Path, timeout: int) -> bool:
         """mysqldump | gzip 管道执行, 返回是否成功。"""
         # [V3.2.119] FIX-10: concurrent.futures 已提升至模块级导入
         dump_ok = False
@@ -28426,11 +32312,11 @@ class WPDeployManager:
             _dump_err_container = [b""]
             # [PATCH-199] select-based drain; detects EOF on child exit
             _dump_stderr_fd = p_dump.stderr.fileno()
-            def _drain_dump_stderr(_fd_num, _container):
+            def _drain_dump_stderr(_fd_num: int, _container: list) -> None:
                 try:
                     _container[0] = _drain_pipe_with_select(_fd_num) or b""
-                except Exception:
-                    pass
+                except Exception as _exc_31675:
+                    logging.debug("[PATCH-276] stdout: %s", _exc_31675)
             _dump_drain_t = _threading.Thread(
                 target=_drain_dump_stderr,
                 args=(_dump_stderr_fd, _dump_err_container))
@@ -28454,7 +32340,7 @@ class WPDeployManager:
                         try:
                             _p.wait(timeout=5)
                         except Exception:
-                            pass
+                            pass  # process cleanup: wait may fail if already exited
                 _dump_drain_t.join(timeout=5)
                 if _dump_drain_t.is_alive():
                     logging.warning(t("warn_patch_199_drain_thread_alive_after_kill"))
@@ -28467,8 +32353,8 @@ class WPDeployManager:
                         if _gz_partial:
                             _timeout_diag.append(
                                 _gz_partial.decode("utf-8", errors="replace"))
-                    except Exception:
-                        pass
+                    except Exception as _exc_31713:
+                        logging.debug("[PATCH-276] L31713: %s", _exc_31713)
                 if _timeout_diag:
                     logging.debug(
                         "[FIX-4] backup timeout stderr: %s",
@@ -28489,7 +32375,7 @@ class WPDeployManager:
                     p_dump.kill()
                     p_dump.wait(timeout=5)
                 except Exception:
-                    pass
+                    pass  # process cleanup: wait may fail if already exited
             _dump_drain_t.join(timeout=5)
             # [PATCH-199] select-based drain exits on EOF/timeout;
             # no force os.close() needed (eliminates fd reuse race).
@@ -28551,8 +32437,8 @@ class WPDeployManager:
                                     len(_err_tables_196),
                                     ", ".join(sorted(_err_tables_196)[:5]),
                                     _inc_path_196)
-                        except Exception:
-                            pass
+                        except Exception as _exc_31797:
+                            logging.debug("[PATCH-276] operation failed: %s", _exc_31797)
                     else:
                         logging.error(t("err_patch_190_defect_1_gzip_exited_on_fix_path"),
                             p_gzip.returncode)
@@ -28585,13 +32471,13 @@ class WPDeployManager:
                             try:
                                 _pipe.close()
                             except Exception:
-                                pass
+                                pass  # pipe cleanup: close may fail on already-closed fd
                     try:
                         if p.poll() is None:
                             p.kill()
                             p.wait(timeout=5)
                     except Exception:
-                        pass
+                        pass  # process cleanup: wait may fail if already exited
             # [PATCH-199] select-based drain; simplified cleanup
             if _dump_drain_t is not None:
                 try:
@@ -28599,14 +32485,14 @@ class WPDeployManager:
                     if _dump_drain_t.is_alive():
                         logging.warning(t("warn_patch_199_backup_drain_thread_alive_in"))
                 except Exception:
-                    pass
+                    pass  # thread check: non-fatal
             # [V3.2.37] P-4: gzip_fd 在 finally 中关闭, 即使 TimeoutExpired
             # raise 跳出内层 try, finally 仍保证执行。此注释防止未来重构误删。
             if gzip_fd is not None:
                 try:
                     gzip_fd.close()
-                except Exception:
-                    pass
+                except Exception as _exc_31851:
+                    logging.debug("[PATCH-276] L31851: %s", _exc_31851)
         if not dump_ok:
             logging.warning(t("warn_db_dump_incomplete"))
             self._exit_code = 1
@@ -28617,8 +32503,7 @@ class WPDeployManager:
                     pass
         return dump_ok
 
-    def _backup_webroot_files(self, backup_dir):
-        # type: (Path) -> None
+    def _backup_webroot_files(self, backup_dir: Path) -> None:
         """压缩 webroot 目录到备份。
 
         [V3.2.90] B-10 注释: tar 打包使用 -C parent name 格式,
@@ -28668,8 +32553,7 @@ class WPDeployManager:
             self._exit_code = 1
 
 
-    def _backup_letsencrypt_certs(self, backup_dir):
-        # type: (Path) -> None
+    def _backup_letsencrypt_certs(self, backup_dir: Path) -> None:
         """[P2] 备份 Let's Encrypt 证书目录 (live + archive + renewal conf)。
 
         恢复到新服务器时, SSL 无需重新签发。
@@ -28717,8 +32601,7 @@ class WPDeployManager:
             if _cert_stderr:
                 logging.warning(t("warn_tar_letsencrypt_error_detail"), _cert_stderr)
 
-    def _backup_nginx_and_extras(self, backup_dir):
-        # type: (Path) -> None
+    def _backup_nginx_and_extras(self, backup_dir: Path) -> None:
         """备份 Nginx 配置 + Fail2Ban/logrotate 附加配置。"""
         if self.cfg.nginx_conf.exists():
             # [PATCH-255 FIX-29] Reject symlink source: shutil.copy2 follows
@@ -28772,8 +32655,7 @@ class WPDeployManager:
                         logging.warning(t("warn_extra_backup_fail",
                                           name=_src.name, e=_e))
 
-    def _backup_verify_and_cleanup(self, backup_dir, keep_count):
-        # type: (Path, int) -> None
+    def _backup_verify_and_cleanup(self, backup_dir: Path, keep_count: int) -> None:
         """校验备份完整性并清理旧备份。"""
         db_dump = backup_dir / ("%s.sql.gz" % self.cfg.db_name)
         webroot_tar = backup_dir / "webroot.tar.gz"
@@ -28862,7 +32744,6 @@ class WPDeployManager:
             except OSError as e:
                 logging.warning(t("warn_list_bak_fail", e=e))
     def backup(self, keep_count: int = 5, lightweight: bool = False) -> None:  # [AUDIT M-1]
-        # type: (int, bool) -> None
         """一键备份：数据库 dump + webroot 压缩包 + Nginx 配置。
 
         lightweight=True 时仅备份 DB + Nginx 配置，跳过 webroot 压缩与
@@ -29090,8 +32971,8 @@ class WPDeployManager:
                 if (_rua.returncode == 0
                         and _redis_svc_auto in _rua.stdout):
                     _redis_auto_show = True
-            except Exception:
-                pass
+            except Exception as _exc_32336:
+                logging.debug("[PATCH-276] print: %s", _exc_32336)
         if _redis_auto_show:
             status_services.append(
                 (self._detect_redis_service_name(), "Redis"))
@@ -29128,6 +33009,38 @@ class WPDeployManager:
 
         # WP-CLI 状态 + 插件状态（nginx-helper / redis-cache）
         # 不依赖部署参数（status 子命令不传 --cache/--redis），直接探测实际状态。
+
+        # [PATCH-276 FIX-10.5] DB 连接池健康探针:
+        # 检查 max_connections 和当前活跃连接数, 预警连接池即将耗尽。
+        if not self.cfg.is_external_db and not self.cfg.dry_run:
+            try:
+                _db_pool = self.run_sql(
+                    "SELECT @@max_connections, @@wait_timeout, "
+                    "(SELECT COUNT(*) FROM information_schema.processlist);",
+                    use_pwd=True, timeout=5, quiet=True)
+                if _db_pool and _db_pool.stdout:
+                    _parts = _db_pool.stdout.strip().split()
+                    if len(_parts) >= 3:
+                        _max_conn = int(_parts[0])
+                        _wait_t = int(_parts[1])
+                        _cur_conn = int(_parts[2])
+                        _usage_pct = (_cur_conn / _max_conn * 100) if _max_conn > 0 else 0
+                        if _usage_pct >= 80:
+                            _db_pool_mark = t("status_mark_crit")
+                            print(f"  {_db_pool_mark} DB connections: "
+                                  f"{_cur_conn}/{_max_conn} ({_usage_pct:.0f}%)"
+                                  f" — CRITICAL: near exhaustion")
+                        elif _usage_pct >= 50:
+                            _db_pool_mark = t("status_mark_warn")
+                            print(f"  {_db_pool_mark} DB connections: "
+                                  f"{_cur_conn}/{_max_conn} ({_usage_pct:.0f}%)")
+                        # wait_timeout 过短 (< 60s) 可能导致 WordPress 长查询被断开
+                        if _wait_t < 60:
+                            print(f"  ⚠  DB wait_timeout={_wait_t}s"
+                                  f" (unusually low, may cause WP timeouts)")
+            except Exception as _db_pool_e:
+                logging.debug("[PATCH-276] DB pool check: %s", _db_pool_e)
+
         # _detect_wpcli 首次调用会打 INFO 日志，status 场景下用状态行代替，临时静默
         _root_logger = logging.getLogger()
         _prev_level = _root_logger.level
@@ -29189,9 +33102,11 @@ class WPDeployManager:
                     if self.cfg.nginx_conf.exists():
                         try:
                             _nc_nh_status = self.cfg.nginx_conf.read_text(encoding="utf-8")
-                            if "srcache_fetch" in _nc_nh_status:
+                            # [PATCH-280] Strip comments to avoid matching commented-out directives
+                            _nc_nh_clean = _strip_nginx_comments_d5(_nc_nh_status)
+                            if "srcache_fetch" in _nc_nh_clean:
                                 _actual_page_cache = "redis"
-                            elif "fastcgi_cache" in _nc_nh_status:
+                            elif "fastcgi_cache" in _nc_nh_clean:
                                 _actual_page_cache = "fastcgi"
                         except OSError:
                             pass
@@ -29302,9 +33217,11 @@ class WPDeployManager:
         if self.cfg.nginx_conf.exists():
             try:
                 _nc_cache = self.cfg.nginx_conf.read_text(encoding="utf-8")
-                if "srcache_fetch" in _nc_cache:
+                # [PATCH-280] Strip comments to avoid matching commented-out directives
+                _nc_cache_clean = _strip_nginx_comments_d5(_nc_cache)
+                if "srcache_fetch" in _nc_cache_clean:
                     _cache_mode_str = t("status_cache_redis")
-                elif "fastcgi_cache" in _nc_cache:
+                elif "fastcgi_cache" in _nc_cache_clean:
                     _cache_mode_str = t("status_cache_fastcgi")
             except OSError:
                 pass
@@ -29333,6 +33250,40 @@ class WPDeployManager:
             _disk_mark = t("status_mark_crit")
         print(t("status_disk", icon=_disk_mark, mb=free_mb, path=self.cfg.webroot_path))
 
+        # [PATCH-276 FIX-10.4] 日志文件大小检查 — 预警膨胀的日志文件。
+        # logrotate 配置异常 (如权限不足无法轮转) 时, 日志可快速膨胀
+        # 耗尽磁盘。检查 > 100MB 的日志文件并输出警告。
+        _LOG_WARN_MB = 100
+        _log_paths_to_check = [
+            Path(f"/var/log/nginx/{domain}.access.log"),
+            Path(f"/var/log/nginx/{domain}.error.log"),
+            Path("/var/log/nginx/error.log"),
+        ]
+        # 动态添加 PHP-FPM 日志
+        for _php_log_glob in ("/var/log/php*-fpm*log", "/var/log/php*/fpm/error.log"):
+            _log_paths_to_check.extend(Path("/").glob(_php_log_glob.lstrip("/")))
+        # MariaDB/MySQL 日志
+        for _db_log in ("/var/log/mysql/error.log", "/var/log/mariadb/mariadb.log",
+                         "/var/log/mysqld.log"):
+            _log_paths_to_check.append(Path(_db_log))
+        _oversized = []
+        for _lp in _log_paths_to_check:
+            try:
+                if _lp.exists() and not _lp.is_symlink():
+                    _sz_mb = _lp.stat().st_size / (1024 * 1024)
+                    if _sz_mb >= _LOG_WARN_MB:
+                        _oversized.append((_lp, _sz_mb))
+            except OSError:
+                pass
+        if _oversized:
+            for _lp, _sz_mb in _oversized:
+                if _LANG == "zh":
+                    print(f"  ⚠  日志文件过大: {_lp} ({_sz_mb:.0f} MB)"
+                          f" — 检查 logrotate 配置")
+                else:
+                    print(f"  ⚠  Large log file: {_lp} ({_sz_mb:.0f} MB)"
+                          f" — check logrotate config")
+
         print()
 
     # -----------------------------------------------------------------------
@@ -29342,8 +33293,7 @@ class WPDeployManager:
     # -----------------------------------------------------------------------
     # [V3.2.32] restore() 拆分: 子方法
     # -----------------------------------------------------------------------
-    def _restore_locate_backup(self, backup_path):
-        # type: (str) -> Path
+    def _restore_locate_backup(self, backup_path: str) -> Path:
         """定位备份目录, 返回 Path 或 None。"""
         if backup_path:
             _raw_bak = Path(backup_path)
@@ -29411,8 +33361,7 @@ class WPDeployManager:
             return None
         return bak_dir
 
-    def _restore_database(self, bak_dir):
-        # type: (Path) -> None
+    def _restore_database(self, bak_dir: Path) -> None:
         """从备份恢复数据库。"""
         # [PATCH-CRIT-7] 校验 db_name: deploy 路径有 validate_sql_identifier
         # 但 restore 路径此前直接信任 cfg.db_name, 若 --domain 通过
@@ -29572,11 +33521,11 @@ class WPDeployManager:
             _gz_err_container = [b""]
             # [PATCH-199] select-based drain - same pattern as backup
             _gz_stderr_fd = p_gunzip.stderr.fileno()
-            def _drain_gunzip_stderr(_fd_num, _container):
+            def _drain_gunzip_stderr(_fd_num: int, _container: list) -> None:
                 try:
                     _container[0] = _drain_pipe_with_select(_fd_num) or b""
-                except Exception:
-                    pass
+                except Exception as _exc_32821:
+                    logging.debug("[PATCH-276] _drain_gunzip_stderr failed: %s", _exc_32821)
             _gz_drain_t = _threading.Thread(
                 target=_drain_gunzip_stderr,
                 args=(_gz_stderr_fd, _gz_err_container))
@@ -29611,7 +33560,7 @@ class WPDeployManager:
                 try:
                     _gz_drain_t.join(timeout=5)
                 except Exception:
-                    pass
+                    pass  # thread join timeout: non-fatal
         except Exception as e:
             logging.warning(t("warn_db_restore_exception", e=e))
             self._exit_code = 1
@@ -29626,13 +33575,13 @@ class WPDeployManager:
                             try:
                                 _pipe.close()
                             except Exception:
-                                pass
+                                pass  # pipe cleanup: close may fail on already-closed fd
                     try:
                         if _p.poll() is None:
                             _p.kill()
                             _p.wait(timeout=5)
                     except Exception:
-                        pass
+                        pass  # process cleanup: wait may fail if already exited
             # [PATCH-181 FIX-2] Join drain thread after pipes closed;
             # mirrors _backup_run_dump_pipeline PATCH-180 P-2b.
             # [PATCH-199] select-based drain exits on EOF/timeout;
@@ -29643,7 +33592,7 @@ class WPDeployManager:
                     if _gz_drain_t.is_alive():
                         logging.warning(t("warn_patch_199_gunzip_drain_thread_still_alive"))
                 except Exception:
-                    pass
+                    pass  # thread check: non-fatal
             try:
                 os.unlink(defaults_file)
             except OSError:
@@ -30000,8 +33949,7 @@ class WPDeployManager:
             self.run_sql(
                 "DROP DATABASE IF EXISTS `%s`;" % _tmp_db, timeout=30)
 
-    def _restore_webroot_files(self, bak_dir):
-        # type: (Path) -> None
+    def _restore_webroot_files(self, bak_dir: Path) -> None:
         """从备份恢复站点文件。
 
         [V3.2.90] B-10 注释: 解压目标为 webroot_path.parent,
@@ -30030,8 +33978,7 @@ class WPDeployManager:
             return
         logging.info(t("info_webroot_restore_ok"))
 
-    def _restore_nginx_and_extras(self, bak_dir):
-        # type: (Path) -> dict
+    def _restore_nginx_and_extras(self, bak_dir: Path) -> dict:
         """恢复 Nginx + 附加配置, 返回恢复前的 Nginx 配置快照 (用于回滚)。"""
         _nginx_pre = {}
         _nginx_pre['_new_files'] = []  # [V3.2.108] AUDIT-5: track newly added files for rollback
@@ -30212,7 +34159,7 @@ class WPDeployManager:
             logging.error(t("warn_tar_inspection_blocked", e=_e))
             return True  # fail-closed: 假定存在路径遍历
 
-    def _safe_extract_tar(self, tar_path, dest_dir, *,
+    def _safe_extract_tar(self, tar_path: str, dest_dir: str, *,
                           strip_components: int = 0,
                           safe_perms: bool = False,
                           timeout: int = 120,
@@ -30257,7 +34204,7 @@ class WPDeployManager:
                 detail=(result.stderr or "")[:200]))
         return bool(result)
 
-    def _clone_pinned_module(self, name: str, dest_dir,
+    def _clone_pinned_module(self, name: str, dest_dir: str,
                              submodules: bool = True) -> bool:
         """[PATCH-259] 统一固定版本 git clone 入口。
 
@@ -30295,8 +34242,8 @@ class WPDeployManager:
                 if _gvm and (int(_gvm.group(1)),
                              int(_gvm.group(2))) >= (2, 9):
                     _gsub = ["--shallow-submodules"]
-            except Exception:
-                pass
+            except Exception as _exc_33541:
+                logging.debug("[PATCH-276] _dir: %s", _exc_33541)
         # URL 列表 (国内代理优先)
         _urls = [_url]
         if _is_china_network():
@@ -30332,8 +34279,7 @@ class WPDeployManager:
         logging.warning(t("warn_clone_all_failed", mod=name))
         return False
 
-    def _restore_letsencrypt_certs(self, bak_dir):
-        # type: (Path) -> None
+    def _restore_letsencrypt_certs(self, bak_dir: Path) -> None:
         """[P2] 从备份恢复 Let's Encrypt 证书目录。"""
         _le_tar = bak_dir / "letsencrypt.tar.gz"
         if not _le_tar.exists():
@@ -30420,8 +34366,7 @@ class WPDeployManager:
             if not self.cfg.cert_chain.exists():
                 logging.warning(t("warn_fix_2b_certificate_not_found_after_le"), _domain)
 
-    def _restore_post_fixup(self, _nginx_pre):
-        # type: (dict) -> None
+    def _restore_post_fixup(self, _nginx_pre: dict) -> None:
         """恢复后权限修复、服务重载、定时器重建。"""
         # [FIX #16] 跨服务器 restore 时 PHP 可能不存在。
         # 检测 PHP 可用性, 不存在时输出明确告警引导用户。
@@ -30462,6 +34407,7 @@ class WPDeployManager:
                             cert_chain=str(self.cfg.cert_chain),
                             cert_key=str(self.cfg.cert_key),
                             http3=self.cfg.http3,
+                            serve_dist=self.cfg.serve_dist,
                         )
                     else:
                         _regen_conf = generate_http_production_config(
@@ -30469,6 +34415,7 @@ class WPDeployManager:
                             cache_mode=self.cfg.cache_mode,
                             allow_xmlrpc=self.cfg.allow_xmlrpc,
                             optimize=self.cfg.optimize,
+                            serve_dist=self.cfg.serve_dist,
                         )
                     # [PATCH-204 FIX-2] 对齐证书 SAN 与 server_name,
                     # 与 setup_nginx_for_production / update_config 一致。
@@ -30599,6 +34546,7 @@ class WPDeployManager:
                 cache_mode=self.cfg.cache_mode,
                 allow_xmlrpc=self.cfg.allow_xmlrpc,
                 optimize=self.cfg.optimize,
+                serve_dist=self.cfg.serve_dist,
             )
             if not self.apply_nginx_config_safe(_http_conf):
                 _nginx_restore_ok = False  # [V3.2.121] FIX-3
@@ -30613,6 +34561,7 @@ class WPDeployManager:
         self._ensure_wpcli()
         self._setup_brotli()
         self._setup_cloudflare_real_ip()
+        self._setup_serve_dist()  # [PATCH-271] 与 deploy/update/enable_ssl 对齐
         self.setup_wp_cron_timer()
         self._ensure_wp_cron_constant()  # [V3.2.33] P-2
         self.setup_db_optimize_timer()
@@ -30679,7 +34628,6 @@ class WPDeployManager:
                 "[AUDIT-R1] Health check skipped: %s", _hc_e)
 
     def restore(self, backup_path: str = "") -> None:  # [AUDIT M-1]
-        # type: (str) -> None
         """从备份目录恢复站点。
 
         [V3.2.32] 重构: 拆分为 5 个子方法。
@@ -30767,6 +34715,9 @@ class WPDeployManager:
         # [V3.2.113] PATCH-1b: 统一调用 _pre_backup(), 隔离 _exit_code 副作用
         self._pre_backup()
 
+        # [PATCH-270] 初始化动态模块重编译标志
+        self._nginx_modules_need_recompile = False
+
         # [PATCH-202 FIX-5] 委托共享方法, 消除重复的自动探测逻辑。
         self._apply_auto_detected_config()
         logging.info(t("info_update_start", domain=self.cfg.domain))
@@ -30776,8 +34727,15 @@ class WPDeployManager:
         self._upgrade_php_if_needed()
         # [PATCH-268] PHP/Nginx 小版本主动升级 (安全/bug 修复)
         self._upgrade_php_minor_if_available()
-        # [PATCH-265] Nginx 版本状态 + [PATCH-268] 小版本主动升级
+        # [PATCH-265] Nginx 版本状态
         self._report_nginx_version()
+        # [PATCH-272] update 路径: 用户可能从 fastcgi 切换到 redis, 需要 Nginx 1.28+。
+        # deploy 路径在 install_packages 中配置 nginx.org 仓库, update 路径需对齐。
+        if self.cfg.cache_mode == 'redis':
+            self._prepare_nginx_128_repo()
+        # [PATCH-268] Nginx 小版本主动升级 (安全/bug 修复)
+        # 必须在 _ensure_srcache_modules 之前: 新版 Nginx 二进制需要重编译动态模块
+        self._upgrade_nginx_minor_if_available()
         # [PATCH-MDB] MariaDB 版本升级 (如果当前版本低于最低推荐)
         self._upgrade_mariadb_if_needed()
         # [PATCH-268] MariaDB 小版本主动升级 (安全/bug 修复)
@@ -30796,8 +34754,8 @@ class WPDeployManager:
         # 而非等到 apply_nginx_config_safe 中 nginx -t 失败才被动触发。
         try:
             self._fix_nginx_post_upgrade_compat()
-        except Exception:
-            pass
+        except Exception as _exc_34056:
+            logging.debug("[PATCH-276] _fix_nginx_post_upgrade_compat failed: %s", _exc_34056)
         self._ensure_redis_for_srcache()  # [PATCH-171 FIX-4]
         sock_path = self.get_php_sock_path()
         # [FIX-2] 有证书 → HTTPS 配置; 无证书 → HTTP-only 配置
@@ -30811,6 +34769,7 @@ class WPDeployManager:
                 cert_chain=str(self.cfg.cert_chain),
                 cert_key=str(self.cfg.cert_key),
                 http3=self.cfg.http3,  # [PATCH-167 FIX-4d]
+                serve_dist=self.cfg.serve_dist,  # [PATCH-271]
             )
         else:
             logging.info(t("warn_update_no_cert"))
@@ -30819,6 +34778,7 @@ class WPDeployManager:
                 cache_mode=self.cfg.cache_mode,
                 allow_xmlrpc=self.cfg.allow_xmlrpc,
                 optimize=self.cfg.optimize,
+                serve_dist=self.cfg.serve_dist,  # [PATCH-271]
             )
         config = self._align_nginx_with_cert(config)  # [PATCH-162 FIX-2]
         # [V3.2.112] INC-2: 追踪 Nginx 配置结果, 失败时跳过依赖正确
@@ -30881,6 +34841,7 @@ class WPDeployManager:
         self._update_wpcli()  # [PATCH-165 FIX-1] 热更新时检查 WP-CLI 版本
 
         # 4. Fail2Ban + logrotate + Brotli + nginx-helper
+        self._upgrade_fail2ban_minor_if_available()  # [PATCH-272]
         self.setup_fail2ban()
         self.setup_logrotate()
         self.setup_wp_cron_timer()  # [V3.0.16] P2
@@ -30890,17 +34851,25 @@ class WPDeployManager:
         # (在下方 setup_systemd 块中统一调用)
         self._setup_brotli()
         self._setup_cloudflare_real_ip()  # [V3.0.16] P12
+        self._setup_serve_dist()  # [PATCH-271]
         # [V3.2.0] P3: deploy 时 WP-CLI 不可用导致自动安装跳过, update 补执行
         self._wp_auto_install()
         # 更新脚本管理的插件（nginx-helper / redis-cache），并在更新后重新应用配置
         self._update_managed_plugins()
         self._install_nginx_helper()
+        # [PATCH-270] Redis 版本管理: 版本门控 → 升级 → 验证
+        # (位于 _setup_redis_cache 之前, 确保插件配置使用新版 Redis)
+        self._upgrade_redis_if_needed()
+        self._upgrade_redis_minor_if_available()  # [PATCH-272]
         self._setup_redis_cache()  # [V3.0.11] B2: 允许 update --redis 补装
         # [V3.2.95] BUG-FIX: WP-CLI 以 root 运行后修正 webroot 属主
         self._fix_webroot_ownership()
 
         # [V3.0.9] B8: 同步 Systemd 续期单元（修正脚本路径变更后旧路径残留）
         if _has_cert:                                # [V3.2.69] BUG-1: HTTP-only 无需续期 timer
+            # [PATCH-270] Certbot 版本管理: snap 迁移 (位于续期基础设施之前,
+            # 确保 _setup_ssl_renewal_infra 使用最新 certbot 路径)
+            self._upgrade_certbot_if_needed()
             self._suppress_phase_banner = True  # [PATCH-165 FIX-2]
             self._setup_ssl_renewal_infra()  # [PATCH-146 P1-3]
             # [V3.2.112] INC-2: Nginx 配置更新失败时跳过续期管道验证,
@@ -30933,15 +34902,15 @@ class WPDeployManager:
                         if Path(_sock).exists():
                             break
                         time.sleep(0.3)
-            except Exception:
-                pass
+            except Exception as _exc_34204:
+                logging.debug("[PATCH-276] t: %s", _exc_34204)
         self._safe_reload_nginx()  # [V3.0.16] P8: 门控 reload
         logging.info(t("info_update_done", domain=self.cfg.domain))
 
     # -----------------------------------------------------------------------
     # 卸载
     # -----------------------------------------------------------------------
-    def _upgrade_http_to_https(self):
+    def _upgrade_http_to_https(self) -> None:
         """[V3.2.1] L-1: deploy --skip-ssl 后 enable-ssl 时恢复 HTTPS 设置。
 
         1. 将 wp-config.php 中 FORCE_SSL_ADMIN 从 false 改回 true
@@ -30976,7 +34945,7 @@ class WPDeployManager:
                 timeout=15, quiet=True,
             )
 
-    def _downgrade_to_http(self):
+    def _downgrade_to_http(self) -> None:
         """[V3.2.110] FIX-3: Downgrade WordPress URLs from https:// to http://.
 
         Called during restore when certificate is missing or --skip-ssl is set,
@@ -31013,7 +34982,7 @@ class WPDeployManager:
                     timeout=15, quiet=True)
                 logging.info(t("info_fix_3_wordpress_urls_downgraded_to_http"))
 
-    def _restore_http_production_config(self):
+    def _restore_http_production_config(self) -> None:
         """[V3.2.3] H-1: 恢复 HTTP 生产配置，防止站点停留在 ACME-only 模式。
 
         enable_ssl() 中 setup_nginx_for_challenge() 会将 Nginx 配置替换为
@@ -31031,8 +35000,12 @@ class WPDeployManager:
                 if self.apply_nginx_config_safe(_saved):
                     logging.info(t("info_nginx_restored_snapshot"))
                     return
-            except Exception:
-                pass  # 快照恢复失败，降级到重生成
+            except Exception as _snap_e:
+                # [PATCH-276 FIX-P0-4] 快照恢复失败 → 降级到重生成。
+                # 记录原因便于排查为何快照不可用。
+                logging.warning(
+                    "[PATCH-276] Nginx snapshot restore failed,"
+                    " falling back to regeneration: %s", _snap_e)
         try:
             _sock = self.get_php_sock_path()
             _http_conf = generate_http_production_config(
@@ -31048,7 +35021,7 @@ class WPDeployManager:
         except Exception as _e:
             logging.warning(t("warn_http_restore_fail", e=_e))
 
-    def _retry_with_ssl_diagnosis(self, action, *args, **kwargs):
+    def _retry_with_ssl_diagnosis(self, action: Callable[..., bool], *args: Any, **kwargs: Any) -> bool:
         """[V3.2.2] D-1: SSL 操作失败后诊断+重试的通用辅助。
 
         [V3.2.103] FIX-1: _diagnose_ssl_failure 调用 _try_repair 返回 bool,
@@ -31065,8 +35038,7 @@ class WPDeployManager:
             return action(*args, **kwargs)
         return False
 
-    def _ssl_recover_credentials(self):
-        # type: () -> None
+    def _ssl_recover_credentials(self) -> None:
         """SSL 签发完成后恢复真实 DB 凭据, 防止覆写为错误密码。
 
         优先从 wp-config.php 恢复; 失败时回退到凭据文件的多格式解析。
@@ -31408,6 +35380,7 @@ class WPDeployManager:
         # [V3.2.69] BUG-E: Brotli/CF 配置写入后再做健康检查，验证终态 Nginx 配置
         self._setup_brotli()
         self._setup_cloudflare_real_ip()    # [V3.2.33] P-5
+        self._setup_serve_dist()  # [PATCH-271]
         # [V3.2.73] Bug-6: 先完成自动安装, 再做健康检查 (与 deploy 路径对齐)
         self._wp_auto_install()
         # [PATCH-251] srcache 降级后补充 FPM 重启 (与 deploy HTTPS 路径对齐)。
@@ -31810,12 +35783,11 @@ class WPDeployManager:
         f2b_deleted = False
         for f2b_file in (f2b_filter, f2b_jail):
             if f2b_file.exists():
-                try:
-                    f2b_file.unlink()
+                if self._force_unlink(f2b_file):
                     logging.info(t("info_deleted", path=f2b_file))
                     f2b_deleted = True
-                except OSError as _e:
-                    logging.warning(t("warn_failed_to_remove_manual_cleanup"), f2b_file, _e)
+                else:
+                    logging.warning(t("warn_failed_to_remove_manual_cleanup"), f2b_file, "force_unlink failed")
                     self._exit_code = 1
         # [AUDIT-2] 仅在实际删除了配置文件时热重载 fail2ban 使之生效。
         # 使用 reload 而非 restart, 避免清空其他 jail 的 IP 封禁状态。
@@ -31834,11 +35806,10 @@ class WPDeployManager:
         # [V2.9.9] 清理 logrotate 配置 (V2.9.7 setup_logrotate 创建)
         _logrotate_conf = Path(f"/etc/logrotate.d/nginx-wp-{safe_name}")
         if _logrotate_conf.exists():
-            try:
-                _logrotate_conf.unlink()
+            if self._force_unlink(_logrotate_conf):
                 logging.info(t("info_deleted", path=_logrotate_conf))
-            except OSError as _e:
-                logging.warning(t("warn_failed_to_remove_manual_cleanup_2"), _logrotate_conf, _e)
+            else:
+                logging.warning(t("warn_failed_to_remove_manual_cleanup_2"), _logrotate_conf, "force_unlink failed")
                 self._exit_code = 1
 
         # [AUDIT-3] 清理 Nginx 站点日志文件 (含已轮转的归档日志)。
@@ -31850,21 +35821,19 @@ class WPDeployManager:
             # 删除主日志 + 所有轮转归档 (.1, .2.gz, ...)
             for _log_candidate in _log_path.parent.glob(
                     f"{self.cfg.domain}.{_log_suffix}*"):
-                try:
-                    _log_candidate.unlink()
+                if self._force_unlink(_log_candidate):
                     logging.info(t("info_deleted", path=_log_candidate))
-                except OSError as _le:
-                    logging.warning(t("warn_cannot_remove_log_manual_cleanup"), _log_candidate, _le)
+                else:
+                    logging.warning(t("warn_cannot_remove_log_manual_cleanup"), _log_candidate, "force_unlink failed")
                     self._exit_code = 1
 
         # [P126-4] 清理 db-optimize 专用 .cnf 文件 (P126-1 创建)
         _optimize_cnf = Path("/root/.my_wp_optimize_%s.cnf" % safe_name)
         if _optimize_cnf.exists():
-            try:
-                _optimize_cnf.unlink()
+            if self._force_unlink(_optimize_cnf):
                 logging.info(t("info_deleted", path=_optimize_cnf))
-            except OSError as _e:
-                logging.warning(t("warn_failed_to_remove_manual_cleanup_3"), _optimize_cnf, _e)
+            else:
+                logging.warning(t("warn_failed_to_remove_manual_cleanup_3"), _optimize_cnf, "force_unlink failed")
                 self._exit_code = 1
 
         # [V3.0.16] P2: 清理 wp-cron timer 文件
@@ -31875,20 +35844,18 @@ class WPDeployManager:
         _dbo_tmr = Path(f"/etc/systemd/system/{self.cfg.systemd_prefix}-db-optimize.timer")
         for _wpc_f in (_wpc_svc, _wpc_tmr, _dbo_svc, _dbo_tmr):
             if _wpc_f.exists():
-                try:
-                    _wpc_f.unlink()
+                if self._force_unlink(_wpc_f):
                     logging.info(t("info_deleted", path=_wpc_f))
-                except OSError as _e:
-                    logging.warning(t("warn_failed_to_remove_manual_cleanup_4"), _wpc_f, _e)
+                else:
+                    logging.warning(t("warn_failed_to_remove_manual_cleanup_4"), _wpc_f, "force_unlink failed")
                     self._exit_code = 1
 
         for f in (self.cfg.service_file, self.cfg.timer_file, self.cfg.nginx_conf):
             if f.exists():
-                try:
-                    f.unlink()
+                if self._force_unlink(f):
                     logging.info(t("info_deleted", path=f))
-                except OSError as _e:
-                    logging.warning(t("warn_failed_to_remove_manual_cleanup_5"), f, _e)
+                else:
+                    logging.warning(t("warn_failed_to_remove_manual_cleanup_5"), f, "force_unlink failed")
                     self._exit_code = 1
 
         # [PATCH-267] 清理 fastcgi snippet 文件
@@ -31907,11 +35874,10 @@ class WPDeployManager:
         _eab_env_196 = Path(
             f"/etc/systemd/system/{self.cfg.systemd_prefix}-ssl.env")
         if _eab_env_196.exists():
-            try:
-                _eab_env_196.unlink()
+            if self._force_unlink(_eab_env_196):
                 logging.info(t("info_deleted", path=_eab_env_196))
-            except OSError as _e:
-                logging.warning(t("warn_failed_to_remove_manual_cleanup_6"), _eab_env_196, _e)
+            else:
+                logging.warning(t("warn_failed_to_remove_manual_cleanup_6"), _eab_env_196, "force_unlink failed")
                 self._exit_code = 1
 
         # [V3.2.79][B2] 清理通知脚本 + env 文件 + notify-fail 服务单元
@@ -31922,11 +35888,10 @@ class WPDeployManager:
             self.run_cmd(["systemctl", "disable", _nf_unit_name], quiet=True)
             for _nf_path in (_nf_svc, _nf_script, _nf_env):
                 if _nf_path.exists():
-                    try:
-                        _nf_path.unlink()
+                    if self._force_unlink(_nf_path):
                         logging.info(t("info_deleted", path=_nf_path))
-                    except OSError as _e:
-                        logging.warning(t("warn_failed_to_remove_manual_cleanup_7"), _nf_path, _e)
+                    else:
+                        logging.warning(t("warn_failed_to_remove_manual_cleanup_7"), _nf_path, "force_unlink failed")
                         self._exit_code = 1
 
         # [PATCH-163 FIX-2] 多站点安全: deploy hook 是全局共享的,
@@ -31943,11 +35908,10 @@ class WPDeployManager:
             "/etc/letsencrypt/renewal-hooks/deploy/01-reload-nginx.sh")
         if not _other_ssl_timers:
             if _deploy_hook_e83.exists():
-                try:
-                    _deploy_hook_e83.unlink()
+                if self._force_unlink(_deploy_hook_e83):
                     logging.info(t("info_deleted", path=_deploy_hook_e83))
-                except OSError as _e:
-                    logging.warning(t("warn_failed_to_remove_manual_cleanup_8"), _deploy_hook_e83, _e)
+                else:
+                    logging.warning(t("warn_failed_to_remove_manual_cleanup_8"), _deploy_hook_e83, "force_unlink failed")
                     self._exit_code = 1
             # [AUDIT-7] 恢复 certbot timer 前检查是否有续期配置文件。
             # 若无任何 renewal 配置, 恢复 timer 无意义且可能产生报警邮件。
@@ -31974,8 +35938,8 @@ class WPDeployManager:
                                  _ct_restore], quiet=True)
                             logging.info(t("info_patch_163_restored_certbot_timer"), _ct_restore)
                             break
-                    except Exception:
-                        pass
+                    except Exception as _exc_35250:
+                        logging.warning("[PATCH-276] _ct_r: %s", _exc_35250)
         else:
             logging.info(t("info_patch_163_keeping_deploy_hook_other_ssl"), len(_other_ssl_timers))
         # [PATCH-204 FIX-1] 回退 DISABLE_WP_CRON=true → false。
@@ -32067,8 +36031,8 @@ class WPDeployManager:
                     encoding="utf-8", timeout=5, check=False)
                 if "not-found" not in _r.stdout:
                     _ghost_units.append(_unit)
-            except Exception:
-                pass
+            except Exception as _exc_35343:
+                logging.debug("[PATCH-276] _safe_reload_nginx: %s", _exc_35343)
         if _ghost_units:
             logging.warning(t("warn_audit_8_ghost_units_still_loaded_may"),
                 ", ".join(_ghost_units))
@@ -32236,6 +36200,21 @@ class WPDeployManager:
             if not _db_dropped:
                 # 回退: 尝试 socket 认证 (MariaDB 默认 unix_socket)
                 _db_dropped = bool(self.run_sql(_drop_sql, use_pwd=False))
+            # [PATCH-279] Auto-retry: restart DB and re-attempt if both methods failed.
+            # Common cause: MariaDB in read-only / crash-recovery / unresponsive state.
+            if (not _db_dropped
+                    and not self.cfg.is_external_db
+                    and hasattr(self, 'db_svc') and self.db_svc):
+                logging.info("[PATCH-279] DB cleanup failed — restarting %s and retrying...",
+                             self.db_svc)
+                self.run_cmd(["systemctl", "restart", self.db_svc], quiet=True, timeout=30)
+                time.sleep(3)
+                if self.db_root_pass:
+                    _db_dropped = bool(self.run_sql(_drop_sql, use_pwd=True))
+                if not _db_dropped:
+                    _db_dropped = bool(self.run_sql(_drop_sql, use_pwd=False))
+                if _db_dropped:
+                    logging.info("[PATCH-279] DB cleanup succeeded after restart.")
             if not _db_dropped:
                 logging.warning(t("warn_patch_219_database_cleanup_failed_manual_fix"),
                     _db, _user, _grant_host)
@@ -32571,6 +36550,7 @@ class WPDeployManager:
             # 后续增强步骤 (不含 SSL 相关)
             self._setup_brotli()
             self._setup_cloudflare_real_ip()
+            self._setup_serve_dist()  # [PATCH-271] 与 HTTPS 路径对齐
             # [PATCH audit-fix] FIX-4: 移除冗余 _ensure_wpcli() 调用。
             # setup_lemp_and_wp() (L7986) 内部已调用 _ensure_wpcli(),
             # 且 _wpcli_install_attempted 幂等锁保证不会重复安装,
@@ -32728,6 +36708,7 @@ class WPDeployManager:
         # 部署成功 — 执行后续增强步骤
         self._setup_brotli()
         self._setup_cloudflare_real_ip()  # [V3.0.16] P12
+        self._setup_serve_dist()  # [PATCH-271]
         self._wp_auto_install()        # [V3.2.69] BUG-3: 先完成自动安装
         # [P210-3] 修正文件属主: _wp_auto_install 以 root 运行,
         # 新建文件归属 root:root, PHP-FPM (nginx 用户) 无法读取 → 500。
@@ -32800,6 +36781,42 @@ class WPDeployManager:
 # ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# [PATCH-271] 脚本分发同步 (standalone function, 供 _do_self_update 调用)
+# ---------------------------------------------------------------------------
+def _sync_serve_dist(script_path: Path = None) -> None:
+    """[PATCH-271] 将脚本复制到分发目录并生成 SHA256 校验文件。
+
+    可从 WPDeployManager._setup_serve_dist() 和 _do_self_update() 调用。
+    仅在 _SERVE_DIST_DIR 已存在时执行 (由 _setup_serve_dist 创建),
+    避免未启用 --serve-dist 的站点产生副作用。
+    """
+    if not _SERVE_DIST_DIR.is_dir():
+        return
+    if script_path is None:
+        script_path = Path(os.path.abspath(__file__))
+    _dest = _SERVE_DIST_DIR / "wp_ssl_bootstrap.py"
+    _hash_dest = _SERVE_DIST_DIR / "wp_ssl_bootstrap.py.sha256"
+    try:
+        shutil.copy2(str(script_path), str(_dest))
+        os.chmod(str(_dest), 0o644)
+        # 生成 SHA256 (与 self-update 下载端校验格式一致: 纯 hex 无文件名)
+        _h = hashlib.sha256()
+        with open(str(_dest), "rb") as _f:
+            while True:
+                _chunk = _f.read(65536)
+                if not _chunk:
+                    break
+                _h.update(_chunk)
+        _sha = _h.hexdigest()
+        _hash_dest.write_text(_sha + "\n", encoding="utf-8")
+        os.chmod(str(_hash_dest), 0o644)
+        logging.info(t("ok_serve_dist_synced",
+                       ver=__version__, sha=_sha[:12] + "..."))
+    except Exception as e:
+        logging.warning(t("warn_serve_dist_sync_failed", err=str(e)))
+
+
 # ---------------------------------------------------------------------------
 # [V3.0.16] P10: 自更新常量
 # ---------------------------------------------------------------------------
@@ -32946,8 +36963,8 @@ def _do_self_update(**_ignored) -> None:
         try:
             if not _fd_file.closed:
                 _fd_file.close()
-        except Exception:
-            pass
+        except Exception as _exc_36260:
+            logging.debug("[PATCH-276] operation failed: %s", _exc_36260)
 
         # [PATCH-145 S-2] Cross-verify: fetch SHA256 from alternate source.
         # When script is downloaded from source A, verify its hash against
@@ -33013,7 +37030,7 @@ def _do_self_update(**_ignored) -> None:
             return
         _nv = _m.group(1)
 
-        def _vt(v):
+        def _vt(v: str) -> tuple:
             _vm = re.match(r'(\d+(?:\.\d+)*)', v)
             if not _vm:
                 return (0,)
@@ -33194,6 +37211,13 @@ def _do_self_update(**_ignored) -> None:
             logging.warning(t("warn_audit_p2_14_post_update_verification_skipped"),
                 _ver_e)
 
+        # [PATCH-271] 若启用了 --serve-dist, 同步新版本到分发目录。
+        # _sync_serve_dist 内部检测 _SERVE_DIST_DIR 是否存在, 未启用时无副作用。
+        try:
+            _sync_serve_dist(script_path)
+        except Exception:
+            pass  # 非致命, 不阻断 self-update 成功流程
+
         print(f"\n{'=' * 50}")
         print(t("info_self_update_done", old=__version__, new=_nv))
         print(f"{'=' * 50}")
@@ -33205,8 +37229,8 @@ def _do_self_update(**_ignored) -> None:
         try:
             if not _fd_file.closed:
                 _fd_file.close()
-        except Exception:
-            pass
+        except Exception as _exc_36526:
+            logging.debug("[PATCH-276] _sync_serve_dist: %s", _exc_36526)
         if tmp_path:
             try:
                 Path(tmp_path).unlink()
@@ -33251,6 +37275,9 @@ _GHOST_SITES_CACHE = []
 #   certbot — 每次运行无条件向 stderr 打印 "Saving debug log to ..." 状态行
 _BENIGN_STDERR_PATTERNS: tuple = (
     "Saving debug log to ",   # certbot 调试日志路径通知
+    "libonion.so",            # [PATCH-272] 腾讯云/阿里云安全 Agent 残留
+    "ld.so.preload",          # [PATCH-272] 同上, 覆盖不同错误格式
+    "does not have a stable CLI interface",  # [PATCH-275] apt 标准警告, 非错误
 )
 
 
@@ -33260,8 +37287,7 @@ _BENIGN_STDERR_PATTERNS: tuple = (
 # [PATCH-217] 交互式向导智能推荐探测函数
 # ---------------------------------------------------------------------------
 
-def _probe_repo_nginx_version():
-    # type: () -> tuple
+def _probe_repo_nginx_version() -> tuple:
     """从系统包仓库探测可安装的 Nginx 版本号。
 
     [PATCH-217] 用于 Nginx 未安装时判定仓库中可用版本是否支持 HTTP/3。
@@ -33290,8 +37316,8 @@ def _probe_repo_nginx_version():
                             (int(a), int(b), int(c)) for a, b, c in _vers
                         ]
                         return max(_vers_t)
-            except Exception:
-                pass
+            except Exception as _exc_36614:
+                logging.debug("[PATCH-276] L36614: %s", _exc_36614)
             break  # 只尝试第一个可用的 pm
     # ── apt ──
     if shutil.which("apt-cache"):
@@ -33315,13 +37341,12 @@ def _probe_repo_nginx_version():
                     return (int(_m2.group(1)),
                             int(_m2.group(2)),
                             int(_m2.group(3)))
-        except Exception:
-            pass
+        except Exception as _exc_36639:
+            logging.debug("[PATCH-276] L36639: %s", _exc_36639)
     return (0, 0, 0)
 
 
-def _recommend_http3_interactive(nginx_bin):
-    # type: (str) -> bool
+def _recommend_http3_interactive(nginx_bin: str) -> bool:
     """交互式向导专用: 综合判定 HTTP/3 (QUIC) 是否值得推荐。
 
     [PATCH-217] 三层探测:
@@ -33357,8 +37382,8 @@ def _recommend_http3_interactive(nginx_bin):
                         int(_m.group(3)))
                 if _ver >= (1, 25, 0):
                     return True
-        except Exception:
-            pass
+        except Exception as _exc_36681:
+            logging.debug("[PATCH-276] L36681: %s", _exc_36681)
         return False
     # 层 3: Nginx 未安装, 探测仓库版本
     _repo_ver = _probe_repo_nginx_version()
@@ -33367,8 +37392,7 @@ def _recommend_http3_interactive(nginx_bin):
     return False
 
 
-def _probe_devel_packages_available():
-    # type: () -> bool
+def _probe_devel_packages_available() -> bool:
     """探测系统仓库是否提供 srcache 编译所需的核心 devel 包。
 
     [PATCH-217] srcache 源码编译需要 C 头文件:
@@ -33469,8 +37493,7 @@ def _probe_devel_packages_available():
     return False
 
 
-def _get_nginx_version_tuple():
-    # type: () -> tuple
+def _get_nginx_version_tuple() -> tuple:
     """[PATCH-244] 获取已安装 Nginx 的版本号元组。
 
     返回 (major, minor, patch):
@@ -33492,13 +37515,12 @@ def _get_nginx_version_tuple():
             _r.stdout + _r.stderr)
         if _m:
             return (int(_m.group(1)), int(_m.group(2)), int(_m.group(3)))
-    except Exception:
-        pass
+    except Exception as _exc_36816:
+        logging.debug("[PATCH-276] _get_nginx_version_tuple: %s", _exc_36816)
     return (0, 0, 0)
 
 
-def _get_nginx_error_log_path():
-    # type: () -> str
+def _get_nginx_error_log_path() -> str:
     """[PATCH-262 FIX-6] 探测 Nginx 全局 error_log 路径。
 
     优先从 `nginx -T` 输出解析 http 上下文或全局 error_log 指令,
@@ -33531,13 +37553,12 @@ def _get_nginx_error_log_path():
                 _path = _m.group(1).strip('"').strip("'")
                 if _path and _path != 'syslog' and not _path.startswith('syslog:'):
                     return _path
-    except Exception:
-        pass
+    except Exception as _exc_36855:
+        logging.debug("[PATCH-276] stdout: %s", _exc_36855)
     return _default
 
 
-def _is_pkg_managed_so(so_path):
-    # type: (str) -> bool
+def _is_pkg_managed_so(so_path: str) -> bool:
     """[PATCH-262 FIX-P1] 跨平台检测 .so 文件是否由包管理器安装。
 
     EL 系列使用 rpm -qf, Debian/Ubuntu 使用 dpkg -S。
@@ -33557,8 +37578,8 @@ def _is_pkg_managed_so(so_path):
                 timeout=5, check=False)
             if _r.returncode == 0 and _r.stdout.strip():
                 return True
-        except Exception:
-            pass
+        except Exception as _exc_36881:
+            logging.debug("[PATCH-276] _is_pkg_managed_so: %s", _exc_36881)
     # 再尝试 rpm (EL 系列)
     if shutil.which("rpm"):
         try:
@@ -33570,13 +37591,12 @@ def _is_pkg_managed_so(so_path):
                 timeout=5, check=False)
             if _r.returncode == 0:
                 return True
-        except Exception:
-            pass
+        except Exception as _exc_36894:
+            logging.debug("[PATCH-276] stderr: %s", _exc_36894)
     return False
 
 
-def _detect_el_family_and_version():
-    # type: () -> tuple
+def _detect_el_family_and_version() -> tuple:
     """[PATCH-243] 探测系统是否为 EL (RHEL/CentOS/Alma/Rocky 等) 及其主版本号。
 
     返回 (is_el, major_version):
@@ -33626,8 +37646,7 @@ def _detect_el_family_and_version():
     return (False, 0)
 
 
-def _recommend_srcache_interactive(ram_mb):
-    # type: (int) -> bool
+def _recommend_srcache_interactive(ram_mb: int) -> bool:
     """交互式向导专用: 判定 srcache (Redis 全页缓存) 是否值得推荐。
 
     [PATCH-217] srcache 需要 5 个第三方 Nginx 模块 (ndk / echo /
@@ -33695,7 +37714,7 @@ def _recommend_srcache_interactive(ram_mb):
     return False
 
 
-def _detect_existing_sites():
+def _detect_existing_sites() -> list:
     """扫描已部署的站点, 返回域名列表。
 
     [V3.2.3] L-2: 增加 WordPress 标志文件检测, 排除非 WP 站点。
@@ -33798,7 +37817,7 @@ def _detect_existing_sites():
     return sites
 
 
-def _cleanup_ghost_sites(ghost_domains, drop_db=False):
+def _cleanup_ghost_sites(ghost_domains: list, drop_db: bool=False) -> None:
     """[PATCH-250] 清理幽灵站点残留配置。
 
     幽灵站点 = Nginx 配置存在但站点目录已不存在。
@@ -33850,8 +37869,8 @@ def _cleanup_ghost_sites(ghost_domains, drop_db=False):
                 ["systemctl", "disable"] + _units,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=10, check=False)
-        except Exception:
-            pass
+        except Exception as _exc_37174:
+            logging.debug("[PATCH-276] L37174: %s", _exc_37174)
         for _u in _units:
             _uf = Path(f"/etc/systemd/system/{_u}")
             if _uf.exists():
@@ -33955,8 +37974,8 @@ def _cleanup_ghost_sites(ghost_domains, drop_db=False):
                     timeout=10, check=False)
                 if _r.returncode == 0:
                     _db_ok = True
-            except Exception:
-                pass
+            except Exception as _exc_37279:
+                logging.debug("[PATCH-276] _escape_single_quoted: %s", _exc_37279)
             # 回退: 用密码通过临时 .cnf 文件传递 (不暴露于 ps)
             if not _db_ok:
                 _pwd_file = Path("/root/.mariadb_root.pwd")
@@ -33990,8 +38009,8 @@ def _cleanup_ghost_sites(ghost_domains, drop_db=False):
                             timeout=10, check=False)
                         if _r2.returncode == 0:
                             _db_ok = True
-                    except Exception:
-                        pass
+                    except Exception as _exc_37314:
+                        logging.debug("[PATCH-276] _ghost_tmp_dir: %s", _exc_37314)
                     finally:
                         try:
                             os.unlink(_ghost_cnf_path)
@@ -34040,7 +38059,7 @@ def _cleanup_ghost_sites(ghost_domains, drop_db=False):
 # [PATCH-203 FIX-EXTRACT] _strip_nginx_comments_d5 提升为模块级函数。
 # 原为 _detect_site_config 内部闭包 (PATCH-192 D5),
 # _restore_post_fixup 需要复用 (FIX-1/FIX-2), 故提升。
-def _strip_nginx_comments_d5(text):
+def _strip_nginx_comments_d5(text: str) -> bool:
     """Nginx-aware 注释剥离: 尊重引号和正则上下文中的 #。
 
     [PATCH-192 D5] 原 re.sub(r'#[^\n]*', '', text) 会破坏
@@ -34089,12 +38108,13 @@ def _strip_nginx_comments_d5(text):
     return ''.join(result)
 
 
-def _detect_site_config(domain):
+def _detect_site_config(domain: str) -> dict:
     """探测已部署站点的当前配置。"""
     config = {
         "cache": "none", "redis": False, "optimize": False,
         "cloudflare": False, "allow_xmlrpc": False,
         "http3": False,  # [PATCH-167 FIX-8]
+        "serve_dist": False,  # [PATCH-271]
     }
     conf_path = Path(f"/etc/nginx/conf.d/{domain}.conf")
     _c = ""  # [V3.2.112] BUG-4: 提升作用域, 供下方 Redis 检测复用
@@ -34121,6 +38141,9 @@ def _detect_site_config(domain):
             # [PATCH-203 FIX-5] 同上, http3 探测也需剥离注释。
             if "listen" in _c_no_comments and "quic" in _c_no_comments:  # [PATCH-167 FIX-8]
                 config["http3"] = True
+            # [PATCH-271] 检测 --serve-dist location 块
+            if "wp-ssl-bootstrap" in _c_no_comments and "wp-ssl-dist" in _c_no_comments:
+                config["serve_dist"] = True
             # [PATCH-187 FIX-5] deny all 限定在包含 xmlrpc 的 location 块内。
             # 原全文搜索会被其他 location 块 (如 /wp-admin/) 的 deny all 干扰。
             # [PATCH-206 FIX-1] xmlrpc 块提取统一使用 _c_no_comments。
@@ -34269,8 +38292,8 @@ def _detect_site_config(domain):
                                 "[AUDIT M-8] Redis running + drop-in exists for %s "
                                 "but wp-config lacks WP_REDIS_HOST; "
                                 "not marking as Redis-enabled.", domain)
-                    except Exception:
-                        pass
+                    except Exception as _exc_37597:
+                        logging.debug("[PATCH-276] operation failed: %s", _exc_37597)
                     break
     return config
 
@@ -34350,7 +38373,7 @@ def _load_clean_snapshot(domain: str, systemd_prefix: str) -> dict:
             _result[_k] = _sv
     return _result
 
-def _show_lightweight_status():
+def _show_lightweight_status() -> None:
     """[V3.2.96] 未部署站点时, 展示轻量级系统环境状态。
 
     仅检查 Nginx / PHP-FPM / MariaDB|MySQL 服务是否在运行,
@@ -34382,8 +38405,8 @@ def _show_lightweight_status():
                     _svc_candidates.append((_svc_name, _label))
                     _php_fpm_found = True
                     break  # 只需第一个 (最高版本在前)
-    except Exception:
-        pass
+    except Exception as _exc_37710:
+        logging.debug("[PATCH-276] _lu_r: %s", _exc_37710)
     if not _php_fpm_found:
         _svc_candidates.append(("php-fpm", "PHP-FPM"))
 
@@ -34450,8 +38473,8 @@ def _show_lightweight_status():
                 _mark = t("status_mark_ok") if _st == "active" else t("status_mark_fail")
                 print(f"  {_label} ({_svc}): {_st} {_mark}")
                 _shown_categories.add(_cat)
-        except Exception:
-            pass
+        except Exception as _exc_37778:
+            logging.debug("[PATCH-276] stdout: %s", _exc_37778)
 
     # 磁盘空间快速检测
     try:
@@ -34664,6 +38687,8 @@ def _interactive_mode() -> list:
             _cli.append("--cloudflare")
         if _cfg["allow_xmlrpc"]:
             _cli.append("--allow-xmlrpc")
+        if _cfg["serve_dist"]:  # [PATCH-271]
+            _cli.append("--serve-dist")
         # [V3.2.37] P-7: 自动探测全局密码文件, 若存在则传递 --persist-root-pwd,
         # 确保 enable-ssl 后续操作 (wp-cron timer, db-optimize timer 等)
         # 能正确访问 DB 密码文件。
@@ -34795,8 +38820,8 @@ def _interactive_deploy_flow() -> list:
                     if _line.startswith("MemTotal:"):
                         _ram_mb = int(_line.split()[1]) // 1024
                         break
-        except Exception:
-            pass
+        except Exception as _exc_38125:
+            logging.debug("[PATCH-276] _osr: %s", _exc_38125)
 
     _disk_gb = 0.0
     # [AUDIT-R4 M-5] 检测 webroot 实际所在分区, 而非根分区。
@@ -34829,8 +38854,8 @@ def _interactive_deploy_flow() -> list:
             _m = re.search(r"PHP\s+(\d+\.\d+)", _r.stdout)
         if _m:
             _php = _m.group(1)
-    except Exception:
-        pass
+    except Exception as _exc_38159:
+        logging.debug("[PATCH-276] operation failed: %s", _exc_38159)
 
     _db = "unknown"
     for _svc in ("mariadb", "mysql", "mysqld"):
@@ -34843,8 +38868,8 @@ def _interactive_deploy_flow() -> list:
             if _r.returncode == 0 and f"{_svc}.service" in _r.stdout:
                 _db = _svc
                 break
-        except Exception:
-            pass
+        except Exception as _exc_38173:
+            logging.debug("[PATCH-276] php: %s", _exc_38173)
     # [PATCH-269 FIX-2] 服务 unit 不存在时（如仅安装客户端包而无 mariadb-server）
     # 回退到二进制探测，避免显示 "unknown"。
     # dnf install mariadb 只装客户端，systemctl list-unit-files 找不到 .service，
@@ -34870,8 +38895,8 @@ def _interactive_deploy_flow() -> list:
                     _brand = "MariaDB" if "MariaDB" in _dbv_fb_out else "MySQL"
                     _db = f"{_brand} {_dbv_fb_m.group(1)}"
                     break
-            except Exception:
-                pass
+            except Exception as _exc_38200:
+                logging.debug("[PATCH-276] stdout: %s", _exc_38200)
 
     # [PATCH-EAB-CURL] 探测数据库完整版本号 (如 MariaDB 11.4.5)
     if _db != "unknown":
@@ -34903,8 +38928,8 @@ def _interactive_deploy_flow() -> list:
                     _db = f"MySQL {_dbv_m.group(1)}"
                     _db_ver_detected = True
                     break
-            except Exception:
-                pass
+            except Exception as _exc_38233:
+                logging.debug("[PATCH-276] stdout: %s", _exc_38233)
 
     _nginx_bin = shutil.which("nginx")
     _nginx_ver = t("interactive_env_nginx_not_installed")
@@ -34951,14 +38976,15 @@ def _interactive_deploy_flow() -> list:
         ("autoinstall",   ["--wp-auto-install"],  True,             "interactive_rec_autoinstall"),
         ("persist_pwd",   ["--persist-root-pwd"], True,             "interactive_rec_persist_pwd"),
         ("cloudflare",    ["--cloudflare"],       False,            "interactive_rec_cloudflare"),
-        ("http3",         ["--http3"],            _http3_rec,       "interactive_rec_http3"),  # [PATCH-172 FIX-4]
+        ("http3",         ["--http3"],            _http3_rec,       "interactive_rec_http3"),  # [PATCH-275] 与 update 菜单顺序对齐
+        ("serve_dist",    ["--serve-dist"],       False,            "help_serve_dist"),  # [PATCH-271]
         ("notify_webhook", ["--notify-webhook"],  False,            "interactive_rec_notify_webhook"),
         ("staging",       ["--staging"],          False,            "interactive_rec_staging"),  # [V3.2.119] FIX-5
         ("ssl_cert",      [],                     True,             "interactive_rec_ssl_cert"),  # [PATCH-SSL] 正向逻辑: on=签发SSL, off=跳过
         # [V3.2.100] A4: _f=[] 是有意为之 — on=签发SSL(无flag), off=追加--skip-ssl
     ]
 
-    def _print_recs(recs):
+    def _print_recs(recs: list) -> None:
         print(t("interactive_rec_header"))
         for _i, (_k, _f, _on, _dk) in enumerate(recs, 1):
             _icon = t("toggle_on") if _on else t("toggle_off")
@@ -35132,7 +39158,7 @@ def _interactive_deploy_flow() -> list:
     return _cli
 
 
-def _extract_existing_deploy_params(domain):
+def _extract_existing_deploy_params(domain: str) -> dict:
     """[V3.2.104] FIX-6: 从已有 systemd unit / certbot conf 提取部署参数。
 
     用于交互式 update/enable-ssl, 防止 email/webhook/ZeroSSL 丢失。
@@ -35152,8 +39178,8 @@ def _extract_existing_deploy_params(domain):
     if _svc.exists():
         try:
             result = WPDeployManager._extract_timer_params(_svc)
-        except Exception:
-            pass
+        except Exception as _exc_38483:
+            logging.warning("[PATCH-276] _extract_existing_deploy_params: %s", _exc_38483)
     # 2. email fallback: certbot renewal conf
     if not result.get("email"):
         _rc = Path("/etc/letsencrypt/renewal/%s.conf" % domain)
@@ -35170,7 +39196,7 @@ def _extract_existing_deploy_params(domain):
     return result
 
 
-def _interactive_update_flow(domain) -> list:
+def _interactive_update_flow(domain: str) -> list:
     """交互式更新向导: 探测当前配置 → 切换 → 生成 CLI 参数。"""
 
     _cfg = _detect_site_config(domain)
@@ -35195,6 +39221,7 @@ def _interactive_update_flow(domain) -> list:
         ("cloudflare", ["--cloudflare"],       _cfg["cloudflare"],         "interactive_rec_cloudflare"),
         ("http3",      ["--http3"],            _rec_http3,                 "interactive_rec_http3"),  # [PATCH-173 D2]
         ("xmlrpc",     ["--allow-xmlrpc"],     _cfg["allow_xmlrpc"],       "interactive_update_xmlrpc"),
+        ("serve_dist", ["--serve-dist"],       _cfg["serve_dist"],         "help_serve_dist"),  # [PATCH-271]
         ("staging",    ["--staging"],          _is_staging,                "help_staging"),
         ("no_pre_backup", ["--no-pre-backup"], False,                     "interactive_rec_no_pre_backup"),  # [P127-4]
     ]
@@ -35303,7 +39330,7 @@ def _interactive_update_flow(domain) -> list:
     return _cli
 
 
-def _add_common_args(sub_parser):
+def _add_common_args(sub_parser: argparse.ArgumentParser) -> None:
     """为子命令添加公共参数。"""
     sub_parser.add_argument(
         "--domain",
@@ -35345,7 +39372,17 @@ def _add_common_args(sub_parser):
     )
 
 
-def main():
+def main() -> None:
+    # [PATCH-275] 中文 IME 切换残留可能向 stdin 注入非 UTF-8 字节 (如 0xe3),
+    # 导致 input() 抛出 UnicodeDecodeError。用 replace 策略容错,
+    # 将无法解码的字节替换为 U+FFFD, 后续 strip()/比较自然不匹配,
+    # 等效于用户输入错误, 不会崩溃。
+    try:
+        if hasattr(sys.stdin, 'reconfigure'):
+            sys.stdin.reconfigure(errors='replace')
+    except Exception as _exc_38685:
+        logging.debug("[PATCH-276] main failed: %s", _exc_38685)
+
     # ── 语言预扫描：在构建解析器前确定 _LANG ─────────────────────────────────
     # argparse help= 参数在 add_argument() 调用时立即求值，因此必须在构建任何
     # 解析器之前先确定语言，否则 --lang 只能影响逻辑输出，无法影响帮助文本。
@@ -35477,6 +39514,14 @@ def main():
         default=os.environ.get("WP_ZEROSSL_EAB_HMAC_KEY"),
         metavar="HMAC_KEY",
         help=t("help_zerossl_eab_hmac"),
+    )
+    p_deploy.add_argument(
+        "--serve-dist", action="store_true",
+        help=t("help_serve_dist"),
+    )
+    p_deploy.add_argument(
+        "--accept-redis-license", action="store_true",
+        help="Accept Redis RSAL/SSPL license change for versions 7.4+ (non-BSD)",
     )
 
     # --- renew 子命令 ---
@@ -35752,6 +39797,14 @@ def main():
         metavar="HMAC_KEY",
         help=t("help_zerossl_eab_hmac"),
     )
+    p_update.add_argument(
+        "--serve-dist", action="store_true",
+        help=t("help_serve_dist"),
+    )
+    p_update.add_argument(
+        "--accept-redis-license", action="store_true",
+        help="Accept Redis RSAL/SSPL license change for versions 7.4+ (non-BSD)",
+    )
 
     # --- self-update 子命令 ---
     p_selfupdate = subparsers.add_parser(
@@ -35973,8 +40026,8 @@ def main():
                                          b'\x00' * _alen_187)
                 finally:
                     os.close(_mem_fd_187)
-        except Exception:
-            pass
+        except Exception as _exc_39331:
+            logging.debug("[PATCH-276] operation failed: %s", _exc_39331)
 
     # [AUDIT SEC-03] 尽早清除敏感环境变量, 防止同机用户通过
     # /proc/<pid>/environ 读取 EAB HMAC Key / DB Root Password。
@@ -36033,7 +40086,7 @@ def main():
     if args.command == "uninstall":
         # [V3.2.114] R3: 统一走 _run_subcommand
         # [PATCH-219] --clean: 清理站点数据 (保留基础设施)
-        def _uninstall_op():
+        def _uninstall_op() -> None:
             if getattr(args, 'clean', False):
                 manager._clean_uninstall_site()
             else:

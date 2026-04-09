@@ -1,50 +1,52 @@
-# V3.2.4 — Stability & i18n Hardening Release
+# V3.2.5 — Automation & Resilience Hardening Release
 
 One-command WordPress + HTTPS deployment engine for production Linux servers.
 
-## What's New in V3.2.4
+## What's New in V3.2.5
 
-V3.2.4 refines V3.2.3 through 8 patches (PATCH-262–269) plus a comprehensive i18n audit, adding Nginx dynamic module auto-repair, FastCGI snippet deduplication, modernized CSP security policy, proactive Nginx minor-version upgrades, and a full i18n system cleanup. Net +6,946 lines (29,133→36,079).
+V3.2.5 refines V3.2.4 through 11 patches (PATCH-270–280), transforming the script from "warn and bail" to "diagnose, auto-fix, retry". An exhaustive audit of all 507 `logging.warning` calls yielded 14 auto-remediation patterns; adds short-lived certificate support with dynamic timer frequency, journal/email fallback notification for renewal failures, full component lifecycle management, and fixes a MariaDB tuning "self-lock" bug plus 5 Nginx config comment false-match issues. 100% type annotation coverage (439/439 functions). Net +4,054 lines (36,079→40,133).
 
-🔧 **Nginx dynamic module auto-repair (PATCH-268)** — when `nginx -t` detects dynamic module load failures (ABI mismatch / undefined symbol / missing .so), automatically attempts reinstall → if that fails, removes .so → cleans orphaned `load_module` directives and module-specific directives, iterating until `nginx -t` passes. srcache compilation now uses full `nginx -V` configure arguments (replacing `--with-compat` fallback) for better ABI compatibility.
+🤖 **14 warn-and-bail auto-remediation patterns (PATCH-279)** — exhaustive audit of every `logging.warning` in the script. Where the script previously warned and gave up, it now diagnoses and auto-fixes: missing logrotate/curl auto-installed, failed DB auto-restarted, `nginx -t` errors auto-repaired (stale includes, duplicate default_server — with backup before modification), file deletion retried with `chattr -i` (immutable bit removal), PHP-FPM failures auto-diagnosed via `php-fpm -t` (wrong user/group, socket conflict), Redis start failures diagnosed via journal (port conflict, bad config), Redis ping failures auto-restarted, MariaDB conf.d auto-created with `!includedir`, Nginx minor upgrade retried after `apt --fix-broken`/`yum clean all`, redis-cache plugin retried with `--force`, nginx.list parent dir auto-created.
 
-📎 **FastCGI PHP snippet deduplication (PATCH-267)** — extracts repeated 5-line fastcgi configuration from `location ~ \.php$` blocks into `/etc/nginx/snippets/fastcgi-php.conf`; all location blocks reference it via `include`, eliminating cross-block config drift. Auto-cleaned on uninstall.
+⏱️ **Short-lived certificate auto-detection + dynamic timer (PATCH-277)** — reads certificate total lifetime (Not After − Not Before) and auto-adjusts systemd timer: daily for standard 90-day certs, every 8h for LE 2027 47-day certs, every 4h for 2028 6-day certs. Auto-detects lifetime changes after each renewal and hot-updates the timer frequency — zero manual intervention needed for the upcoming Let's Encrypt short-lived certificate transition.
 
-⬆️ **Proactive Nginx minor-version upgrades (PATCH-268)** — when installed Nginx meets the minimum version but is below the repo's latest patch version, proactively upgrades (e.g. 1.28.0→1.28.1) followed by the unified verification chain (`nginx -t` → module repair → graceful restart).
+📣 **Journal/email fallback for renewal failures (PATCH-278)** — when no `--notify-webhook` is configured, auto-installs a systemd OnFailure service: renewal failures are logged to journal at CRIT priority + syslog via `logger` + email attempted via `mail(1)` to root. Ensures renewal failures are **never completely silent**, even on minimal installs without external monitoring.
 
-🛡️ **Modernized CSP security policy (PATCH-268/269)** — removed deprecated `X-Frame-Options` (superseded by `frame-ancestors`) and `X-XSS-Protection` (built into modern browsers; the header can introduce XSS auditing side-channels). CSP relaxed to WordPress-practical policy (`'unsafe-inline'`/`'unsafe-eval'` for theme/plugin compatibility + `img-src data: blob:` for media library). Added `upgrade-insecure-requests` for automatic HTTP→HTTPS sub-resource upgrade. Temporary ACME-challenge Nginx config now includes basic security headers to prevent exposure after interrupted deployments.
+🔄 **Full component lifecycle management (PATCH-270)** — Certbot: snap detection → version gating → pip venv migration (6-step EFF official procedure); Redis/Valkey: version detection → minor upgrades → EL10+ Valkey auto-switch; WP-CLI: version detection → auto-update → SHA-512 verification; fail2ban: version probing → legacy compat (below 0.11).
 
-🌐 **Comprehensive i18n audit** — 15 `_MESSAGES` keys containing Chinese characters renamed to ASCII convention with proper English translations; 3 hardcoded Chinese `logging.warning()` calls routed through `t()` with new bilingual entries; `generate_http_production_config()` docstring documents why `http3=` is intentionally omitted (QUIC requires TLS).
+🔑 **MariaDB GPG 4-level key fallback (PATCH-275)** — MariaDB repo GPG key import on Debian/Ubuntu now has 4 fallback levels, aligned with the existing Nginx key fallback: ① direct download from supplychain.mariadb.com + mariadb.org ② GPG keyserver (ubuntu keyserver → openpgp.org) ③ script-embedded ASCII-armored public key ④ legacy `apt-key` fallback. APT pinning aligned with nginx.org official format (PATCH-272).
 
-🐛 **Debian ABI-locked module cleanup (PATCH-262 FIX-P5)** — after switching from Debian `nginx-core` to nginx.org packages, residual ABI-locked module packages (`libnginx-mod-*`) caused `nginx -t` failures. Now auto-detects and removes incompatible packages.
+🐛 **MariaDB tuning "self-lock" bug (PATCH-280)** — the generated `.cnf` file's instructional comment `# add a line containing '# User-modified'` contained the marker string itself, causing the substring check to always match → tuning **perpetually skipped** → RAM changes and version upgrades never updated MariaDB parameters. Fix: detection changed to line-level regex `^\s*#\s*User-modified\s*$`; template text reworded to not embed the literal marker.
 
-🐛 **Missing fastcgi.conf after nginx.org switch (PATCH-263 FIX-2)** — `_ensure_fastcgi_conf()` now called for all `cache_mode` paths, not just srcache, ensuring the file exists after switching from AppStream `nginx-core`.
+🐛 **Nginx config comment false-match ×5 (PATCH-280)** — 5 substring checks on raw Nginx config could match commented-out directives (e.g. `# srcache_fetch ...`), causing wrong cache mode in `status` output, incorrect log levels, or commented lines treated as SSL blocks. Fix: 3 sites now use `_strip_nginx_comments_d5()` before checking; 1 site adds `startswith("#")` skip.
 
-🐛 **srcache residual directive cleanup (PATCH-263 FIX-5)** — after srcache compilation failure and degradation, residual `load_module` directives could leave Nginx in a broken state. Now uses aggressive cleanup + snapshot rollback + manual fix hint as three-tier fallback.
+🐛 **Massive exception safety sweep (PATCH-276, 270 sites)** — full-script `except Exception` path audit: added missing `logging.debug` for exception recording, caught unhandled `subprocess.TimeoutExpired`, ensured `finally` blocks don't recurse on secondary exceptions, fixed command failures being completely silent in quiet mode.
 
-🐛 **EL10 nginx module stream conflict (PATCH-264 FIX-1)** — `dnf module disable nginx` on EL10 prevents module stream conflicts with nginx.org repo, aligned with EL8/EL9 path.
+🐛 **EL7 EOL graceful degradation (PATCH-272)** — Certbot/PHP/MariaDB/Nginx/Redis upgrade paths on EL7 (EOL 2024-06) now gracefully skip with logged warnings instead of failing due to unavailable repos.
 
-🐛 **EL10 pcre-devel removal (PATCH-265 FIX-1)** — EL10+ removed `pcre-devel`; srcache build dependency list now conditionally excludes it based on `_el_major`.
-
-🐛 **Service not-installed status (PATCH-269 FIX-3)** — `status` subcommand now shows "not installed" for missing Nginx/PHP-FPM, distinguishing from "inactive" (installed but stopped).
+📐 **100% type annotation coverage (PATCH-277)** — all 439 functions have return-type annotations. Supports `mypy` and `pyright` checking.
 
 ## Highlights
 
 🚀 **Full-stack deployment** — Nginx, PHP-FPM, MariaDB, WordPress, SSL certificate, systemd auto-renewal, Fail2Ban, logrotate, OS auto-security-updates — all from a single `deploy` command.
 
-🔒 **Production-grade security** — modernized CSP policy with `frame-ancestors` and `upgrade-insecure-requests`; zero CLI password leakage, atomic config writes with symlink protection, wp-config hardening, Nginx defense-in-depth with dynamic module auto-repair, certbot error circuit-breaker with multi-CA failover, supply-chain protection via dual-source cross-verification.
+🤖 **Self-healing** — 14 common failure scenarios are now automatically diagnosed and repaired, from missing system packages to crashed database services to Nginx config syntax errors. The script recovers from failures that previously required manual intervention.
 
-🔧 **Self-healing Nginx** — dynamic module load errors (ABI mismatch after upgrades, missing .so files, orphaned directives) are automatically diagnosed and repaired through a multi-iteration cascade: reinstall → remove → directive cleanup → `nginx -t` verification. Proactive minor-version upgrades keep Nginx at the latest patch level.
+🔒 **Production-grade security** — modernized CSP policy, zero CLI password leakage, atomic config writes with symlink protection, wp-config hardening, Nginx defense-in-depth with dynamic module auto-repair, certbot error circuit-breaker with multi-CA failover, supply-chain protection via dual-source cross-verification, GPG key 4-level fallback for Nginx and MariaDB repos.
 
-🐘 **PHP lifecycle management** — automatic version detection, repository setup (Remi/Ondrej/Sury), in-place upgrade with `php.ini` migration, old service cleanup. Future PHP bumps require only constant changes (`_PHP_MIN_VERSION`, `_PHP_DEFAULT_VERSION`).
+⏱️ **Future-proof certificates** — automatic detection and adaptation for Let's Encrypt's upcoming short-lived certificate transition (47-day in 2027, 6-day in 2028), with dynamic timer frequency adjustment and guaranteed failure alerting.
+
+🔄 **Component lifecycle** — automatic version management for Certbot (snap migration + pip venv), Redis/Valkey (version-aware upgrades), WP-CLI (auto-update + SHA-512), PHP (auto-upgrade to 8.4), Nginx (proactive minor upgrades), MariaDB (version-aware repo setup), fail2ban (legacy compat).
+
+🐘 **PHP lifecycle management** — automatic version detection, repository setup (Remi/Ondrej/Sury), in-place upgrade with `php.ini` migration, old service cleanup.
 
 🌐 **Multi-distro** — tested on EL7–10 (RHEL / CentOS / AlmaLinux / Rocky / Alibaba Cloud Linux), Ubuntu 20.04–24.04, Debian 11–13.
 
 ⚡ **Performance options** — FastCGI page cache, Redis full-page cache (srcache), Redis object cache (with source-compile fallback + Valkey support), HTTP/3 QUIC, Brotli compression, ECDSA certificates (all optional, composable).
 
-📦 **Ops toolkit** — `backup`, `restore`, `update`, `enable-ssl`, `status`, `self-update`, `uninstall` subcommands for day-2 operations — with atomic DB restore, plugin safe-upgrade, and webhook alerting.
+📦 **Ops toolkit** — `backup`, `restore`, `update`, `enable-ssl`, `status`, `self-update`, `uninstall` subcommands for day-2 operations — with atomic DB restore, plugin safe-upgrade, and webhook alerting (with journal/email fallback).
 
-🌍 **Bilingual** — full Chinese/English interface, auto-detected from system locale. V3.2.4 completes the i18n audit: zero hardcoded Chinese in logging paths, all message keys use ASCII naming convention.
+🌍 **Bilingual** — full Chinese/English interface, auto-detected from system locale.
 
 ## Quick Start
 
@@ -72,82 +74,71 @@ sudo python3 wp_ssl_bootstrap.py deploy \
 # Two-phase: HTTP first, SSL later
 sudo python3 wp_ssl_bootstrap.py deploy --domain example.com --skip-ssl
 sudo python3 wp_ssl_bootstrap.py enable-ssl --domain example.com --email admin@example.com
-
-# Enable HTTP/3 on existing site
-sudo python3 wp_ssl_bootstrap.py update --domain example.com --http3
-
-# Disable auto-detected Redis during update
-sudo python3 wp_ssl_bootstrap.py update --domain example.com --no-redis
 ```
 
 See [deploy-guide.md](./deploy-guide.md) for scenario-based examples and [README.md](./README.md) for full documentation.
 
+## Upgrade from V3.2.4
+
+```bash
+# Replace script file, then:
+sudo python3 wp_ssl_bootstrap.py update --domain example.com
+```
+
+All V3.2.5 features activate immediately:
+- **MariaDB tuning** will regenerate on next `update` (the "self-lock" bug prevented all previous updates from taking effect)
+- **Self-healing** activates automatically — existing failure scenarios that required manual intervention will now auto-repair
+- **Certificate timer** adjusts automatically if you have a short-lived certificate
+- **Renewal failure notification** auto-installs the journal/email fallback if no `--notify-webhook` was configured
+- **Component lifecycle** checks will run: Certbot version, Redis version, WP-CLI version, fail2ban compatibility
+- No manual reconfiguration needed
+
 ## Upgrade from V3.2.3
 
 ```bash
-# Replace script file, then:
 sudo python3 wp_ssl_bootstrap.py update --domain example.com
 ```
 
-Nginx module auto-repair activates immediately — any existing dynamic module load errors will be diagnosed and fixed on next `update` or `deploy`. CSP headers are updated automatically. The i18n fixes are transparent: English users who previously saw Chinese log messages in tar backup paths will now see proper English. No manual reconfiguration needed.
+All V3.2.4 + V3.2.5 features activate automatically.
 
-## Upgrade from V3.2.2
+## Upgrade from V3.2.2 / V3.2.1 / V3.2.0 / V3.1.x
 
 ```bash
-# Replace script file, then:
 sudo python3 wp_ssl_bootstrap.py update --domain example.com
 ```
 
-All V3.2.3 + V3.2.4 features activate automatically. PHP auto-upgrade runs on next deploy/redeploy if installed PHP is below 8.3.
+All accumulated features activate automatically. Existing SSL timers inherit parameters from previous unit files.
 
-## Upgrade from V3.2.1
+## Self-Healing Scenarios (V3.2.5)
 
-```bash
-# Replace script file, then:
-sudo python3 wp_ssl_bootstrap.py update --domain example.com
-```
+| Failure | Previous Behavior | V3.2.5 Behavior |
+|---|---|---|
+| logrotate not installed | Warn, skip → logs grow unbounded | Auto-install package + mkdir |
+| curl not available | Warn, skip health check | Auto-install curl |
+| MariaDB wait timeout | Warn, return False | Restart DB service + 15s retry |
+| `nginx -t` fails | Warn, skip reload | Capture error, fix stale include / dup default_server, re-test |
+| File deletion blocked | Warn ×9, exit_code=1 | `chattr -i` + retry (all 9 cleanup sites) |
+| DROP DATABASE fails | Warn, leave residual | Restart DB + retry both auth methods |
+| PHP-FPM won't restart | Warn, return | `php-fpm -t` diagnose → fix user/group or kill stale processes |
+| Redis won't start | Warn, return | Journal inspect → kill port conflict or backup bad config |
+| Redis ping fails | Warn, skip object cache | Restart service + re-verify |
+| MariaDB conf.d missing | Warn, skip tuning | Create dir + add `!includedir` to my.cnf |
+| Nginx upgrade fails | Warn, skip | `apt --fix-broken` / `yum clean all` + retry |
+| Redis plugin fails | Warn, skip | Retry with `--force` |
+| nginx.list write fails | Warn, skip repo | Create parent dir + retry |
 
-All V3.2.2 + V3.2.3 + V3.2.4 features activate automatically. Existing timers inherit parameters from EnvironmentFile — no manual reconfiguration needed.
+## Key Bug Fixes (V3.2.5)
 
-## Upgrade from V3.2.0
+- **MariaDB tuning self-lock (PATCH-280)** — instructional comment in generated `.cnf` contained the `# User-modified` marker string, causing tuning to be perpetually skipped
+- **Nginx config comment false-match ×5 (PATCH-280)** — substring checks on raw config matched commented-out directives, causing wrong status display, log level errors, and SSL block misidentification
+- **Exception safety sweep (PATCH-276, 270 sites)** — full `except Exception` path audit with missing debug logging, unhandled timeouts, recursive finally blocks, and silent quiet-mode failures
+- **EL7 EOL degradation (PATCH-272)** — component upgrade paths on EL7 now gracefully skip instead of erroring on unavailable repos
 
-```bash
-# Replace script file, then:
-sudo python3 wp_ssl_bootstrap.py update --domain example.com
-```
+## Security Enhancements (V3.2.5)
 
-All V3.2.1 + V3.2.2 + V3.2.3 + V3.2.4 features activate automatically. Existing SSL timers inherit parameters from previous unit files.
-
-## Upgrade from V3.1.x
-
-```bash
-# Replace script file, then:
-sudo python3 wp_ssl_bootstrap.py update --domain example.com
-```
-
-All V3.2.x configs (Brotli / Cloudflare / Fail2Ban / logrotate / systemd timers / webhook / HTTP/3 / srcache / PHP upgrade / Nginx module repair) rebuild automatically.
-
-## Key Bug Fixes (V3.2.4)
-
-- **Debian ABI-locked modules (PATCH-262 FIX-P5)** — residual `libnginx-mod-*` packages after nginx-core→nginx.org switch now auto-removed
-- **logrotate postrotate (PATCH-262 FIX-P8)** — standardized to USR1 signal, replacing PID-file-dependent patterns
-- **Missing fastcgi.conf (PATCH-263 FIX-2)** — `_ensure_fastcgi_conf()` now runs for all cache modes, not just srcache
-- **srcache orphaned directives (PATCH-263 FIX-5)** — aggressive cleanup + snapshot rollback + manual fix hint on compilation failure
-- **EL10 nginx module stream (PATCH-264 FIX-1)** — `dnf module disable nginx` prevents repo conflict on EL10
-- **EL10 pcre-devel (PATCH-265 FIX-1)** — removed from srcache build deps on EL10+ (package no longer exists)
-- **Service status display (PATCH-269 FIX-3)** — "not installed" vs "inactive" now correctly distinguished
-
-## i18n Fixes (V3.2.4)
-
-- **15 Chinese-character keys renamed** — `_MESSAGES` keys like `warn_redis_安装失败_部署将继续_不含_redis` renamed to ASCII convention (`warn_redis_install_failed_continuing_without_redis`); `en` field replaced with actual English translation; all call sites updated
-- **3 hardcoded Chinese `logging.warning()` fixed** — tar backup error messages (`warn_tar_error_detail`, `warn_tar_letsencrypt_error_detail`, `warn_tar_partial_files_changed`) now routed through `t()` with bilingual entries
-- **`--skip-ssl` path documented** — `generate_http_production_config()` docstring explains `http3=` omission (QUIC requires TLS)
-
-## Security Enhancements (V3.2.4)
-
-- **CSP modernization** — removed deprecated `X-Frame-Options` and `X-XSS-Protection`; added `frame-ancestors 'self'`, `upgrade-insecure-requests`; relaxed CSP for WordPress theme/plugin compatibility
-- **Temporary config security headers (PATCH-269)** — ACME challenge phase Nginx config now includes security headers to prevent exposure after deployment interruption
-- **srcache ABI improvement (PATCH-268)** — compilation uses full `nginx -V` configure arguments instead of `--with-compat` fallback
+- **MariaDB GPG 4-level key fallback (PATCH-275)** — direct download → keyserver → embedded key → apt-key, aligned with Nginx key fallback
+- **APT pinning (PATCH-272)** — aligned with nginx.org official format; fixes invalid dual-line `Pin:` syntax silently ignored by apt
+- **Nginx config auto-fix safety (PATCH-279)** — all auto-modifications create `.bak279` backup before writing; stale include fix uses precise regex targeting; default_server fix restricted to site-owned config files
 
 ## Requirements
 
@@ -156,12 +147,6 @@ All V3.2.x configs (Brotli / Cloudflare / Fail2Ban / logrotate / systemd timers 
 - Ports 80 and 443 open
 
 Everything else is installed automatically. PHP < 8.3 is automatically upgraded to 8.4.
-
-## Checksums
-
-```
-SHA256: 88210d30acf269bf411e671627482a17712d9aaf3ddb75011e2ca605288fb09d  wp_ssl_bootstrap.py
-```
 
 ## License
 
