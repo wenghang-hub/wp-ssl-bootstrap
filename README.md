@@ -32,7 +32,11 @@ One command to deploy WordPress with HTTPS, auto-renewal, and production-grade s
 - **`--no-*` reverse switches** — `--no-redis` / `--no-optimize` / `--no-cloudflare` / `--no-http3` / `--no-allow-xmlrpc` to explicitly disable auto-detected features during `update`/`enable-ssl`/`restore`
 - **Performance tuning** — PHP-FPM pool auto-sized by RAM, MariaDB InnoDB tuning, BBR + TCP sysctl, swap auto-creation, Nginx `open_file_cache` (`--optimize`)
 - **Self-healing** — 14 common failure scenarios auto-diagnosed and repaired: missing logrotate/curl auto-installed, failed DB auto-restarted, `nginx -t` errors auto-fixed (stale includes, duplicate default_server), uninstall file deletion retried with `chattr -i`, PHP-FPM/Redis failures auto-diagnosed via config test and journal inspection
+- **OpenSSL/Python SSL resilience** — Three-layer defense against `openssl-libs` upgrade breaking Python `_ssl.so`: L0 compile-time vs runtime version comparison (PEP 644) with auto `python3-libs` upgrade; L1 `_try_repair_openssl()` with subprocess verification after each strategy; L2 curl/wget fallback. Standalone `fix-openssl` subcommand for manual diagnosis.
 - **Component lifecycle** — Certbot snap migration with pip venv fallback; Redis/Valkey version-aware upgrades; WP-CLI auto-update with SHA-512 verification; fail2ban version detection with legacy compat; short-lived certificate auto-detection with timer frequency adjustment
+- **Dual-CA failover** — ZeroSSL (primary) + Let's Encrypt (fallback) with EAB auto-negotiation; ECC→RSA auto-downgrade; rate-limit detection; `migrate-ssl` subcommand for CA migration
+- **ntfy.sh zero-config webhook** — Interactive wizard offers one-click ntfy.sh setup with auto-generated topic; also supports Slack/DingTalk/Feishu JSON webhooks
+- **Atomic file writes** — All credential and config writes use `_write_bytes_atomic` (tempfile → fsync → os.replace) following Python official POSIX atomic semantics; signal-safe shutdown with 21 polling points
 - **WordPress Cron offload** — systemd 15-min timer replaces per-request wp-cron.php
 - **Bilingual UI** — Chinese/English; auto-detected from locale, persistable via `--lang`
 - **Smart domain handling** — `www.example.com` auto-normalized to `example.com`; subdomains skip `www` variant; single-site auto domain inference
@@ -96,6 +100,8 @@ All other dependencies (Nginx, PHP-FPM, MariaDB, certbot, etc.) are installed au
 | `restore` | Restore from backup with atomic DB swap (auto-selects latest, or `--from PATH`) |
 | `update` | Hot-update config templates and safely upgrade managed plugins |
 | `self-update` | Download latest script with cross-source SHA-256 verification and atomic replace |
+| `migrate-ssl` | Migrate certificate between CAs (e.g. Let's Encrypt → ZeroSSL) |
+| `fix-openssl` | Diagnose and repair OpenSSL/Python SSL library mismatch (no `--domain` needed) |
 | `uninstall` | Remove daemon components; `--purge` for full cleanup, `--revoke` to revoke certificate |
 
 ## Options
@@ -276,7 +282,11 @@ After deployment, credentials are saved to `/root/.wp_credentials_<domain>.txt` 
 - **`--no-*` 反向开关** — `--no-redis` / `--no-optimize` / `--no-cloudflare` / `--no-http3` / `--no-allow-xmlrpc` 可在 `update`/`enable-ssl`/`restore` 中显式禁用自动探测到的功能
 - **性能调优** — PHP-FPM 按内存动态调参、MariaDB InnoDB 调优、BBR + TCP sysctl、Swap 自动创建、Nginx `open_file_cache`（`--optimize`）
 - **自愈能力** — 14 种常见故障场景自动诊断修复：缺失 logrotate/curl 自动安装、DB 超时自动重启、`nginx -t` 错误自动修复（失效 include / 重复 default_server）、卸载删除失败自动 `chattr -i` 重试、PHP-FPM/Redis 故障自动诊断（配置测试 + journal 检查）
+- **OpenSSL/Python SSL 韧性** — 三层防线应对 `openssl-libs` 升级破坏 Python `_ssl.so`：L0 编译时/运行时版本比较（PEP 644）自动 `python3-libs` 升级；L1 `_try_repair_openssl()` 子进程验证修复；L2 curl/wget 降级。`fix-openssl` 独立子命令手动诊断
 - **组件生命周期** — Certbot snap 迁移 + pip venv 兜底；Redis/Valkey 版本感知升级；WP-CLI 自动更新 + SHA-512 校验；fail2ban 版本探测 + 旧版兼容；短寿命证书自动检测 + timer 频率调整
+- **双 CA 容灾** — ZeroSSL (主) + Let's Encrypt (降级) 自动切换，EAB 凭据自动获取，ECC→RSA 自动降级，速率限制检测，`migrate-ssl` 子命令支持 CA 迁移
+- **ntfy.sh 零配置 webhook** — 交互式向导一键配置 ntfy.sh 通知，自动生成主题名；同时支持 Slack/DingTalk/飞书 JSON webhook
+- **原子文件写入** — 所有凭据和配置写入使用 `_write_bytes_atomic`（tempfile → fsync → os.replace），符合 Python 官方 POSIX 原子语义；信号安全关闭 + 21 个轮询点
 - **WordPress Cron 卸载** — systemd 15 分钟定时器替代每请求触发 wp-cron.php
 - **双语界面** — 中英文自动切换，`--lang` 持久化
 - **域名智能处理** — 输入 `www.example.com` 自动归一为 `example.com`；子域名自动跳过 `www` 变体；单站点自动推断域名
@@ -340,6 +350,8 @@ sudo python3 wp_ssl_bootstrap.py enable-ssl \
 | `restore` | 从备份原子恢复（自动选最新，或 `--from 路径`） |
 | `update` | 热更新配置模板，安全升级托管插件 |
 | `self-update` | 下载最新版脚本，双源交叉 SHA-256 校验后原子替换 |
+| `migrate-ssl` | 在 CA 之间迁移证书（如 Let's Encrypt → ZeroSSL） |
+| `fix-openssl` | 诊断并修复 OpenSSL/Python SSL 库兼容性问题（无需 `--domain`） |
 | `uninstall` | 卸载守护组件；`--purge` 彻底清理，`--revoke` 吊销证书 |
 
 ## 常用参数

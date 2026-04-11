@@ -4,6 +4,92 @@ All notable changes to WP-SSL-Bootstrap are documented in this file.
 本文件记录 WP-SSL-Bootstrap 的所有重要变更。
 ---
 
+## [V3.2.6]
+
+> **升级说明 / Upgrade note**
+> V3.2.6 是架构重构、安全审计与 OpenSSL 韧性强化版本，包含 PATCH-281 至 PATCH-285。
+> 核心主题：平台抽象层重构（126 处硬编码分支集中化）、原子文件写入、信号安全重构、
+> OpenSSL/Python SSL 兼容性三层防线、ntfy.sh 零配置 webhook、self-update SHA256 预检优化。
+> 从 V3.2.5 升级时，直接替换脚本文件并执行 `update` 子命令即可。
+>
+> V3.2.6 is an architecture refactoring, security audit and OpenSSL resilience release (PATCH-281 through PATCH-285).
+> Core themes: Platform Abstraction Layer (126 hardcoded branches centralized), atomic file writes,
+> signal-safe shutdown, three-layer OpenSSL/Python SSL defense, zero-config ntfy.sh webhook,
+> self-update SHA256 pre-check optimization.
+> To upgrade from V3.2.5, replace the script and run the `update` subcommand.
+
+---
+
+### ✨ 新功能 / New Features
+
+- **`fix-openssl` 独立子命令 (PATCH-285)** — `python3 wp_ssl_bootstrap.py fix-openssl` 4 步诊断+修复 OpenSSL/Python SSL 兼容性问题：版本比较检测 → `ldd`/`rpm -qf` 诊断 → 自动修复 → 子进程验证。无需 `--domain`/`--email`，直接运行即可。
+  **`fix-openssl` standalone subcommand (PATCH-285)** — `python3 wp_ssl_bootstrap.py fix-openssl` provides 4-step diagnosis and repair for OpenSSL/Python SSL mismatch: version comparison → `ldd`/`rpm -qf` diagnostics → auto-repair → subprocess verification. No `--domain`/`--email` required.
+
+- **ntfy.sh 零配置 webhook (PATCH-284)** — 交互式向导新增 `[1] 自动配置 ntfy.sh` 选项，`secrets.token_hex(8)` 生成 64-bit 熵主题名，curl 适配纯文本 POST + `X-Title`/`X-Priority: high`/`X-Tags: warning` 头。Slack/DingTalk/飞书保持 `{"text":"..."}` JSON 格式。部署完成后输出可直接复制的 `update --notify-webhook` 命令。
+  **ntfy.sh zero-config webhook (PATCH-284)** — Interactive wizard adds `[1] Auto-configure ntfy.sh` option with `secrets.token_hex(8)` topic generation. Curl adapter uses plaintext POST with `X-Title`/`X-Priority`/`X-Tags` headers. Slack/DingTalk/Feishu keep JSON format. Outputs a copy-paste-ready `update --notify-webhook` command after deploy.
+
+- **Self-update SHA256 预检 (PATCH-285)** — 先下载远程 SHA256 文件（~64 字节）与本地比对，一致则跳过完整脚本下载（1.5MB+），节省带宽和时间。
+  **Self-update SHA256 pre-check (PATCH-285)** — Downloads remote SHA256 file (~64 bytes) first and compares with local hash. If identical, skips full script download (1.5MB+), saving bandwidth and time.
+
+- **双 CA 容灾架构 (PATCH-282)** — ZeroSSL (主) + Let's Encrypt (降级) 双 CA 自动切换，EAB 凭据自动获取，ECC→RSA 自动降级，速率限制检测跳过无意义重试。
+  **Dual-CA failover architecture (PATCH-282)** — ZeroSSL (primary) + Let's Encrypt (fallback) with auto-switch, EAB auto-negotiation, ECC→RSA auto-downgrade, rate-limit detection to skip futile retries.
+
+- **证书 CA 迁移 `migrate-ssl` (PATCH-282)** — 检测当前证书签发商，支持从 LE 迁移到 ZeroSSL 或反向迁移，保留原有域名列表。
+  **Certificate CA migration `migrate-ssl` (PATCH-282)** — Detects current certificate issuer, supports migration from LE to ZeroSSL or vice versa, preserving existing domain list.
+
+---
+
+### 🔒 安全增强 / Security Enhancements
+
+- **原子文件写入 `_write_bytes_atomic` (PATCH-284)** — `tempfile.mkstemp()` → write → `os.fsync()` → `os.replace()` 三步原子写入，24 处调用迁移。符合 Python 官方 `os.replace` + `os.fsync` 最佳实践（POSIX 原子语义）。消除断电/崩溃时文件损坏风险。
+  **Atomic file writes `_write_bytes_atomic` (PATCH-284)** — `tempfile.mkstemp()` → write → `os.fsync()` → `os.replace()` three-step atomic write, 24 call sites migrated. Follows Python official `os.replace` + `os.fsync` best practices (POSIX atomic semantics). Eliminates file corruption risk during power loss or crash.
+
+- **信号安全重构 (PATCH-285)** — 移除信号处理器中的 `raise KeyboardInterrupt`，改为标志位 `_shutdown_requested` + 21 个轮询点 `_abort_if_shutdown()`。`_run_subcommand` 捕获 `KeyboardInterrupt` 确保 rollback 执行。`_CriticalSectionCtx` 上下文管理器保护关键区段。
+  **Signal-safe shutdown (PATCH-285)** — Removed `raise KeyboardInterrupt` from signal handlers; replaced with `_shutdown_requested` flag + 21 polling points via `_abort_if_shutdown()`. `_run_subcommand` catches `KeyboardInterrupt` to ensure rollback. `_CriticalSectionCtx` context manager protects critical sections.
+
+- **`_safe_chmod` 统一权限设置 (PATCH-283)** — 消除 `islink()+chmod()` TOCTOU 反模式，16 处调用迁移。`_md5_noncrypto` / `_sha1_noncrypto` 显式标记非密码学用途（`usedforsecurity=False` + Python 3.6 回退）。
+  **`_safe_chmod` unified permission setting (PATCH-283)** — Eliminates `islink()+chmod()` TOCTOU anti-pattern, 16 call sites migrated. `_md5_noncrypto` / `_sha1_noncrypto` explicitly mark non-cryptographic use (`usedforsecurity=False` with Python 3.6 fallback).
+
+- **凭据安全强化 (PATCH-284)** — `LC_MESSAGES=C` 确保 stderr 英文输出（防止本地化泄露路径）；`/proc/self/mem` 清零 `/proc/environ` 中的敏感环境变量；`O_NOFOLLOW` 启动检查；凭据文件写入返回值检查。
+  **Credential hardening (PATCH-284)** — `LC_MESSAGES=C` forces English stderr (prevents localized path leaks); `/proc/self/mem` zeroes sensitive env vars in `/proc/environ`; `O_NOFOLLOW` startup check; credential file write return value verification.
+
+---
+
+### 🐛 问题修复 / Bug Fixes
+
+- **OpenSSL/Python SSL 兼容性三层防线 (PATCH-285)** — 解决 `install_packages()` 升级 `openssl-libs` 后 Python `_ssl.so` ABI 不兼容问题（Rocky Linux / EL9 已知广泛问题）。L0 预防：`ssl.OPENSSL_VERSION` vs `openssl version` 编译时/运行时版本比较（符合 PEP 644 最佳实践），不匹配则自动 `dnf upgrade python3-libs`。L1 自愈：`_try_repair_openssl()` 每次修复后子进程验证，遍历全部策略直到真正修好。L2 降级：curl/wget 接管。
+  **OpenSSL/Python SSL three-layer defense (PATCH-285)** — Fixes `install_packages()` upgrading `openssl-libs` breaking Python `_ssl.so` ABI (known widespread issue on Rocky Linux / EL9). L0 prevention: `ssl.OPENSSL_VERSION` vs `openssl version` compile-time/runtime version comparison (per PEP 644 best practice), auto `dnf upgrade python3-libs` on mismatch. L1 self-heal: `_try_repair_openssl()` verifies fix in subprocess after each attempt. L2 fallback: curl/wget takeover.
+
+- **Certbot challenge 文件残留 (PATCH-284)** — ZeroSSL ECC 签发超时后 challenge 文件残留 → RSA 降级时 `FileExistsError`。3 处添加 `_clean_challenge_dir()`：CA 切换前、ECC→RSA 降级前、renew CA 循环开头。
+  **Certbot challenge file cleanup (PATCH-284)** — Stale challenge files after ZeroSSL ECC timeout caused `FileExistsError` during RSA fallback. Added `_clean_challenge_dir()` at 3 points: before CA switch, before ECC→RSA downgrade, and at renew CA loop start.
+
+- **Staging/中国大陆网络检测 (PATCH-285)** — 从 `_is_china_cloud()`（云商身份，误杀海外节点）改为 `_is_china_network()`（网络出口位置，精确到 region metadata `cn-` 前缀）。腾讯云香港/新加坡不再被误判为中国大陆网络。
+  **Staging / China mainland network detection (PATCH-285)** — Changed from `_is_china_cloud()` (vendor identity, false positive on overseas nodes) to `_is_china_network()` (network egress location, precise to region metadata `cn-` prefix). Tencent Cloud Hong Kong / Singapore no longer falsely detected as China mainland.
+
+- **Self-update 非 TTY 交叉验证 (PATCH-284)** — 非 TTY 环境下交叉验证失败不再阻断更新（降级为 WARNING），避免 cron/CI 场景被卡住。
+  **Self-update non-TTY cross-verification (PATCH-284)** — Cross-verification failure in non-TTY mode no longer blocks updates (downgraded to WARNING), preventing cron/CI from stalling.
+
+---
+
+### 🔧 改进 / Improvements
+
+- **平台抽象层重构 (PATCH-281)** — 将分散在 40,000 行中的 126 个 `if pkg_mgr == "apt"` / `in ("dnf","yum")` 硬编码分支集中到 `_PLATFORM_REGISTRY` 注册表。业务逻辑通过 `self.platform["key"]` 访问平台特定值（包名、路径、服务名等），上游改包名/路径时只需改注册表一行。方法委托模式（`[REFACTOR]` 标签）将 Nginx/MariaDB/PHP/Redis/Cert 相关方法代理到各自管理器。
+  **Platform Abstraction Layer refactoring (PATCH-281)** — Consolidated 126 hardcoded `if pkg_mgr == "apt"` / `in ("dnf","yum")` branches scattered across 40,000 lines into a centralized `_PLATFORM_REGISTRY`. Business logic accesses platform-specific values (package names, paths, service names) via `self.platform["key"]`; upstream package/path changes require editing only one line. Method delegation pattern (`[REFACTOR]` tags) proxies Nginx/MariaDB/PHP/Redis/Cert methods to their respective managers.
+
+- **OpenSSL 修复策略增强** — L0.5a: `/etc/ld.so.conf.d/` 第三方条目扫描禁用。L0.5b: `LD_LIBRARY_PATH` 污染清理。L0.5c: `/opt/` `/usr/local/` 全盘 OpenSSL 副本扫描。L0.9: `rpm -qf`/`dpkg -S` 孤儿文件诊断+自动移除。L1.5: `dnf downgrade openssl-libs` 强制降级。APT: `libssl3t64` (Ubuntu 24.04+) + `--fix-broken`。
+  **OpenSSL repair strategy enhancements** — L0.5a: `/etc/ld.so.conf.d/` third-party entry scan. L0.5b: `LD_LIBRARY_PATH` pollution cleanup. L0.5c: `/opt/` `/usr/local/` full-disk OpenSSL copy scan. L0.9: `rpm -qf`/`dpkg -S` orphan file diagnosis + auto-removal. L1.5: `dnf downgrade openssl-libs` forced rollback. APT: `libssl3t64` (Ubuntu 24.04+) + `--fix-broken`.
+
+- **国际化 (i18n)** — 主脚本 14 处 + 测试脚本 63 处英文模式下的中文硬编码修复。Nginx 模块描述、PATCH-284 日志、WP-CLI 源名等全部改为英文常量。
+  **Internationalization (i18n)** — Fixed 14 hardcoded Chinese strings in main script + 63 in test script that leaked in English mode. Nginx module descriptions, PATCH-284 logs, WP-CLI source names all changed to English constants.
+
+- **测试脚本增强** — `--staging` 默认开启（避免 LE 速率限制）；中国大陆网络自动切换生产环境（curl 连通性测试）；staging 证书 SSL 握手验证兼容；DNS 预检/部署失败时提前终止（避免级联失败浪费时间）；37 项 PATCH 静态检查 (P282×8 + P283×11 + P284×13 + P285×5)。
+  **Test script enhancements** — `--staging` on by default (avoids LE rate limits); China mainland auto-switches to production (curl connectivity test); staging cert SSL handshake compat; early abort on DNS/deploy failure (avoids cascading waste); 37 PATCH static checks (P282×8 + P283×11 + P284×13 + P285×5).
+
+- **平台兼容性** — `missing_ok=True` → try/except (Python 3.6 EL7/EL8)；无 walrus `:=`、无 `match/case`、无 `capture_output=`；`hashlib usedforsecurity` try/except 回退；`certbot<5` 版本 pin (Python<3.10 兼容)。
+  **Platform compatibility** — `missing_ok=True` → try/except (Python 3.6 EL7/EL8); no walrus `:=`, no `match/case`, no `capture_output=`; `hashlib usedforsecurity` try/except fallback; `certbot<5` version pin (Python<3.10 compat).
+
+---
+
 ## [V3.2.5]
 
 > **升级说明 / Upgrade note**

@@ -1,5 +1,5 @@
-# WP-SSL-Bootstrap V3.2.5 — 全新建站参数指南
-# WP-SSL-Bootstrap V3.2.5 — New Site Deployment Guide
+# WP-SSL-Bootstrap V3.2.6 — 全新建站参数指南
+# WP-SSL-Bootstrap V3.2.6 — New Site Deployment Guide
 
 ---
 
@@ -337,6 +337,63 @@ python3 wp_ssl_bootstrap.py uninstall \
 
 ---
 
+## 场景十二：ntfy.sh 零配置 Webhook 通知 *(V3.2.6 新增)*
+## Scenario 12: ntfy.sh Zero-Config Webhook *(New in V3.2.6)*
+
+无需注册第三方服务。交互式向导自动生成 ntfy.sh 主题并配置通知：
+No third-party service registration needed. The interactive wizard auto-generates an ntfy.sh topic:
+
+```bash
+# 交互式向导会提示: [1] 自动配置 ntfy.sh  [2] 自定义 URL  [Enter] 跳过
+# The wizard will prompt: [1] Auto-configure ntfy.sh  [2] Custom URL  [Enter] Skip
+python3 wp_ssl_bootstrap.py
+
+# 或在命令行直接指定 / Or specify on command line
+python3 wp_ssl_bootstrap.py deploy \
+  --domain example.com \
+  --email  admin@example.com \
+  --notify-webhook https://ntfy.sh/your-topic
+```
+
+部署完成后，脚本输出可直接复制的 `update --notify-webhook` 命令。在手机上安装 [ntfy 应用](https://ntfy.sh) 并订阅相同主题即可收到推送通知。
+After deploy, the script outputs a copy-paste-ready `update --notify-webhook` command. Install the [ntfy app](https://ntfy.sh) on your phone and subscribe to the same topic for push notifications.
+
+---
+
+## 场景十三：证书 CA 迁移 *(V3.2.6 新增)*
+## Scenario 13: Certificate CA Migration *(New in V3.2.6)*
+
+从 Let's Encrypt 迁移到 ZeroSSL（或反向）：
+Migrate from Let's Encrypt to ZeroSSL (or vice versa):
+
+```bash
+python3 wp_ssl_bootstrap.py migrate-ssl \
+  --domain example.com \
+  --email  admin@example.com
+```
+
+脚本自动检测当前证书签发商、保留域名列表、使用目标 CA 重新签发。
+The script auto-detects the current issuer, preserves the domain list, and re-issues with the target CA.
+
+---
+
+## 场景十四：OpenSSL 修复 *(V3.2.6 新增)*
+## Scenario 14: OpenSSL Repair *(New in V3.2.6)*
+
+系统升级后 Python SSL 模块报错（常见于 Rocky/EL9 系统 `openssl-libs` 升级后）：
+Python SSL module errors after system upgrade (common on Rocky/EL9 after `openssl-libs` upgrade):
+
+```bash
+# 无需 --domain 或 --email，直接运行
+# No --domain or --email needed
+python3 wp_ssl_bootstrap.py fix-openssl
+```
+
+4 步诊断+修复：版本比较检测 → ldd/rpm 诊断 → 自动修复 → 子进程验证。
+4-step diagnosis and repair: version comparison → ldd/rpm diagnostics → auto-repair → subprocess verification.
+
+---
+
 ## 常用后续操作 / Common Post-Deployment Operations
 
 ```bash
@@ -358,6 +415,11 @@ python3 wp_ssl_bootstrap.py renew \
 
 # 为 HTTP-only 站点补签 SSL 证书 / Add SSL to an HTTP-only site
 python3 wp_ssl_bootstrap.py enable-ssl \
+  --domain example.com \
+  --email  admin@example.com
+
+# 证书 CA 迁移 (V3.2.6+) / Migrate certificate CA
+python3 wp_ssl_bootstrap.py migrate-ssl \
   --domain example.com \
   --email  admin@example.com
 
@@ -383,6 +445,9 @@ python3 wp_ssl_bootstrap.py update \
 # 从备份恢复 / Restore from backup
 python3 wp_ssl_bootstrap.py restore \
   --domain example.com
+
+# OpenSSL 修复 (V3.2.6+) / Fix OpenSSL issues
+python3 wp_ssl_bootstrap.py fix-openssl
 
 # 脚本自更新 / Self-update the script
 python3 wp_ssl_bootstrap.py self-update
@@ -449,9 +514,9 @@ The following run **unconditionally** during `deploy` without any flags:
 | **TCP / BBR 内核调优** / Kernel network tuning | 写入 sysctl drop-in，开启 BBR 拥塞控制（内核 4.9+）<br>Writes sysctl drop-in enabling BBR congestion control (kernel 4.9+) |
 | **Fail2Ban** | 自动配置 WordPress 暴力破解防护，封禁时间 24h + 递增封禁<br>Configures WordPress brute-force protection with 24h ban duration and progressive escalation |
 | **systemd 续期定时器** / Certificate renewal timer | 定时器频率随证书寿命自适应：标准 90 天证书每日检查；LE 2027 年 47 天证书每 8 小时；2028 年 6 天证书每 4 小时。续期成功后自动检测寿命变化并热更新 timer。<br>Timer frequency auto-adapts to certificate lifetime: daily for standard 90-day certs; every 8h for LE 2027 47-day certs; every 4h for 2028 6-day certs. Auto-detects lifetime changes after renewal and hot-updates the timer. |
-| **续期失败兜底通知** / Renewal failure fallback *(V3.2.5 新增 / New in V3.2.5)* | 未配置 `--notify-webhook` 时，自动安装 systemd OnFailure 服务：续期失败写 journal（CRIT）+ syslog + 尝试 `mail` 发邮件给 root。确保证书到期风险永不静默。<br>When no `--notify-webhook` is configured, auto-installs a systemd OnFailure service: renewal failures logged to journal (CRIT) + syslog + email attempted via `mail(1)` to root. Ensures certificate expiry risk is never silent. |
-| **自愈引擎** / Self-healing engine *(V3.2.5 新增 / New in V3.2.5)* | 14 种常见故障自动诊断修复：缺失 logrotate/curl 自动安装、DB 超时自动重启、`nginx -t` 错误自动修复（失效 include / 重复 default_server）、文件删除失败自动清除 immutable 位重试、PHP-FPM/Redis 故障自动诊断（配置测试 + journal 检查）。<br>14 common failure scenarios auto-diagnosed and repaired: missing logrotate/curl auto-installed, DB timeout auto-restarted, `nginx -t` errors auto-fixed (stale includes / duplicate default_server), file deletion retried with `chattr -i`, PHP-FPM/Redis failures auto-diagnosed via config test and journal inspection. |
-| **组件生命周期管理** / Component lifecycle *(V3.2.5 新增 / New in V3.2.5)* | Certbot: snap 迁移 + pip venv 兜底（EFF 官方 6 步流程）；Redis/Valkey: 版本感知升级 + EL10 Valkey 自动切换；WP-CLI: 版本检测 + 自动更新 + SHA-512 校验；fail2ban: 版本探测 + 0.11 以下旧版兼容。<br>Certbot: snap migration + pip venv fallback (EFF official 6-step); Redis/Valkey: version-aware upgrades + EL10 Valkey auto-switch; WP-CLI: version detection + auto-update + SHA-512 verification; fail2ban: version probing + legacy compat below 0.11. |
+| **续期失败兜底通知** / Renewal failure fallback *(V3.2.6 新增 / New in V3.2.6)* | 未配置 `--notify-webhook` 时，自动安装 systemd OnFailure 服务：续期失败写 journal（CRIT）+ syslog + 尝试 `mail` 发邮件给 root。确保证书到期风险永不静默。<br>When no `--notify-webhook` is configured, auto-installs a systemd OnFailure service: renewal failures logged to journal (CRIT) + syslog + email attempted via `mail(1)` to root. Ensures certificate expiry risk is never silent. |
+| **自愈引擎** / Self-healing engine *(V3.2.6 新增 / New in V3.2.6)* | 14 种常见故障自动诊断修复：缺失 logrotate/curl 自动安装、DB 超时自动重启、`nginx -t` 错误自动修复（失效 include / 重复 default_server）、文件删除失败自动清除 immutable 位重试、PHP-FPM/Redis 故障自动诊断（配置测试 + journal 检查）。<br>14 common failure scenarios auto-diagnosed and repaired: missing logrotate/curl auto-installed, DB timeout auto-restarted, `nginx -t` errors auto-fixed (stale includes / duplicate default_server), file deletion retried with `chattr -i`, PHP-FPM/Redis failures auto-diagnosed via config test and journal inspection. |
+| **组件生命周期管理** / Component lifecycle *(V3.2.6 新增 / New in V3.2.6)* | Certbot: snap 迁移 + pip venv 兜底（EFF 官方 6 步流程）；Redis/Valkey: 版本感知升级 + EL10 Valkey 自动切换；WP-CLI: 版本检测 + 自动更新 + SHA-512 校验；fail2ban: 版本探测 + 0.11 以下旧版兼容。<br>Certbot: snap migration + pip venv fallback (EFF official 6-step); Redis/Valkey: version-aware upgrades + EL10 Valkey auto-switch; WP-CLI: version detection + auto-update + SHA-512 verification; fail2ban: version probing + legacy compat below 0.11. |
 | **WP-Cron 定时器** / WP-Cron systemd timer | 15 分钟 systemd timer 替代 HTTP 触发，消除每次请求触发 wp-cron 的性能开销<br>15-minute systemd timer replaces HTTP-triggered wp-cron, eliminating per-request overhead |
 | **mysqlcheck 周度优化** / Weekly DB optimize | 每周日 03:00 自动执行碎片回收（外置数据库时跳过）<br>Runs `mysqlcheck --optimize` every Sunday at 03:00; skipped for external databases |
 | **Certbot 持久化 deploy hook** / Persistent certbot hook | 证书续期后自动 reload Nginx，无论由脚本 timer 还是 certbot 自身 timer 触发<br>Reloads Nginx after every renewal regardless of which timer triggered it |
