@@ -4,6 +4,72 @@ All notable changes to WP-SSL-Bootstrap are documented in this file.
 本文件记录 WP-SSL-Bootstrap 的所有重要变更。
 ---
 
+## [V3.2.7]
+
+> **升级说明 / Upgrade note**
+> V3.2.7 是全组件安全加固与用户体验优化版本（PATCH-286）。
+> 对照 OWASP / CIS Benchmark / 官方文档，为 PHP、MariaDB、Redis、OS、systemd、WordPress 六个组件
+> 补齐 55 项安全配置，新增 Nginx 修复链、wp-config update 路径补注入、readline 行编辑、
+> Ctrl+C 干净退出、Debian 12/13 nftables 防火墙支持。全部加固通过 `update` 子命令自动生效，无需重新部署。
+>
+> V3.2.7 is a full-stack security hardening and UX polish release (PATCH-286).
+> 55 security checks across PHP, MariaDB, Redis, OS sysctl, systemd, and WordPress — verified against
+> OWASP / CIS Benchmark / official docs. New Nginx repair chain, wp-config update-path injection,
+> readline line editing, clean Ctrl+C exit. All hardening applies automatically via `update`.
+
+---
+
+### 🔒 安全增强 / Security Enhancements
+
+- **PHP-FPM 安全加固 (PATCH-286)** — 12 项 OWASP PHP Cheat Sheet 加固，委托 `PHPManager.harden_ini()` 实现：expose_php=Off / display_errors=Off / display_startup_errors=Off / allow_url_include=Off / open_basedir（webroot+/tmp+/usr/share/php）/ disable_functions（exec,passthru,shell_exec,system,popen,dl,show_source；保留 proc_open 供 WP-CLI、curl_exec 供 HTTP API）/ session cookie 全量加固（httponly+secure+samesite=Lax+strict_mode+use_only_cookies+use_trans_sid=0）。
+  **PHP-FPM security hardening (PATCH-286)** — 12 items per OWASP PHP Cheat Sheet, delegated to `PHPManager.harden_ini()`: expose_php / display_errors / allow_url_include / open_basedir / disable_functions (preserving proc_open for WP-CLI, curl_exec for HTTP API) / session cookie hardening (httponly, secure, samesite, strict_mode).
+
+- **MariaDB 安全加固 (PATCH-286)** — 5 项 CIS MariaDB Benchmark 加固，委托 `MariaDBManager.security_cnf_lines()` 返回：bind-address=127.0.0.1 / local-infile=0 / skip-symbolic-links=1 / secure-file-priv=/dev/null / skip-show-database。
+  **MariaDB security hardening (PATCH-286)** — 5 items per CIS MariaDB Benchmark, delegated to `MariaDBManager.security_cnf_lines()`: bind-address / local-infile / skip-symbolic-links / secure-file-priv / skip-show-database.
+
+- **Redis 安全加固 (PATCH-286)** — 4 项 Redis 官方安全指南加固，委托 `RedisManager.harden_conf()` 实现：bind 127.0.0.1 ::1 / rename-command FLUSHALL+FLUSHDB "" / disable THP（transparent_hugepage）。
+  **Redis security hardening (PATCH-286)** — 4 items per Redis official security guide, delegated to `RedisManager.harden_conf()`: bind localhost / rename-command FLUSHALL+FLUSHDB / disable THP.
+
+- **OS 内核安全加固 (PATCH-286)** — 7 项 CIS Linux Benchmark sysctl 参数：tcp_syncookies=1 / rp_filter=1（all+default）/ accept_redirects=0（all+default）/ send_redirects=0（all+default）/ icmp_ignore_bogus_error_responses=1 / protected_hardlinks=1 / protected_symlinks=1。
+  **OS kernel security hardening (PATCH-286)** — 7 CIS Linux Benchmark sysctl parameters: tcp_syncookies / rp_filter / accept_redirects / send_redirects / icmp_ignore_bogus / protected_hardlinks / protected_symlinks.
+
+- **systemd 沙箱 (PATCH-286)** — SSL 续期服务新增 NoNewPrivileges=true / PrivateTmp=true（不使用 ProtectSystem/ProtectHome，certbot 需写 /etc/letsencrypt）。
+  **systemd sandboxing (PATCH-286)** — SSL renewal service: NoNewPrivileges=true / PrivateTmp=true (ProtectSystem/ProtectHome omitted — certbot needs /etc/letsencrypt write access).
+
+- **WordPress WP_DEBUG=false (PATCH-286)** — 生产环境显式禁用调试输出，加入 hardening_defines 列表。
+  **WordPress WP_DEBUG=false (PATCH-286)** — Explicitly disable debug output in production, added to hardening_defines list.
+
+---
+
+### 🐛 问题修复 / Bug Fixes
+
+- **Nginx server_names_hash_bucket_size 自动修复 (PATCH-286)** — 域名过长或 server block 过多时 `nginx -t` 报 `could not build server_names_hash`。在 `_diagnose_and_fix_config()` 新增 Case 3：自动检测错误 → 在 nginx.conf http 块插入 `server_names_hash_bucket_size 128` → 备份 `.bak286` → 重新验证。
+  **Nginx server_names_hash_bucket_size auto-repair (PATCH-286)** — Added Case 3 to `_diagnose_and_fix_config()`: detects `could not build server_names_hash` → inserts `server_names_hash_bucket_size 128` into nginx.conf → backup `.bak286` → re-validates.
+
+- **wp-config 安全常量 update 路径补注入 (PATCH-286)** — `inject_wp_hardening()` 仅在 deploy 新建 wp-config.php 时调用，老站点 update 后缺少 WP_DEBUG=false 等 8 个常量。新增 `_ensure_wp_hardening_constants()` 在 update 路径幂等补注入。
+  **wp-config hardening constants injected during update (PATCH-286)** — Added `_ensure_wp_hardening_constants()` for idempotent injection during update (pattern follows `_ensure_wp_cron_constant()`).
+
+- **readline 行编辑 (PATCH-286)** — `import readline` 提升到模块级，所有 32 处 `input()` 自动获得退格键/方向键/Ctrl+A/Ctrl+E 行编辑支持。修复退格显示 `^H`、方向键显示 `^[[D` 的问题。
+  **readline line editing (PATCH-286)** — `import readline` moved to module level; all 32 `input()` calls now support backspace, arrow keys, and standard line editing. Fixes `^H` display on backspace.
+
+- **Ctrl+C 干净退出 (PATCH-286)** — 顶层 `except KeyboardInterrupt: sys.exit(130)` 防止 Python traceback；交互向导 4 处 DB 配置 `pass` 改为 `return []`（退出向导而非静默跳过）。
+  **Clean Ctrl+C exit (PATCH-286)** — Top-level `except KeyboardInterrupt: sys.exit(130)` prevents Python traceback; 4 interactive wizard DB prompts changed from `pass` to `return []` (exit wizard instead of silently skipping).
+
+- **Debian 12/13 nftables 防火墙支持 (PATCH-286)** — `setup_firewall()` 新增 nftables 路径（优先级 ufw > firewall-cmd > nft）。创建独立 `inet wp_ssl` 表（policy accept，不锁 SSH）放行 80/443 TCP；持久化到 `/etc/nftables.conf`；`systemctl enable nftables`（Debian 12 默认未启用）。
+  **Debian 12/13 nftables firewall support (PATCH-286)** — `setup_firewall()` adds nftables path (priority: ufw > firewall-cmd > nft). Creates dedicated `inet wp_ssl` table (policy accept, won't lock SSH) allowing TCP 80/443; persists to `/etc/nftables.conf`; enables nftables.service (disabled by default on Debian 12).
+
+---
+
+### 🔧 改进 / Improvements
+
+- **架构规范 + 模块化 (PATCH-286)** — 模块级醒目位置插入 8 条架构规范（组件逻辑放 Manager / WPDeployManager 仅编排 / 平台差异查表 / 文件原子写入 / 信号安全 / subprocess timeout / _safe_chmod / 正反示例）。安全加固方法提取到各 Manager 类：`PHPManager.harden_ini()` / `RedisManager.harden_conf()` / `MariaDBManager.security_cnf_lines()` / `NginxManager._diagnose_and_fix_config()` Case 3。WPDeployManager 仅做一行委托调用。
+  **Architecture rules + modularization (PATCH-286)** — 8-rule architecture spec at module level (component logic in Managers / WPDM orchestration only / platform registry / atomic writes / signal safety / with positive and negative examples). Security methods extracted to Managers with one-line delegation from WPDeployManager.
+
+- **测试脚本适配 (PATCH-286)** — 新增 28 项 PATCH-286 检查（18 静态 + 10 运行时），覆盖全部加固项的源码存在性和部署后运行时生效性。
+  **Test script adaptation (PATCH-286)** — 28 new PATCH-286 checks (18 static + 10 runtime) covering source presence and runtime effectiveness of all hardening items.
+
+---
+
 ## [V3.2.6]
 
 > **升级说明 / Upgrade note**

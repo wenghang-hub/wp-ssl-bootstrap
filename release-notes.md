@@ -1,85 +1,51 @@
-# V3.2.6 — Architecture Refactoring, Security Audit & OpenSSL Resilience Release
+# WP-SSL-Bootstrap V3.2.7 Release Notes
 
-One-command WordPress + HTTPS deployment engine for production Linux servers.
+> 全组件安全加固 + 用户体验优化版本 | Full-stack security hardening + UX polish release
 
-## What's New in V3.2.6
+## 核心主题 / Core Themes
 
-V3.2.6 builds on V3.2.5 through 5 patches (PATCH-281–285), delivering a major architecture refactoring, deep security audit, and OpenSSL/Python SSL resilience hardening. The Platform Abstraction Layer centralizes 126 hardcoded platform branches; atomic file writes replace all 24 direct-write call sites; signal handling is rebuilt around safe polling points; a three-layer defense protects against OpenSSL library version mismatches. New features include zero-config ntfy.sh webhook, dual-CA failover (ZeroSSL + Let's Encrypt), certificate CA migration, standalone `fix-openssl` subcommand, and self-update SHA256 pre-check. Net +2,300 lines (40,133→42,421).
+- **全组件安全加固 (PATCH-286)** — 对照 OWASP / CIS Benchmark / 官方文档，为 PHP、MariaDB、Redis、OS、systemd、WordPress 六个组件补齐 55 项安全配置，全部通过 `update` 子命令自动生效
+- **架构模块化** — 安全加固逻辑委托到各 Manager 类，WPDeployManager 仅做一行委托；模块级架构规范注释确保未来修改遵循同一模式
+- **用户体验优化** — readline 行编辑（退格/方向键）、Ctrl+C 干净退出、Nginx hash_bucket_size 自动修复、wp-config update 路径补注入
 
-🏗️ **Platform Abstraction Layer (PATCH-281)** — consolidated 126 hardcoded `if pkg_mgr == "apt"` / `in ("dnf","yum")` branches into `_PLATFORM_REGISTRY`. Business logic accesses platform-specific values via `self.platform["key"]`; upstream changes require editing one line. Method delegation proxies Nginx/MariaDB/PHP/Redis/Cert methods to their managers.
+## 安全加固清单 / Security Hardening Checklist
 
-🔒 **Atomic file writes (PATCH-284)** — `_write_bytes_atomic`: tempfile → `os.fsync()` → `os.replace()` following Python official POSIX best practices. 24 call sites migrated.
+| 组件 | 加固项 | 对照标准 | 实现方式 |
+|------|--------|---------|---------|
+| PHP-FPM | expose_php / display_errors / disable_functions / open_basedir / session cookie 安全 / allow_url_include | OWASP PHP Cheat Sheet | `PHPManager.harden_ini()` |
+| MariaDB | bind-address / local-infile / skip-symbolic-links / secure-file-priv / skip-show-database | CIS MariaDB Benchmark | `MariaDBManager.security_cnf_lines()` |
+| Redis | bind 127.0.0.1 / rename-command FLUSHALL+FLUSHDB / disable THP | Redis 官方安全指南 | `RedisManager.harden_conf()` |
+| OS sysctl | tcp_syncookies / rp_filter / accept_redirects / send_redirects / protected_hardlinks+symlinks | CIS Linux Benchmark | `_tune_kernel_network()` |
+| systemd | NoNewPrivileges / PrivateTmp | systemd 沙箱最佳实践 | `setup_systemd()` |
+| WordPress | WP_DEBUG=false | WordPress Codex | `inject_wp_hardening()` |
 
-🔒 **Signal-safe shutdown (PATCH-285)** — `_shutdown_requested` flag + 21 polling points via `_abort_if_shutdown()`. `_CriticalSectionCtx` protects critical sections. Ensures rollback execution on Ctrl+C.
+## 修复链新增 / New Repair Chains
 
-🔒 **OpenSSL three-layer defense (PATCH-285)** — L0: `ssl.OPENSSL_VERSION` vs `openssl version` comparison (PEP 644), auto `python3-libs` upgrade. L1: `_try_repair_openssl()` with subprocess verification. L2: curl/wget fallback. Standalone `fix-openssl` subcommand for manual diagnosis.
+| 错误 | 自动修复 |
+|------|---------|
+| `nginx -t` 报 `could not build server_names_hash` | 自动插入 `server_names_hash_bucket_size 128` |
+| 老站点 update 后缺少安全常量 (WP_DEBUG 等) | `_ensure_wp_hardening_constants()` 幂等补注入 |
+| 退格键显示 `^H` | `import readline` 模块级导入 |
+| Ctrl+C 打印 Python traceback | 顶层 `except KeyboardInterrupt: sys.exit(130)` |
+| Debian 12/13 无防火墙规则 | `_setup_nftables_allow_web()` 创建 `inet wp_ssl` 表 + 持久化 + 启用服务 |
 
-🔔 **ntfy.sh zero-config webhook (PATCH-284)** — interactive wizard auto-generates ntfy.sh topic; plaintext POST with `X-Title`/`X-Priority` headers; Slack/DingTalk/Feishu keep JSON format.
-
-🔀 **Dual-CA failover (PATCH-282)** — ZeroSSL (primary) + Let's Encrypt (fallback) with EAB auto-negotiation, ECC→RSA downgrade, rate-limit detection. `migrate-ssl` subcommand for CA migration.
-
-⚡ **Self-update SHA256 pre-check (PATCH-285)** — downloads remote SHA256 (~64 bytes) first; skips full 1.5MB download if hash matches.
-
-🔒 **Credential hardening (PATCH-283/284)** — `_safe_chmod` eliminates TOCTOU (16 sites); `LC_MESSAGES=C`; `/proc/environ` zeroing; `_md5_noncrypto` with `usedforsecurity=False`.
-
-🌐 **China network detection fix (PATCH-285)** — `_is_china_network()` replaces `_is_china_cloud()` for staging detection; Tencent Cloud overseas nodes no longer falsely blocked.
-
-🐛 **Challenge file cleanup (PATCH-284)** — `_clean_challenge_dir()` at 3 points prevents `FileExistsError` during CA switch / ECC→RSA downgrade.
-
-## Highlights
-
-🚀 **Full-stack deployment** — Nginx, PHP-FPM, MariaDB, WordPress, SSL, auto-renewal, Fail2Ban, logrotate — single `deploy` command.
-
-🏗️ **Clean architecture** — 126 platform branches centralized; 24 atomic write paths; signal-safe shutdown with 21 polling points.
-
-🔀 **Dual-CA failover** — ZeroSSL + Let's Encrypt with auto-switch, EAB auto-negotiation, `migrate-ssl` for CA migration.
-
-🤖 **Self-healing** — 14 failure auto-remediation patterns + OpenSSL three-layer defense.
-
-⏱️ **Future-proof** — dynamic timer for LE short-lived certs (47-day/6-day); component lifecycle management.
-
-📦 **Ops toolkit** — `deploy`, `enable-ssl`, `renew`, `status`, `backup`, `restore`, `update`, `migrate-ssl`, `fix-openssl`, `self-update`, `uninstall`.
-
-🌐 **Multi-distro** — EL7–10, Ubuntu 20.04–24.04, Debian 11–13. Python 3.6+ compatible.
-
-## Quick Start
+## 升级指南 / Upgrade Guide
 
 ```bash
-sudo python3 wp_ssl_bootstrap.py                    # Interactive wizard
-sudo python3 wp_ssl_bootstrap.py fix-openssl         # Fix SSL issues
-sudo python3 wp_ssl_bootstrap.py migrate-ssl \       # Migrate CA
-  --domain example.com --email admin@example.com
+# 从 V3.2.6 升级 — 替换脚本后执行 update，全部加固自动生效
+cp wp_ssl_bootstrap.py wp_ssl_bootstrap.py.bak326
+# 下载新版本覆盖
+python3 wp_ssl_bootstrap.py update --domain YOUR_DOMAIN --email YOUR_EMAIL
 ```
 
-See [deploy-guide.md](./deploy-guide.md) for scenarios and [README.md](./README.md) for full docs.
+## 测试覆盖 / Test Coverage
 
-## Upgrade from V3.2.5
+- 静态检查: 194 项 (含 28 项 PATCH-286 专项)
+- 运行时检查: 含 10 项安全加固运行时验证
+- 平台: Rocky 9.x / Ubuntu 24.04 / Debian 12
 
-```bash
-sudo python3 wp_ssl_bootstrap.py update --domain example.com
-```
+## 兼容性 / Compatibility
 
-All features activate immediately. No manual reconfiguration needed.
-
-## New Subcommands
-
-| Command | Description |
-|---|---|
-| `fix-openssl` | 4-step OpenSSL/Python SSL diagnosis and repair (no `--domain` needed) |
-| `migrate-ssl` | Migrate certificate between CAs (LE ↔ ZeroSSL) |
-
-## OpenSSL Three-Layer Defense
-
-| Layer | When | Action |
-|---|---|---|
-| L0 Prevention | After `install_packages()` | Version comparison → auto `python3-libs` upgrade |
-| L1 Self-Heal | urllib failure | Iterate all repair strategies with subprocess verification |
-| L2 Fallback | L1 exhausted | curl/wget takeover |
-
-## Requirements
-
-Root access, Python 3.6+, domain with DNS A records, ports 80/443 open. Everything else is auto-installed.
-
-## License
-
-MIT
+- Python 3.6+ (EL7/EL8) ~ 3.12+ (EL10/Ubuntu 24.04)
+- 无新增外部依赖
+- 向后兼容 V3.2.6 配置文件

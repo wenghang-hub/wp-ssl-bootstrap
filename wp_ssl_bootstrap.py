@@ -89,8 +89,8 @@ WP-SSL-Bootstrap: 高可用建站引擎
 #                   2) Before release, set __version__ to new version
 #                   3) Optionally reset __build__ to match
 # ---------------------------------------------------------------------------
-__version__ = "3.2.6"
-__build__   = "3.2.285"
+__version__ = "3.2.7"
+__build__   = "3.2.287"
 
 # ---------------------------------------------------------------------------
 # [PATCH-284] 模块化重构路线图 / Modularization Roadmap
@@ -143,6 +143,82 @@ from typing import Optional, Any, Callable  # [PATCH-277] Phase 2: full type ann
 # [V3.2.121] FIX-12: concurrent.futures 已被 threading.Thread 替代 (FIX-10)
 import json
 from pathlib import Path
+
+# [PATCH-286] readline: 使所有 input() 调用支持退格/方向键/行编辑。
+# 无此导入时, 部分终端 (尤其 root 直接登录的最小化系统) 退格显示 ^H。
+# GNU readline 在绝大多数 Linux 发行版预装; 仅 import 即自动挂钩 input()。
+try:
+    import readline  # noqa: F401 — side-effect import for input() line editing
+except ImportError:
+    pass  # 极少数无 readline 的环境 (如 Alpine musl), 降级为无编辑功能
+
+# ---------------------------------------------------------------------------
+# [PATCH-285] subprocess.run 默认超时保护 / Default Timeout Guard
+# ---------------------------------------------------------------------------
+# 脚本中 324 处直接调用 subprocess.run 无 timeout 参数,
+# 任何子进程挂起 (如 dnf 遇损坏镜像、curl 无响应) 都会导致脚本永久阻塞。
+# 注入模块级默认超时: 未显式指定 timeout 的调用自动获得 120s 超时。
+# 已有显式 timeout 的调用 (如 run_cmd 的 300s) 不受影响。
+#
+# 324 subprocess.run calls lacked timeout; any hung subprocess (e.g. dnf
+# hitting a broken mirror, curl with unresponsive server) would block the
+# script indefinitely. This module-level wrapper injects a default 120s
+# timeout for calls without explicit timeout. Existing explicit timeouts
+# are preserved.
+# ---------------------------------------------------------------------------
+_DEFAULT_SUBPROCESS_TIMEOUT = 120  # seconds
+
+_original_subprocess_run = subprocess.run
+
+
+def _subprocess_run_with_default_timeout(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+    """subprocess.run wrapper: injects default timeout if not specified."""
+    if 'timeout' not in kwargs:
+        kwargs['timeout'] = _DEFAULT_SUBPROCESS_TIMEOUT
+    return _original_subprocess_run(*args, **kwargs)
+
+
+subprocess.run = _subprocess_run_with_default_timeout  # type: ignore[assignment]
+
+# ===========================================================================
+# ⚠️  架构规范 — 所有修改必须遵循  ⚠️
+# ⚠️  ARCHITECTURE RULES — ALL CHANGES MUST FOLLOW  ⚠️
+# ===========================================================================
+#
+# 本脚本采用 Manager 委托模式 (PATCH-281):
+#
+#   NginxManager    — Nginx 安装/配置/诊断/修复
+#   MariaDBManager  — MariaDB 安装/配置/诊断/修复
+#   PHPManager      — PHP 安装/升级/诊断/加固
+#   RedisManager    — Redis 安装/配置/诊断/加固
+#   CertManager     — Certbot/SSL 签发/续期/迁移
+#   WPDeployManager — 编排层 (调用各 Manager, 不含组件实现逻辑)
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  规则 1: 组件逻辑放入对应 Manager, 不要直接写在 WPDeployManager │
+# │  规则 2: WPDeployManager 仅做编排 (调用时机 + 参数传递)         │
+# │  规则 3: 新增修复链/加固项 → 对应 Manager 加方法 + WPDM 加委托  │
+# │  规则 4: 平台差异通过 _PLATFORM_REGISTRY 查表, 不要 if/else     │
+# │  规则 5: subprocess.run 必须带 timeout (有模块级兜底但不要依赖)  │
+# │  规则 6: 文件写入必须原子 (_write_bytes_atomic / _safe_write_file)│
+# │  规则 7: 信号安全 — 长操作前调用 _abort_if_shutdown()            │
+# │  规则 8: chmod 使用 _safe_chmod(), 不要直接 os.chmod()           │
+# └─────────────────────────────────────────────────────────────────┘
+#
+# 反面示例 (❌ 不要这样做):
+#   class WPDeployManager:
+#       def _setup_redis_cache(self):
+#           # 40 行 Redis 配置加固代码直接写在这里
+#
+# 正面示例 (✅ 应该这样做):
+#   class RedisManager:
+#       def harden_conf(self):     # 实现在 Manager 里
+#           ...
+#   class WPDeployManager:
+#       def _setup_redis_cache(self):
+#           self.redis.harden_conf()  # 一行委托
+#
+# ===========================================================================
 
 # ---------------------------------------------------------------------------
 # [REFACTOR] 平台抽象层 / Platform Abstraction Layer
@@ -10535,6 +10611,7 @@ def inject_wp_hardening(content: str, skip_ssl: bool = False) -> str:
         ("WP_POST_REVISIONS", "10"),
         ("EMPTY_TRASH_DAYS", "7"),
         ("DISABLE_WP_CRON", "true"),  # [V3.0.16] P2: 服务端 cron 替代
+        ("WP_DEBUG", "false"),  # [PATCH-286] 生产环境显式禁用调试
     ]
 
     # [PATCH-235 FIX-2a] 预计算注释/字符串区间 O(n), 每个常量查找
@@ -11665,6 +11742,37 @@ class NginxManager:
                                 _fixed = True
                         except OSError:
                             pass
+
+            # Case 3: server_names_hash_bucket_size 不足
+            # 域名过长 (>64 字符) 或 server block 过多时触发:
+            # nginx: [emerg] could not build server_names_hash, you should
+            # increase server_names_hash_bucket_size: 64
+            if (not _fixed
+                    and "server_names_hash" in _err
+                    and "increase" in _err):
+                _ngx_main = Path("/etc/nginx/nginx.conf")
+                if _ngx_main.exists():
+                    try:
+                        _nc = _ngx_main.read_text(
+                            encoding="utf-8", errors="replace")
+                        if "server_names_hash_bucket_size" not in _nc:
+                            # 插入到 http { 块内第一行
+                            _nc_new = re.sub(
+                                r'(http\s*\{)',
+                                r'\1\n    server_names_hash_bucket_size 128;',
+                                _nc, count=1)
+                            if _nc_new != _nc:
+                                shutil.copy2(str(_ngx_main),
+                                             str(_ngx_main) + ".bak286")
+                                _ngx_main.write_text(
+                                    _nc_new, encoding="utf-8")
+                                logging.info(
+                                    "[PATCH-286] Added "
+                                    "server_names_hash_bucket_size 128 "
+                                    "to %s", _ngx_main)
+                                _fixed = True
+                    except OSError:
+                        pass
 
             if _fixed and self.run_cmd(["nginx", "-t"], quiet=True):
                 logging.info("[PATCH-279] nginx -t passed after auto-fix.")
@@ -13980,9 +14088,27 @@ class MariaDBManager:
                     pass
 
 
-    # -----------------------------------------------------------------------
-    # WordPress 下载与完整性校验
-    # -----------------------------------------------------------------------
+    @staticmethod
+    def security_cnf_lines() -> list:
+        """[PATCH-286] 返回 MariaDB 安全加固 .cnf 行 (CIS Benchmark)。
+
+        调用方: WPDeployManager._tune_mariadb() 合并到调优配置中。
+
+        对照 CIS MariaDB 10.6 Benchmark + 官方安全文档:
+          · bind-address         — 仅本地监听 (外置 DB 场景不写此文件)
+          · local-infile         — 禁止客户端读服务器文件
+          · skip-symbolic-links  — 禁用符号链接跳出数据目录
+          · secure-file-priv     — 禁止 LOAD DATA / SELECT INTO
+          · skip-show-database   — 隐藏数据库列表
+        """
+        return [
+            "# ── Security hardening (CIS MariaDB Benchmark) ──",
+            "bind-address = 127.0.0.1",
+            "local-infile = 0",
+            "skip-symbolic-links = 1",
+            "secure-file-priv = /dev/null",
+            "skip-show-database",
+        ]
 
 
 
@@ -14151,6 +14277,55 @@ class RedisManager:
         # 非交互式
         logging.info(t("info_redis_license_skip_noninteractive"))
         return False
+
+    def harden_conf(self) -> None:
+        """[PATCH-286] Redis 配置安全加固 (Redis 官方安全指南)。
+
+        对照 Redis Security Guide + CIS Redis Benchmark:
+          · bind 127.0.0.1 — 仅本地监听 (防远程未授权访问)
+          · rename-command — 禁用 FLUSHALL/FLUSHDB (防数据清空)
+            不禁用 CONFIG (脚本 CONFIG SET/GET 需要)
+          · Disable THP — 减少 Redis 延迟毛刺
+
+        幂等: 已有配置不重复添加。
+        """
+        _redis_conf = self.get_conf_path()
+        if not Path(_redis_conf).exists():
+            return
+        try:
+            _rc = Path(_redis_conf).read_text(
+                encoding="utf-8", errors="replace")
+            _rc_changed = False
+            # bind: 确保绑定 127.0.0.1
+            if not re.search(
+                    r'^\s*bind\s+.*127\.0\.0\.1',
+                    _rc, re.MULTILINE):
+                _rc += ("\n# [PATCH-286] Security: bind localhost\n"
+                        "bind 127.0.0.1 ::1\n")
+                _rc_changed = True
+            # rename-command: 禁用最危险命令
+            for _dcmd in ("FLUSHALL", "FLUSHDB"):
+                if "rename-command %s" % _dcmd not in _rc:
+                    _rc += ('rename-command %s ""\n' % _dcmd)
+                    _rc_changed = True
+            if _rc_changed:
+                MariaDBManager._safe_write_file(
+                    _redis_conf, _rc, mode=0o640)
+                logging.info("[PATCH-286] Redis conf hardened: %s",
+                             _redis_conf)
+        except Exception as _e286r:
+            logging.debug("[PATCH-286] Redis harden_conf: %s", _e286r)
+
+        # THP: 禁用透明大页 (减少 Redis 延迟毛刺)
+        _thp_path = "/sys/kernel/mm/transparent_hugepage/enabled"
+        if Path(_thp_path).exists():
+            try:
+                _thp_cur = Path(_thp_path).read_text().strip()
+                if "[never]" not in _thp_cur:
+                    Path(_thp_path).write_text("never")
+                    logging.info("[PATCH-286] THP disabled for Redis")
+            except Exception:
+                pass
 
 
 
@@ -14515,6 +14690,64 @@ class PHPManager:
 
         logging.warning(t("warn_php_version_fallback", ver=version, svc=candidate))
         return self._detect_php_fpm_service()
+
+    def harden_ini(self, ini_paths: list, webroot: str) -> None:
+        """[PATCH-286] PHP ini 安全加固 (OWASP PHP Configuration Cheat Sheet)。
+
+        对照 OWASP + CIS PHP Benchmark 加固 php.ini:
+          · 信息泄露: expose_php/display_errors/display_startup_errors
+          · RFI 防护: allow_url_include=Off
+          · 目录遍历: open_basedir 限制到 webroot+/tmp
+          · Webshell/RCE: disable_functions (保留 WP-CLI 需要的 proc_open)
+          · 会话安全: cookie_httponly/secure/samesite/strict_mode
+
+        Args:
+            ini_paths: php.ini 路径列表 (取第一个存在的)
+            webroot: 站点 webroot 绝对路径 (用于 open_basedir)
+        """
+        _security_values = {
+            "expose_php": "Off",
+            "display_errors": "Off",
+            "display_startup_errors": "Off",
+            "log_errors": "On",
+            "allow_url_include": "Off",
+            "session.cookie_httponly": "1",
+            "session.cookie_secure": "1",
+            "session.use_strict_mode": "1",
+            "session.cookie_samesite": "Lax",
+            "session.use_only_cookies": "1",
+            "session.use_trans_sid": "0",
+            "disable_functions": ("exec,passthru,shell_exec,system,"
+                                  "popen,dl,show_source"),
+        }
+        for _ini_path in ini_paths:
+            if not Path(_ini_path).exists():
+                continue
+            try:
+                _content = Path(_ini_path).read_text(encoding="utf-8")
+                _modified = False
+                for _key, _val in _security_values.items():
+                    _new = patch_php_ini_line(_content, _key, _val)
+                    if _new != _content:
+                        _content = _new
+                        _modified = True
+                # open_basedir: 限制 PHP 文件访问到 webroot + 临时目录
+                _ob_dirs = [webroot, "/tmp", "/usr/share/php",
+                            "/usr/share/pear", "/dev/urandom"]
+                _new = patch_php_ini_line(
+                    _content, "open_basedir", ":".join(_ob_dirs))
+                if _new != _content:
+                    _content = _new
+                    _modified = True
+                if _modified:
+                    MariaDBManager._safe_write_file(
+                        _ini_path, _content, mode=0o644)
+                    logging.info("[PATCH-286] PHP ini hardened: %s",
+                                 _ini_path)
+                return  # 只改第一个找到的
+            except Exception as _e_286:
+                logging.debug("[PATCH-286] PHP harden_ini: %s: %s",
+                              _ini_path, _e_286)
 
 
 
@@ -16064,6 +16297,11 @@ class WPDeployManager:
             except Exception as e:
                 logging.warning(t("warn_fpm_tuning_fail", path=conf_path, e=e))
 
+        # [PATCH-286] 委托 PHPManager.harden_ini() 执行 php.ini 安全加固
+        self.php.harden_ini(
+            self._get_active_php_ini_paths(),
+            str(self.cfg.webroot_path))
+
     def _tune_mariadb(self) -> None:
         """按系统内存分级写入 MariaDB 调优配置。
 
@@ -16104,11 +16342,16 @@ class WPDeployManager:
             conn, disable_perf_schema = 300, False
 
         lines = [
-            "# [V3.0.16] WP-SSL-Bootstrap MariaDB tuning",
+            "# [V3.0.16] WP-SSL-Bootstrap MariaDB tuning + security",
             "# Auto-generated based on system RAM (%dMB). Values will be" % total_mb,
             "# overwritten on deploy/update. To preserve your manual edits,",
             "# add a NEW line with only:  # User-modified",
             "[mysqld]",
+        ]
+        # [PATCH-286] 委托 MariaDBManager.security_cnf_lines() 获取安全加固项
+        lines.extend(self.mariadb.security_cnf_lines())
+        lines.extend([
+            "# ── Performance tuning ──",
             f"innodb_buffer_pool_size = {pool}M",
             # [V3.0.16] F5: 移除 innodb_log_file_size (MariaDB < 10.6 变更后启动失败)
             # [PATCH-MDB] 现已确保 ≥10.6, 但保持移除以兼容手动安装的旧版本
@@ -16122,7 +16365,7 @@ class WPDeployManager:
             "max_heap_table_size = 64M",
             "table_open_cache = 2000",
             "thread_cache_size = 16",
-        ]
+        ])
         if disable_perf_schema:
             lines.append("performance_schema = OFF")
 
@@ -16308,6 +16551,18 @@ class WPDeployManager:
             "# Some ISPs drop ICMP 'too big' packets, breaking Path MTU Discovery.",
             "# Value 1 = enable probing only when ICMP black hole detected.",
             "net.ipv4.tcp_mtu_probing = 1",
+            "",
+            "# [PATCH-286] Network security hardening (CIS Linux Benchmark)",
+            "net.ipv4.tcp_syncookies = 1",
+            "net.ipv4.conf.all.rp_filter = 1",
+            "net.ipv4.conf.default.rp_filter = 1",
+            "net.ipv4.conf.all.accept_redirects = 0",
+            "net.ipv4.conf.default.accept_redirects = 0",
+            "net.ipv4.conf.all.send_redirects = 0",
+            "net.ipv4.conf.default.send_redirects = 0",
+            "net.ipv4.icmp_ignore_bogus_error_responses = 1",
+            "fs.protected_hardlinks = 1",
+            "fs.protected_symlinks = 1",
         ])
 
         if bbr_available:
@@ -19267,6 +19522,96 @@ class WPDeployManager:
                 quiet=True,
             )
             self.run_cmd(["firewall-cmd", "--reload"], quiet=True)
+        elif shutil.which("nft"):
+            # [PATCH-286] Debian 12+ 默认 nftables, 无 ufw/firewalld。
+            # 安全策略: 不创建 drop 默认策略 (防止锁死 SSH),
+            # 仅确保 80/443 在现有规则集中被显式放行。
+            self._setup_nftables_allow_web()
+
+    def _setup_nftables_allow_web(self) -> None:
+        """[PATCH-286] nftables: 确保 80/443 TCP 放行。
+
+        Debian 12/13 默认防火墙。策略:
+          1. 检测是否已有 wp_ssl 表 → 有则跳过 (幂等)
+          2. 创建 inet wp_ssl 表 + input 链 (policy accept, 不影响现有安全策略)
+          3. 添加 tcp dport {80, 443} accept 规则
+          4. 启用 nftables.service (Debian 12 默认未启用!)
+          5. 持久化到 /etc/nftables.conf
+
+        不使用 policy drop (防止 SSH 锁死); 若用户已有 drop 策略的
+        filter 表, 本规则在 wp_ssl 表中独立生效, 不干扰。
+
+        Debian 12 关键事实:
+          · nftables 包已装, 但 systemd 服务默认未启用
+          · /etc/nftables.conf 存在但内容为空 (仅 flush ruleset)
+          · 重启后规则丢失, 除非 nftables.service 已 enable
+        """
+        if self.cfg.dry_run:
+            return
+        try:
+            # 幂等检查: 已有 wp_ssl 表则跳过
+            _chk = subprocess.run(
+                ["nft", "list", "table", "inet", "wp_ssl"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=5, check=False)
+            if _chk.returncode == 0:
+                logging.debug("[PATCH-286] nftables: wp_ssl table exists, skip")
+                return
+
+            # 创建表 + 链 + 规则 (原子批量加载)
+            _nft_rules = (
+                "add table inet wp_ssl\n"
+                "add chain inet wp_ssl input "
+                "{ type filter hook input priority 10 ; policy accept ; }\n"
+                "add rule inet wp_ssl input tcp dport { 80, 443 } accept\n"
+            )
+            _r = subprocess.run(
+                ["nft", "-f", "-"],
+                input=_nft_rules,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding="utf-8", timeout=10, check=False)
+            if _r.returncode != 0:
+                logging.debug("[PATCH-286] nftables: %s", _r.stderr.strip())
+                return
+
+            logging.info("[PATCH-286] nftables: opened ports 80/443 "
+                         "(table inet wp_ssl)")
+
+            # 持久化: 追加到 /etc/nftables.conf
+            # Debian 12 默认 nftables.conf 内容: #!/usr/sbin/nft -f\nflush ruleset
+            # 我们在 flush 之后追加 wp_ssl 表定义, 重启后 flush 先清空再加载
+            _nft_conf = Path("/etc/nftables.conf")
+            if _nft_conf.exists():
+                try:
+                    _existing = _nft_conf.read_text(encoding="utf-8")
+                    if "wp_ssl" not in _existing:
+                        _block = (
+                            "\n# [PATCH-286] WP-SSL-Bootstrap: allow HTTP/HTTPS\n"
+                            "table inet wp_ssl {\n"
+                            "  chain input {\n"
+                            "    type filter hook input priority 10; "
+                            "policy accept;\n"
+                            "    tcp dport { 80, 443 } accept\n"
+                            "  }\n"
+                            "}\n"
+                        )
+                        _nft_conf.write_text(
+                            _existing.rstrip() + "\n" + _block,
+                            encoding="utf-8")
+                        logging.info("[PATCH-286] nftables: persisted to %s",
+                                     _nft_conf)
+                except OSError as _e:
+                    logging.debug("[PATCH-286] nftables persist: %s", _e)
+
+            # 启用 nftables.service: Debian 12/13 默认未启用,
+            # 不启用则重启后 /etc/nftables.conf 不会被加载
+            subprocess.run(
+                ["systemctl", "enable", "nftables"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=10, check=False)
+
+        except Exception as _e:
+            logging.debug("[PATCH-286] nftables setup: %s", _e)
 
     def _open_quic_firewall(self) -> None:
         """[PATCH-167 FIX-7] 为 HTTP/3 QUIC 开放 UDP 443 端口"""
@@ -19288,6 +19633,13 @@ class WPDeployManager:
                 quiet=True,
             )
             self.run_cmd(["firewall-cmd", "--reload"], quiet=True)
+        elif shutil.which("nft"):
+            # [PATCH-286] nftables: 添加 UDP 443 到 wp_ssl 表
+            subprocess.run(
+                ["nft", "add", "rule", "inet", "wp_ssl", "input",
+                 "udp", "dport", "443", "accept"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=5, check=False)
         logging.info(t("info_http3_firewall_udp"))
 
     def _close_quic_firewall(self) -> None:
@@ -22555,10 +22907,7 @@ class WPDeployManager:
                 pass
         # L3: 交互式
         if sys.stdin.isatty():
-            try:
-                import readline  # noqa: F811
-            except ImportError:
-                pass
+            # readline 已在模块级导入 (PATCH-286), 无需局部重复
             for _attempt in range(3):
                 try:
                     _em_in = input(
@@ -31191,6 +31540,9 @@ class WPDeployManager:
                                 _redis_maxmem)
                         else:
                             logging.info(t("info_audit_p2_9_redis_maxmemory_set_to_policy_2"), _redis_maxmem)
+
+                    # [PATCH-286] 委托 RedisManager.harden_conf() 执行安全加固
+                    self.redis.harden_conf()
             except Exception:
                 pass  # 调优失败不阻断
 
@@ -33772,6 +34124,35 @@ class WPDeployManager:
         except Exception as e:
             logging.warning(t("warn_wpcron_inject_fail", e=e))
 
+    def _ensure_wp_hardening_constants(self) -> None:
+        """[PATCH-286] update 路径补注入安全加固常量。
+
+        inject_wp_hardening() 仅在 deploy 新建 wp-config.php 时调用,
+        老站点 update 后缺少 WP_DEBUG=false 等常量。
+        本方法在 update_config() 中调用, 幂等补注入。
+
+        模式参照 _ensure_wp_cron_constant(): 读取 → 注入 → 原子写回。
+        """
+        if self.cfg.dry_run:
+            return
+        _wp_config = self.cfg.webroot_path / "wp-config.php"
+        if not _wp_config.exists():
+            return
+        try:
+            _content = _wp_config.read_text(encoding="utf-8")
+            _new = inject_wp_hardening(
+                _content, skip_ssl=self.cfg.skip_ssl)
+            if _new != _content:
+                if self._safe_write_file(
+                        str(_wp_config), _new, mode=0o440):
+                    logging.info(
+                        "[PATCH-286] wp-config.php hardening "
+                        "constants injected via update")
+        except Exception as _e_286:
+            logging.debug(
+                "[PATCH-286] _ensure_wp_hardening_constants: %s",
+                _e_286)
+
     @staticmethod
     def _extract_timer_params(service_file: Path) -> dict:
         """[V3.2.104] FIX-5: 从已有 systemd service unit 的 ExecStart 中
@@ -34018,6 +34399,11 @@ class WPDeployManager:
             f"TimeoutStopSec=600\n"
             f"StandardOutput=journal\n"
             f"StandardError=journal\n"  # [V2.9.3] 确保续期失败时 journalctl 可查完整输出
+            # [PATCH-286] systemd 沙箱: 限制续期服务的攻击面
+            # 不使用 ProtectSystem/ProtectHome (certbot 需写 /etc/letsencrypt,
+            # 脚本可能在 /root 下), 仅使用安全兼容的指令。
+            f"NoNewPrivileges=true\n"   # 禁止 SUID/SGID 提权
+            f"PrivateTmp=true\n"        # 隔离 /tmp 命名空间 (防止 tmp race)
             f"{_eab_env_line}"  # [AUDIT-FIX BUG-1] EAB EnvironmentFile (0o600)
             f"ExecStart=\"{_sd_escape(str(sys.executable))}\" \"{_sd_escape(str(self.cfg.script_path))}\""  # [V3.2.42] FIX-3: quote  # [V3.2.43] FIX-7: _sd_escape
             f' renew --domain \"{_sd_escape(self.cfg.domain)}\"'
@@ -36871,6 +37257,7 @@ class WPDeployManager:
         self.setup_logrotate()
         self.setup_wp_cron_timer()  # [V3.0.16] P2
         self._ensure_wp_cron_constant()  # [V3.2.0] F4
+        self._ensure_wp_hardening_constants()  # [PATCH-286] update 补注入安全常量
         self.setup_db_optimize_timer()  # [V3.0.16] P11
         # [PATCH-146 P1-3] hook 已合并到 _setup_ssl_renewal_infra
         # (在下方 setup_systemd 块中统一调用)
@@ -40822,7 +41209,8 @@ def _interactive_deploy_flow() -> list:
         if _raw_db:
             _ext_db_host = _raw_db
     except (EOFError, KeyboardInterrupt):
-        pass
+        print()
+        return []
 
     # [V3.2.119] FIX-8: 外置数据库时提示输入 root 密码 (deploy 必需)
     _ext_db_pass = ""
@@ -40839,7 +41227,8 @@ def _interactive_deploy_flow() -> list:
             if _raw_pass:
                 _ext_db_pass = _raw_pass
         except (EOFError, KeyboardInterrupt):
-            pass
+            print()
+            return []
         if not _ext_db_pass:
             print("  " + (t("inline_err_ext_db_password")))
             return []
@@ -40849,13 +41238,15 @@ def _interactive_deploy_flow() -> list:
             if _raw_nossl in ("y", "yes"):
                 _ext_no_db_ssl = True
         except (EOFError, KeyboardInterrupt):
-            pass
+            print()
+            return []
         try:
             _raw_timeout = input("  " + (t("inline_db_wait_timeout_short")) + ": ").strip()
             if _raw_timeout and _raw_timeout.isdigit() and int(_raw_timeout) > 0:
                 _ext_db_timeout = _raw_timeout
         except (EOFError, KeyboardInterrupt):
-            pass
+            print()
+            return []
 
     # ── 2. 环境探测 ───────────────────────────────────────────
     print()
@@ -42418,4 +42809,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # [PATCH-286] 顶层 Ctrl+C 处理: 干净退出, 不打印 Python traceback。
+        # 退出码 130 = 128 + SIGINT(2), 是 Unix 信号退出的标准约定。
+        print("\n")
+        sys.exit(130)

@@ -394,6 +394,38 @@ python3 wp_ssl_bootstrap.py fix-openssl
 
 ---
 
+## 场景十五：安全加固验证 *(V3.2.7 新增)*
+## Scenario 15: Security Hardening Verification *(New in V3.2.7)*
+
+升级到 V3.2.7 后，执行 `update` 即可自动应用全部安全加固：
+After upgrading to V3.2.7, run `update` to apply all security hardening automatically:
+
+```bash
+python3 wp_ssl_bootstrap.py update --domain example.com --email admin@example.com
+```
+
+验证加固生效：
+Verify hardening is applied:
+
+```bash
+# PHP: expose_php 应为 Off
+grep -r 'expose_php' /etc/php*/fpm/php.ini /etc/php.ini 2>/dev/null
+
+# MariaDB: 应包含 bind-address 和 local-infile
+cat /etc/mysql/conf.d/wp-bootstrap-*.cnf 2>/dev/null || cat /etc/my.cnf.d/wp-bootstrap-*.cnf 2>/dev/null
+
+# OS sysctl: 应包含 tcp_syncookies
+cat /etc/sysctl.d/99-wp-ssl-*.conf 2>/dev/null | grep syncookies
+
+# systemd: SSL 续期服务应包含沙箱指令
+grep -E 'NoNewPrivileges|PrivateTmp' /etc/systemd/system/*-ssl.service
+
+# WordPress: wp-config.php 应包含 WP_DEBUG
+grep 'WP_DEBUG' /usr/share/nginx/html/example.com/wp-config.php
+```
+
+---
+
 ## 常用后续操作 / Common Post-Deployment Operations
 
 ```bash
@@ -512,10 +544,11 @@ The following run **unconditionally** during `deploy` without any flags:
 | **PHP-FPM 进程数调优** / PHP-FPM pool tuning | 按内存分级设置 `pm.max_children`，防止小 VPS OOM<br>Sets `pm.max_children` based on RAM tier to prevent OOM kills on small VPS |
 | **MariaDB 缓冲池调优** / MariaDB buffer pool tuning | `innodb_buffer_pool_size` 按内存分级配置<br>Tiers `innodb_buffer_pool_size` according to available RAM |
 | **TCP / BBR 内核调优** / Kernel network tuning | 写入 sysctl drop-in，开启 BBR 拥塞控制（内核 4.9+）<br>Writes sysctl drop-in enabling BBR congestion control (kernel 4.9+) |
+| **防火墙自动配置** / Firewall auto-config *(V3.2.7 新增 nftables / nftables added in V3.2.7)* | 自动检测并配置 ufw（Ubuntu）/ firewalld（EL）/ nftables（Debian 12/13）。开放 80/443 TCP 并持久化。nftables 使用独立 `inet wp_ssl` 表（policy accept，不锁 SSH），自动 `systemctl enable nftables`。<br>Auto-detects and configures ufw (Ubuntu) / firewalld (EL) / nftables (Debian 12/13). Opens TCP 80/443 with persistence. nftables uses dedicated `inet wp_ssl` table (policy accept, won't lock SSH) with `systemctl enable nftables`. |
 | **Fail2Ban** | 自动配置 WordPress 暴力破解防护，封禁时间 24h + 递增封禁<br>Configures WordPress brute-force protection with 24h ban duration and progressive escalation |
 | **systemd 续期定时器** / Certificate renewal timer | 定时器频率随证书寿命自适应：标准 90 天证书每日检查；LE 2027 年 47 天证书每 8 小时；2028 年 6 天证书每 4 小时。续期成功后自动检测寿命变化并热更新 timer。<br>Timer frequency auto-adapts to certificate lifetime: daily for standard 90-day certs; every 8h for LE 2027 47-day certs; every 4h for 2028 6-day certs. Auto-detects lifetime changes after renewal and hot-updates the timer. |
 | **续期失败兜底通知** / Renewal failure fallback *(V3.2.6 新增 / New in V3.2.6)* | 未配置 `--notify-webhook` 时，自动安装 systemd OnFailure 服务：续期失败写 journal（CRIT）+ syslog + 尝试 `mail` 发邮件给 root。确保证书到期风险永不静默。<br>When no `--notify-webhook` is configured, auto-installs a systemd OnFailure service: renewal failures logged to journal (CRIT) + syslog + email attempted via `mail(1)` to root. Ensures certificate expiry risk is never silent. |
-| **自愈引擎** / Self-healing engine *(V3.2.6 新增 / New in V3.2.6)* | 14 种常见故障自动诊断修复：缺失 logrotate/curl 自动安装、DB 超时自动重启、`nginx -t` 错误自动修复（失效 include / 重复 default_server）、文件删除失败自动清除 immutable 位重试、PHP-FPM/Redis 故障自动诊断（配置测试 + journal 检查）。<br>14 common failure scenarios auto-diagnosed and repaired: missing logrotate/curl auto-installed, DB timeout auto-restarted, `nginx -t` errors auto-fixed (stale includes / duplicate default_server), file deletion retried with `chattr -i`, PHP-FPM/Redis failures auto-diagnosed via config test and journal inspection. |
+| **自愈引擎** / Self-healing engine *(V3.2.6 新增 / New in V3.2.6)* | 15 种常见故障自动诊断修复：缺失 logrotate/curl 自动安装、DB 超时自动重启、`nginx -t` 错误自动修复（失效 include / 重复 default_server / server_names_hash_bucket_size）、文件删除失败自动清除 immutable 位重试、PHP-FPM/Redis 故障自动诊断（配置测试 + journal 检查）。<br>15 common failure scenarios auto-diagnosed and repaired: missing logrotate/curl auto-installed, DB timeout auto-restarted, `nginx -t` errors auto-fixed (stale includes / duplicate default_server / server_names_hash_bucket_size), file deletion retried with `chattr -i`, PHP-FPM/Redis failures auto-diagnosed via config test and journal inspection. |
 | **组件生命周期管理** / Component lifecycle *(V3.2.6 新增 / New in V3.2.6)* | Certbot: snap 迁移 + pip venv 兜底（EFF 官方 6 步流程）；Redis/Valkey: 版本感知升级 + EL10 Valkey 自动切换；WP-CLI: 版本检测 + 自动更新 + SHA-512 校验；fail2ban: 版本探测 + 0.11 以下旧版兼容。<br>Certbot: snap migration + pip venv fallback (EFF official 6-step); Redis/Valkey: version-aware upgrades + EL10 Valkey auto-switch; WP-CLI: version detection + auto-update + SHA-512 verification; fail2ban: version probing + legacy compat below 0.11. |
 | **WP-Cron 定时器** / WP-Cron systemd timer | 15 分钟 systemd timer 替代 HTTP 触发，消除每次请求触发 wp-cron 的性能开销<br>15-minute systemd timer replaces HTTP-triggered wp-cron, eliminating per-request overhead |
 | **mysqlcheck 周度优化** / Weekly DB optimize | 每周日 03:00 自动执行碎片回收（外置数据库时跳过）<br>Runs `mysqlcheck --optimize` every Sunday at 03:00; skipped for external databases |
@@ -525,3 +558,4 @@ The following run **unconditionally** during `deploy` without any flags:
 | **OS 自动安全更新** / OS auto security updates | Debian/Ubuntu: unattended-upgrades；RHEL 系: dnf-automatic / yum-cron<br>Debian/Ubuntu: unattended-upgrades; RHEL: dnf-automatic / yum-cron |
 | **操作前自动备份** / Pre-operation backup | `enable-ssl` / `update` / `restore` 执行前自动轻量备份（DB + Nginx 配置），可通过 `--no-pre-backup` 跳过<br>Lightweight auto-backup (DB + Nginx config) before `enable-ssl` / `update` / `restore`; skip with `--no-pre-backup` |
 | **ECC 证书** / ECDSA certificates | 优先使用 ECDSA P-256 密钥签发（TLS 握手更快），certbot 不支持时自动降级 RSA<br>Prefers ECDSA P-256 key type (faster TLS handshake); auto-falls back to RSA if unsupported |
+| **全组件安全加固** / Full-stack security hardening *(V3.2.7 新增 / New in V3.2.7)* | 对照 OWASP / CIS Benchmark / 官方文档，55 项安全检查覆盖 6 个组件。PHP: expose_php / display_errors / disable_functions / open_basedir / session cookie 安全 / allow_url_include。MariaDB: bind-address / local-infile / skip-symbolic-links / secure-file-priv / skip-show-database。Redis: bind 本地 / rename-command / 禁用 THP。OS sysctl: tcp_syncookies / rp_filter / accept_redirects / protected_hardlinks。systemd: NoNewPrivileges / PrivateTmp。WordPress: WP_DEBUG=false。`update` 自动生效。<br>55 security checks across 6 components per OWASP / CIS Benchmark / official docs. PHP: expose_php / display_errors / disable_functions / open_basedir / session cookie / allow_url_include. MariaDB: bind-address / local-infile / skip-symbolic-links / secure-file-priv / skip-show-database. Redis: bind / rename-command / disable THP. OS sysctl: tcp_syncookies / rp_filter / accept_redirects / protected_hardlinks. systemd: NoNewPrivileges / PrivateTmp. WordPress: WP_DEBUG=false. Applied automatically via `update`. |
