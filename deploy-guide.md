@@ -1,5 +1,8 @@
-# WP-SSL-Bootstrap V3.2.6 — 全新建站参数指南
-# WP-SSL-Bootstrap V3.2.6 — New Site Deployment Guide
+# WP-SSL-Bootstrap V3.2.8 — 全新建站参数指南
+# WP-SSL-Bootstrap V3.2.8 — New Site Deployment Guide
+
+> **当前 build**: `3.2.365` (2026-04). 生产环境请使用此 build 或 build 358; **跳过 build 359-364**（架构清理中间态, build 364 有启动 NameError, 已在 365 修复）。  
+> **Current build**: `3.2.365` (2026-04). Production should use this or build 358; **skip builds 359-364** (architectural cleanup intermediate states; build 364 has startup NameError, fixed in 365).
 
 ---
 
@@ -501,6 +504,11 @@ python3 wp_ssl_bootstrap.py self-update
 | `--wp-auto-install` | 开关 / flag | 关 / off | `deploy` / `update` / `enable-ssl` / `restore` |
 | `--persist-root-pwd` | 开关 / flag | 关 / off | `deploy` / `enable-ssl` / `backup` / `restore` |
 | `--skip-ssl` | 开关 / flag | 关 / off | `deploy` / `restore` |
+| `--local-test` | 开关 / flag | 关 / off | `deploy` / `enable-ssl` / `status` |
+| `--ech` | 开关 / flag | 关 / off（需 OpenSSL 4.0+）| `deploy` / `update` / `enable-ssl` |
+| `--cf-api-token` | 字符串 / string | `$WP_CF_API_TOKEN` | `deploy` / `update` / `enable-ssl`（配合 `--ech`）|
+| `--mptcp` / `--no-mptcp` | 开关 / flag | auto-detect | `deploy` / `update` / `enable-ssl` |
+| `--ocsp-stapling` / `--no-ocsp-stapling` | 开关 / flag | auto-decide | `deploy` / `update` / `enable-ssl` |
 | `--allow-xmlrpc` | 开关 / flag | 关（封锁）/ off (blocked) | `deploy` / `update` / `enable-ssl` / `restore` |
 | `--php-version` | `X.Y` | 自动升级到 8.4（已满足 ≥8.3 时跳过）/ auto-upgrade to 8.4 (skipped if ≥8.3) | `deploy` / `update` / `enable-ssl` / `restore` |
 | `--db-host` | 字符串 / string | `localhost` | 全部 / all |
@@ -559,3 +567,36 @@ The following run **unconditionally** during `deploy` without any flags:
 | **操作前自动备份** / Pre-operation backup | `enable-ssl` / `update` / `restore` 执行前自动轻量备份（DB + Nginx 配置），可通过 `--no-pre-backup` 跳过<br>Lightweight auto-backup (DB + Nginx config) before `enable-ssl` / `update` / `restore`; skip with `--no-pre-backup` |
 | **ECC 证书** / ECDSA certificates | 优先使用 ECDSA P-256 密钥签发（TLS 握手更快），certbot 不支持时自动降级 RSA<br>Prefers ECDSA P-256 key type (faster TLS handshake); auto-falls back to RSA if unsupported |
 | **全组件安全加固** / Full-stack security hardening *(V3.2.7 新增 / New in V3.2.7)* | 对照 OWASP / CIS Benchmark / 官方文档，55 项安全检查覆盖 6 个组件。PHP: expose_php / display_errors / disable_functions / open_basedir / session cookie 安全 / allow_url_include。MariaDB: bind-address / local-infile / skip-symbolic-links / secure-file-priv / skip-show-database。Redis: bind 本地 / rename-command / 禁用 THP。OS sysctl: tcp_syncookies / rp_filter / accept_redirects / protected_hardlinks。systemd: NoNewPrivileges / PrivateTmp。WordPress: WP_DEBUG=false。`update` 自动生效。<br>55 security checks across 6 components per OWASP / CIS Benchmark / official docs. PHP: expose_php / display_errors / disable_functions / open_basedir / session cookie / allow_url_include. MariaDB: bind-address / local-infile / skip-symbolic-links / secure-file-priv / skip-show-database. Redis: bind / rename-command / disable THP. OS sysctl: tcp_syncookies / rp_filter / accept_redirects / protected_hardlinks. systemd: NoNewPrivileges / PrivateTmp. WordPress: WP_DEBUG=false. Applied automatically via `update`. |
+| **PHP-FPM systemd LimitNOFILE drop-in** *(V3.2.8 新增 / New in V3.2.8)* | `update` 前通过 `systemctl show <fpm-svc> -p LimitNOFILE --value` 探测当前软限；若 `<65536`（openEuler 默认 1024 / EL8 默认 4096 等低值平台），写入 systemd drop-in `LimitNOFILE=65536` 修复 php-fpm worker `setrlimit(EPERM)` 导致的 SIGSEGV 全站 502；若 `≥65536`（AlmaLinux 10/Rocky 9/Ubuntu 22-24/Debian 12-13 系 systemd 默认 524288），跳过 drop-in 写入和 php-fpm 重启，保证成熟平台配置零变动。<br>Before `update`, `systemctl show <fpm-svc> -p LimitNOFILE --value` probes current soft limit; if `<65536` (openEuler default 1024 / EL8 default 4096), writes systemd drop-in `LimitNOFILE=65536` to fix php-fpm worker `setrlimit(EPERM)` → SIGSEGV full-site 502; if `≥65536` (AlmaLinux 10 / Rocky 9 / Ubuntu 22-24 / Debian 12-13 systemd default 524288), skips drop-in write and php-fpm restart — zero config change on mature platforms. |
+| **Redis timeout 直接写 conf** *(V3.2.8 新增 / New in V3.2.8)* | `CONFIG REWRITE` 在 openEuler `/etc/redis/redis.conf` 权限 0640 仅 redis 用户可写的场景下**静默失败**（权限错误不向 `redis-cli` 返回）。`harden_conf()` 改为以 root 身份直接写 `timeout 300` 到 conf 文件（原子写入 + 0640 权限）+ 重启 redis。v3.2.358 加入 before/after 内容对比守卫，仅真实变化才触发重启，幂等更可靠。<br>`CONFIG REWRITE` silently fails when openEuler `/etc/redis/redis.conf` is 0640 redis-only-writable (perm errors don't surface to `redis-cli`). `harden_conf()` changed to root-writing `timeout 300` directly (atomic + 0640) + restart. v3.2.358 added before/after content diff guard: only real changes trigger restart; idempotency strengthened. |
+| **nginx 1.30 指令运行时 probe** *(V3.2.8 新增 / New in V3.2.8)* | nginx 1.29.8 新增 `max_headers`（HTTP 头数量上限）、1.29.3 新增 `add_header_inherit`（头部继承）。`NginxManager._nginx_supports_max_headers()` / `_nginx_supports_add_header_inherit()` 解析 `nginx -v` 输出，精确版本门条件发出这两条指令。openEuler 24.03 自带 nginx 1.24.0、Ubuntu 22.04 自带 1.18.0 等旧版本平台上不会让 `nginx -t` 失败。<br>nginx 1.29.8 added `max_headers`, 1.29.3 added `add_header_inherit`. `NginxManager._nginx_supports_max_headers()` / `_nginx_supports_add_header_inherit()` parse `nginx -v` and conditionally emit these directives per precise version gates. Never fails `nginx -t` on old-version platforms (openEuler 24.03 nginx 1.24.0 / Ubuntu 22.04 nginx 1.18.0). |
+| **国产 EL 系兼容** *(V3.2.8 新增 / New in V3.2.8)* | openEuler 24.03 LTS SP3 / 银河麒麟 V11 / UOS / Anolis / OpenCloudOS 完整支持。`_el_ids` 扩充 `openeuler` / `kylin`；`_is_openeuler_like()` 辅助函数 + 4 处外部仓库守卫（Remi / nginx.org / MariaDB.org / Valkey.io 均跳过添加，使用发行版自带软件）。<br>Full support for openEuler 24.03 LTS SP3 / Kylin V11 / UOS / Anolis / OpenCloudOS. `_el_ids` expanded with `openeuler` / `kylin`; `_is_openeuler_like()` helper + 4 external-repo guards (Remi / nginx.org / MariaDB.org / Valkey.io skipped, use distro-bundled software). |
+| **Ubuntu 26.04 LTS 兼容准备** *(V3.2.8 新增 / New in V3.2.8)* | nginx.org 与 Sury PHP PPA 当前未发布 `resolute` codename。`deploy` 时 HTTP 探测 `dists/resolute/` 404 后自动回退：nginx.org → `questing`，Sury PPA → sources 改写为 `noble`。等上游同步后脚本零配置切换。**建议生产部署等 26.04.1 点版本（2026-08）发布后**。<br>Neither nginx.org nor Sury PPA has published `resolute` yet. `deploy` HTTP-probes `dists/resolute/`; on 404 falls back: nginx.org → `questing`, Sury PPA → sources rewritten to `noble`. Zero-config switch when upstream catches up. **Production deployment recommended after 26.04.1 point release (2026-08)**. |
+| **fail2ban 安装诊断增强** *(V3.2.8 新增 / New in V3.2.8)* | fail2ban 安装失败时捕获 stderr（原 `quiet=True` 吞错），`logging.error` 暴露根因。EL 分支 dnf / Debian-Ubuntu 分支 apt 均预装 `python3-setuptools` + `python3-systemd` 防御 Python 3.12 移除 `distutils` 后 fail2ban 1.0.2-3 前旧版本的兼容问题。fail2ban 未装场景 `shutil.which("fail2ban-client")` 优雅跳过，不再报 `[Errno 2]`。<br>fail2ban install failure captures stderr (original `quiet=True` swallowed errors); `logging.error` exposes root cause. Both EL (dnf) and Debian/Ubuntu (apt) branches pre-install `python3-setuptools` + `python3-systemd` defending against Python 3.12 distutils removal breaking fail2ban 1.0.2-3 and earlier. `shutil.which("fail2ban-client")` graceful skip when not installed. |
+| **本地测试模式** *(V3.2.8 新增 / New in V3.2.8)* | `--local-test` 开关：无公网/无 DNS 环境用 2048-bit RSA 自签证书（`subjectAltName=DNS:<domain>,DNS:www.<domain>`，7 天有效期）验证部署链路，不触发 certbot、不调用 Let's Encrypt。~15 处模式隔离守卫确保生产证书路径不被污染。覆盖 `deploy` / `enable-ssl` / `status` 三个子命令。<br>`--local-test` flag: validates deployment with 2048-bit RSA self-signed cert (`subjectAltName=DNS:<domain>,DNS:www.<domain>`, 7-day validity) in no-public-DNS environments; never triggers certbot or calls Let's Encrypt. ~15 mode-isolation guards prevent contamination of production cert paths. Covers `deploy` / `enable-ssl` / `status`. |
+
+---
+
+## 🚀 部署后性能预期 / Post-Deployment Performance Expectations
+
+V3.2.365 生产环境实测 `admin-ajax.php`（WordPress 最重的 endpoint）参考值：  
+V3.2.365 production reference metrics for `admin-ajax.php` (WordPress's heaviest endpoint):
+
+| 指标 / Metric | 优秀 / Excellent | 可接受 / Acceptable | 需排查 / Investigate |
+|-----|-----|------|------|
+| **TTFB** (服务器响应 / server response) | **< 100 ms** | 100-200 ms | > 500 ms |
+| 连接建立 / Connection | < 30 ms | 30-100 ms | > 100 ms |
+| 端到端 / End-to-end | **< 150 ms** | 150-300 ms | > 500 ms |
+
+**V3.2.365 实测 / Measured**: TTFB **73.78 ms**, 端到端 **88.00 ms** — 落在"优秀"区间。此结果验证默认配置下 OPcache JIT + Redis 对象缓存 + MariaDB InnoDB tuning + PHP-FPM pool auto-sizing 协同工作正常。  
+**Measured**: TTFB **73.78 ms**, end-to-end **88.00 ms** — in "Excellent" range. Validates that with default config, OPcache JIT + Redis object cache + MariaDB InnoDB tuning + auto-sized PHP-FPM pool cooperate as designed.
+
+**异常 TTFB 排查清单 / Abnormal TTFB troubleshooting**:
+
+1. **TTFB > 500 ms**: 检查慢插件（`wp plugin list --status=active`）、检查 MySQL 慢查询日志（`/var/log/mysql/slow.log`）、用 Query Monitor 插件定位瓶颈 / Check slow plugins, MySQL slow-query log, use Query Monitor plugin
+2. **TTFB 首次 150ms+ 后续 50ms**: OPcache 预热中，属正常 cold-start。可用 `opcache_preload` 提升，或接受首次成本 / OPcache warming up, normal cold-start; can use `opcache_preload` to improve, or accept first-request cost
+3. **TTFB 偶发尖峰**: 查 `/var/log/nginx/error.log`（是否有 upstream timeout）、`journalctl -u php8.5-fpm -n 100`（slow log）、Redis `CLIENT LIST`（连接饱和） / Check nginx error log for upstream timeout, php-fpm slow log, Redis connection saturation
+
+如需进一步优化，考虑启用 `--cache redis`（Redis 全页缓存，通常把 TTFB 压到 < 20ms）或 `--http3`（QUIC 降低 RTT）。  
+For further optimization, consider `--cache redis` (Redis full-page cache, typically drops TTFB to < 20ms) or `--http3` (QUIC reduces RTT).
+

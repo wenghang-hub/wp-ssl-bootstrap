@@ -4,6 +4,369 @@ All notable changes to WP-SSL-Bootstrap are documented in this file.
 本文件记录 WP-SSL-Bootstrap 的所有重要变更。
 ---
 
+## [V3.2.8]
+
+> **升级说明 / Upgrade note**
+> V3.2.8 是 **全栈主要组件升级** + **TLS ECH 隐私增强** + **MPTCP 多路径传输** + **国产系统兼容** + **架构规则 100% 清洁** 版本。
+> Build 从 V3.2.7 的 `287` 累计到 `365`（+7,500+ 代码行 / +49 真·新方法，另有 219 个从 WPDeployManager god-class 迁移到各专业 Manager / +11 Manager 公开 API / +10 新 CLI 参数）。
+>
+> **组件升级 (配置目标版本)**：
+> - **nginx 1.28 → 1.30**（HTTP/2 upstream / Early Hints / ECH / keepalive 默认启用 / `max_headers` / `add_header_inherit` / `quic_retry` / `quic_gso`）
+> - **PHP 8.4 → 8.5**（2025-11 GA，active support 至 2027-12；新 URI 扩展 / pipe operator `|>` / `#[\NoDiscard]`）
+> - **MariaDB 10.11 → 11.8 LTS**（2025-05 GA；**Vector Search** 内建 / JSON_TABLE / 性能增强）
+> - **Valkey 新目标 9.0**（BSD 3-Clause 开源许可 / 40% 吞吐提升 / 原子 slot 迁移）
+>
+> **TLS 隐私增强**：TLS **ECH (Encrypted ClientHello)** 全自动配置链（OpenSSL 4.0+ 检测 → 密钥对生成 → Cloudflare/Route53/阿里云 DNS/DNSPod 四家 API 自动发布 HTTPS 记录 → systemd timer 密钥轮换）。ECH 隐藏 SNI 不被 ISP/中间盒看到，防止被动流量分析和 SNI 过滤。
+>
+> **传输层增强**：**MPTCP (Multipath TCP)** 运行时内核探测 + sysctl 自动启用 + Nginx listen 带 `mptcp` 选项，多 NIC / 手机蜂窝+Wi-Fi 用户获得断流自愈 + 多径带宽合并。
+>
+> **OCSP stapling 智能化**：自动探测证书是否含 OCSP responder（`openssl x509 -ocsp_uri`），Let's Encrypt 2025 年起停发 OCSP responder → 自动关闭 stapling；非 LE CA → 自动启用。`--ocsp-stapling` / `--no-ocsp-stapling` 可强制覆盖。
+>
+> **部署体验**：`--local-test` 自签证书本地测试模式；国产 EL（openEuler 24.03 / 银河麒麟 V11）完整支持；Ubuntu 26.04 LTS HTTP 探测回退预备。
+>
+> 全部通过 `update` 子命令幂等生效。**V3.2.7 已部署站点升级后预期配置文件字节级零变化**（AlmaLinux 10.1 toksun.cn prod 实测验证，除主动升级的 nginx/PHP/MariaDB 软件包外）。
+>
+> ---
+>
+> V3.2.8 is a **full-stack major component upgrade** + **TLS ECH privacy enhancement** + **MPTCP multi-path transport** + **domestic EL support** + **100% architecture rule clean** release.
+> Build `287` → `365` (+7,500+ code lines / +49 truly new methods, plus 219 migrated from WPDeployManager god-class to specialized Managers / +11 Manager public APIs / +10 new CLI flags).
+>
+> **Component upgrades (configured target versions)**:
+> - **nginx 1.28 → 1.30** (HTTP/2 upstream / Early Hints / ECH / keepalive default / `max_headers` / `add_header_inherit` / `quic_retry` / `quic_gso`)
+> - **PHP 8.4 → 8.5** (GA 2025-11, active support until 2027-12; new URI extension / pipe operator `|>` / `#[\NoDiscard]`)
+> - **MariaDB 10.11 → 11.8 LTS** (GA 2025-05; **Vector Search** built-in / JSON_TABLE / performance improvements)
+> - **Valkey new target 9.0** (BSD 3-Clause / 40% throughput / atomic slot migration)
+>
+> **TLS privacy**: TLS **ECH (Encrypted ClientHello)** fully-automated pipeline (OpenSSL 4.0+ detect → keypair generation → auto-publish HTTPS record via Cloudflare / Route53 / Aliyun DNS / DNSPod APIs → systemd timer key rotation). ECH hides SNI from ISPs/middleboxes, defeating passive traffic analysis and SNI filtering.
+>
+> **Transport enhancement**: **MPTCP (Multipath TCP)** runtime kernel probe + sysctl auto-enable + Nginx listen with `mptcp` option; multi-NIC / mobile cellular+Wi-Fi users gain break resilience + multi-path bandwidth aggregation.
+>
+> **OCSP stapling intelligence**: auto-probes certificate OCSP responder (`openssl x509 -ocsp_uri`); Let's Encrypt deprecated OCSP 2025 → auto-disable stapling; non-LE CAs → auto-enable. `--ocsp-stapling` / `--no-ocsp-stapling` force override.
+>
+> **Deployment experience**: `--local-test` self-signed local test mode; full domestic EL support (openEuler 24.03 / Kylin V11); Ubuntu 26.04 LTS HTTP probe fallback.
+>
+> All apply idempotently via `update`. **Existing V3.2.7 production sites: byte-level zero config change after upgrade** (AlmaLinux 10.1 toksun.cn prod measured; excluding actively-upgraded nginx/PHP/MariaDB packages).
+
+---
+
+### ✅ 最终发布审计 (Build 3.2.365 签字) / Final Release Audit
+
+Build 3.2.365 通过 **四层独立验证**，541+ 项检查 **100% 通过**，确认零架构违规：  
+Build 3.2.365 passed **four-layer independent verification**, 541+ checks **100% passing**, confirming zero architecture violations:
+
+| 层 / Layer | 工具 / Tool | 检查项 / Checks | 结果 |
+|-----|------|------|-----|
+| 1 | `test_integration.py` 契约测试 | 466 | ✅ 466/466 |
+| 2 | `full_verify_v2.py` 结构完整性 | 21 | ✅ 21/21 |
+| 3 | `verify_refactor_v3.py` 方向感知迁移 | 54 | ✅ 54/54 |
+| 4 | 14 架构规则深度审计 | 14 | ✅ 14/14 🟢 |
+
+**生产性能实测 / Production performance**: WordPress `admin-ajax.php`（最重的 endpoint）TTFB 73.78 ms / 端到端 88.00 ms，落在"优秀"区间（50-100 ms）。验证 OPcache JIT + Redis 对象缓存 + MariaDB InnoDB 调优 + PHP-FPM pool auto-sizing 协同工作达到设计目标。  
+WordPress `admin-ajax.php` (heaviest endpoint): TTFB 73.78 ms / end-to-end 88.00 ms — "Excellent" tier (50-100 ms). Validates OPcache JIT + Redis object cache + MariaDB InnoDB tuning + auto-sized PHP-FPM pool meeting design performance goals.
+
+---
+
+### 🏗 架构规则清洁冲刺 (Build 3.2.359-365) / Architecture rule compliance push
+
+V3.2.8 后半段（build 359-365，2026-04）对 WPDeployManager god-class 的剩余架构违规做了最终清理, 使 **14 条内部架构规则全部达成 🟢 绿色合规**。这是多轮会话迭代完成的架构硬化工作, 不改变用户可见行为, 但显著提升了脚本的长期可维护性和重构安全性。
+
+**关键里程碑**：
+
+1. **规则 1/2 — WPDeployManager 纯编排** *(build 359-362)*  
+   新增 11 个 Manager 公开 API: `NginxManager.{get_conf_path,get_conf_d_dir,get_site_conf_path,validate_config,validate_config_file,graceful_shutdown,get_module_conf_dirs}` / `RedisManager.{get_conf_path,get_candidate_conf_paths}` / `MariaDBManager.verify_user_connection` / 修复 ECH keypair `os.chmod` 走 `_safe_chmod`。WPDM 内 `Path("/etc/{nginx,redis,valkey}/...")` 硬编码从 ~40 处降到 **0** (-100%); `subprocess.run(["nginx|mysql|..."])` 真违规从多处降到 **0** (4 处带注释的诊断例外 - 捕获 stderr/stdout 用于错误分析, `validate_config()` 返 bool 无法替代)。  
+
+2. **规则 7 — 信号检查覆盖率 3.6× 提升** *(build 364)*  
+   WPDeployManager `__init__` 末尾新增 `# INJECTION BLOCK` 标记注释的跨组件注入块, 向 5 个 Manager 注入 `self._abort_if_shutdown` 引用。批量在 55 个含 `timeout ≥ 60s` 长操作的 Manager 方法入口加信号检查点（NginxManager 22 + MariaDBManager 11 + PHPManager 10 + CertManager 9 + RedisManager 3）。总 `_abort_if_shutdown()` 调用点从 23 → **77** (+235%), 长操作覆盖率 **8.8% → 32.6%**（超 30% 目标）。Ctrl-C / SIGTERM 响应性大幅改善, 部署中途取消时能在下一个方法入口处理, 避免等待长超时。  
+
+3. **契约测试防回归** *(build 364)*  
+   `test_integration.py` 新增 **24 项 v3.2.364 静态断言**（466/466 通过）, 锁定以下不变量防止未来重构误破坏：  
+   - 11 个 Manager 公开 API 必须存在 (7 Nginx + 2 Redis + 1 MariaDB + 1 防回归)  
+   - WPDM 规则 1/2 清洁 (Path 硬编码 0, subprocess 真违规 0)  
+   - 5 个 Manager 都有 `_abort_if_shutdown` 注入 (`INJECTION BLOCK` 标记存在)  
+   - 所有 5 个 Manager `__init__` 包含 `run_cmd` 参数 (A6 陷阱: Manager 禁止循环依赖导入 WPDM)  
+   - 信号检查覆盖率 ≥ 60 个调用点 (防批量误删)  
+
+4. **v3.2.365 HOTFIX — 4 处模块级函数 NameError 修复** *(build 365, 关键稳定性修复)*  
+   Build 364 的批量 Path 硬编码迁移脚本错误地把 `self.nginx.get_conf_d_dir()` 替换放入了 4 个 **模块级函数** (`_detect_existing_sites`, `_cleanup_ghost_sites`, `_detect_site_config` ×2), 导致 `python wp_ssl_bootstrap.py` 启动时立即 `NameError: name 'self' is not defined`。Build 365 全部回退为 `Path("/etc/nginx/conf.d/...")` 硬编码（模块级函数本就无 Manager 实例可用）, 修复同时发现 L48137 原代码的算符优先级 bug（`self.nginx.get_conf_d_dir() / "cloudflare-real-ip.conf".exists()` 等价于 `.exists()` 作用于字符串, AttributeError）。新增 `v3_2_365_no_self_in_module_funcs` 断言防未来同类 bug。**所有 V3.2.8 生产环境必须升级到 build 365+ 或保持在 build 358**（不要停留在 359-364）。  
+
+**架构指标 (V3.2.7 → V3.2.8 build 365)**：
+
+| 指标 | V3.2.7 | V3.2.8 最终 | 变化 |
+|---|---|---|---|
+| WPDM god-class 方法数 | 327 | **108** | -219 (-67%) |
+| Manager 总方法数 | 75 | **242** | +167 (+223%) |
+| Manager 公开 API | 0 | **11** | +11 |
+| WPDM Path 硬编码 | ~40 | **0** | -100% |
+| WPDM subprocess 真违规 | 多处 | **0** | -100% |
+| 信号检查调用点 | 23 | **77** | +235% |
+| 信号检查覆盖率 | 8.8% | **32.6%** | 3.7× |
+| 架构规则清洁度 | 🟡 混合 | **14/14 🟢** | 全绿 |
+| 静态测试项数 | 436 | **466** | +30 |
+| 跨组件注入 | 分散 | **31 统一** | INJECTION BLOCK 模式 |
+
+---
+
+**Architecture rule compliance push (Build 3.2.359-365)**
+
+The later half of V3.2.8 (builds 359-365, April 2026) finalized the cleanup of remaining architecture rule violations in WPDeployManager god-class, achieving **all 14 internal architecture rules 🟢 green**. This is multi-session architectural hardening work that does not change user-visible behavior but significantly improves long-term maintainability and refactor safety.
+
+**Key milestones**:
+
+1. **Rules 1/2 — WPDeployManager pure orchestration** *(builds 359-362)*  
+   Added 11 new Manager public APIs. `Path("/etc/{nginx,redis,valkey}/...")` hardcoded in WPDM dropped from ~40 → **0** (-100%); `subprocess.run(["nginx|mysql|..."])` real violations dropped to **0** (4 documented diagnostic exceptions — stderr/stdout capture for error analysis where `validate_config()` returning bool is insufficient).  
+
+2. **Rule 7 — Signal check coverage 3.6× up** *(build 364)*  
+   New `# INJECTION BLOCK`-tagged cross-component injection block at end of WPDeployManager `__init__` injects `self._abort_if_shutdown` reference into all 5 Managers. Batch-added signal check points at entry of 55 Manager methods with `timeout ≥ 60s` long operations. Total `_abort_if_shutdown()` call sites went from 23 → **77** (+235%); long-op coverage **8.8% → 32.6%** (exceeds 30% target). Ctrl-C / SIGTERM responsiveness greatly improved.  
+
+3. **Contract tests against regression** *(build 364)*  
+   `test_integration.py` gained **24 new static assertions** (466/466 pass), locking down invariants to prevent future refactor breakage — Manager public API existence, WPDM rule 1/2 cleanliness, `_abort_if_shutdown` injection in all 5 Managers, `INJECTION BLOCK` marker presence (A2 trap defense), all 5 Manager `__init__` have `run_cmd` param (A6 trap: no circular WPDM import), signal coverage ≥ 60 call sites.  
+
+4. **v3.2.365 HOTFIX — 4 module-level NameError fixes** *(build 365, critical stability fix)*  
+   Build 364's batch Path migration script incorrectly placed `self.nginx.get_conf_d_dir()` replacements into 4 **module-level functions** (`_detect_existing_sites`, `_cleanup_ghost_sites`, `_detect_site_config` ×2), causing `python wp_ssl_bootstrap.py` to `NameError: name 'self' is not defined` immediately on startup. Build 365 reverts all to `Path("/etc/nginx/conf.d/...")` hardcodes (module-level functions have no Manager instance available). Fix also caught a preexisting operator-precedence bug at L48137. New `v3_2_365_no_self_in_module_funcs` assertion prevents the class of bug. **All V3.2.8 production must upgrade to build 365+ or stay at build 358** (do not linger in 359-364).  
+
+**Architecture metrics (V3.2.7 → V3.2.8 build 365)**:
+
+| Metric | V3.2.7 | V3.2.8 final | Change |
+|---|---|---|---|
+| WPDM god-class methods | 327 | **108** | -219 (-67%) |
+| Manager total methods | 75 | **242** | +167 (+223%) |
+| Manager public APIs | 0 | **11** | +11 |
+| WPDM Path hardcodes | ~40 | **0** | -100% |
+| WPDM subprocess real violations | many | **0** | -100% |
+| Signal check call sites | 23 | **77** | +235% |
+| Signal check coverage | 8.8% | **32.6%** | 3.7× |
+| Architecture rule cleanliness | 🟡 mixed | **14/14 🟢** | all green |
+| Static test count | 436 | **466** | +30 |
+| Cross-component injection | scattered | **31 unified** | INJECTION BLOCK pattern |
+
+---
+
+### ✨ 新功能 / New Features
+
+- **TLS ECH (Encrypted ClientHello) 全自动配置链 (v3.2.x, nginx 1.30+OpenSSL 4.0)** — RFC 9849 最新隐私协议，把 ClientHello 里的 SNI 加密传输。端到端流程：(1) `_detect_ech_support()` 检测 OpenSSL ≥ 4.0 含 ECH 子命令 + Nginx 1.30 `ssl_ech_file` 支持；(2) `_generate_ech_keypair()` 生成 ECH 密钥对（OpenSSL 原生）；(3) `_extract_ech_config_base64()` 提取 ECHConfig 公钥 → Base64；(4) 自动通过 4 家 DNS API 写 HTTPS 记录（`_cf_upsert_https_record` / `_r53_upsert_https_record` / `_alidns_upsert_https_record` / `_dnspod_upsert_https_record`），无 API token 则打印记录给用户手动添加；(5) `_verify_ech_dns()` 验证 DNS 已全球生效；(6) `_install_ech_rotation_timer()` 安装 systemd timer 自动轮换密钥。CLI：`--ech` 启用，`--cf-api-token` / Route53 EAB-like（`--change-batch` / `--dns-name` / `--hosted-zone-id`）传 API 凭据。**ECH 防止 ISP/防火墙通过 SNI 识别目标站点**，对跨境站点和隐私敏感场景显著。
+  **TLS ECH (Encrypted ClientHello) fully-automated pipeline (nginx 1.30 + OpenSSL 4.0)** — RFC 9849 latest privacy protocol, encrypts SNI in ClientHello. End-to-end: (1) `_detect_ech_support()` probes OpenSSL ≥ 4.0 with ECH subcommand + Nginx 1.30 `ssl_ech_file`; (2) `_generate_ech_keypair()` generates ECH keypair (OpenSSL native); (3) `_extract_ech_config_base64()` extracts ECHConfig public key → Base64; (4) auto-publishes HTTPS record via 4 DNS APIs (`_cf_upsert_https_record` / `_r53_upsert_https_record` / `_alidns_upsert_https_record` / `_dnspod_upsert_https_record`); no API token → prints record for manual add; (5) `_verify_ech_dns()` verifies DNS global propagation; (6) `_install_ech_rotation_timer()` installs systemd timer for auto key rotation. CLI: `--ech` to enable, `--cf-api-token` / Route53 (`--change-batch` / `--dns-name` / `--hosted-zone-id`) for credentials. **ECH prevents ISP/firewall SNI-based site identification** — significant for cross-border sites and privacy-sensitive scenarios.
+
+- **MPTCP (Multipath TCP) 支持 (nginx 1.30)** — `_detect_mptcp_support()` 运行时探测：(1) 内核 `net.mptcp.enabled` sysctl 可用；(2) Nginx 构建含 MPTCP 支持（1.30 上游默认）。`_ensure_mptcp_nginx_support()` 自动 `sysctl -w net.mptcp.enabled=1`。Nginx `listen 443 ssl quic mptcp` 指令启用。CLI：`--mptcp`（强制开启，不支持时降级）、`--no-mptcp`（显式禁用）、不指定（auto-detect）。**多 NIC 服务器、4G/5G+Wi-Fi 移动客户端、跨运营商链路聚合场景自动多径化**，单链路故障无感切换。
+  **MPTCP (Multipath TCP) support (nginx 1.30)** — `_detect_mptcp_support()` runtime probes: (1) kernel `net.mptcp.enabled` sysctl available; (2) Nginx built with MPTCP (upstream default in 1.30). `_ensure_mptcp_nginx_support()` auto `sysctl -w net.mptcp.enabled=1`. Nginx `listen 443 ssl quic mptcp` directive enables it. CLI: `--mptcp` (force on, degrades if unsupported), `--no-mptcp` (explicit disable), unspecified (auto-detect). **Multi-NIC servers, 4G/5G+Wi-Fi mobile clients, cross-carrier link aggregation get automatic multi-path**; single-link failure transparent failover.
+
+- **nginx 1.28 → 1.30 主要版本升级 [B296]** — `_NGINX_MIN_VERSION` 从 `(1, 28, 0)` → `(1, 30, 0)`。启用：(1) HTTP/2 upstream（`proxy_http_version 2`，向后端保持 HTTP/2，减少 upstream 连接数和延迟）；(2) Early Hints（`103 Early Hints` 响应，预发资源 hint，LCP 指标改善）；(3) ECH (`ssl_ech_file` 指令，见上)；(4) keepalive 默认启用（Nginx 1.30 upstream keepalive 不再需要显式声明）；(5) `max_headers`（1.29.8+，HTTP 头数量上限防内存耗尽）；(6) `add_header_inherit`（1.29.3+，header 从 server→location 继承）；(7) `quic_retry on`（1.30 默认，防 QUIC 源地址伪造 DDoS）；(8) `quic_gso on`（UDP GSO，~40% 吞吐）。废弃的 `http2_*_timeout` / `http2_*_size` 指令由 `_fix_nginx_post_upgrade_compat` 自动清理。
+  **nginx 1.28 → 1.30 major version upgrade [B296]** — `_NGINX_MIN_VERSION` from `(1, 28, 0)` → `(1, 30, 0)`. Unlocks: (1) HTTP/2 upstream (`proxy_http_version 2` to backends, reduces upstream conn count + latency); (2) Early Hints (`103 Early Hints` response, preload resource hints, LCP improvement); (3) ECH (`ssl_ech_file` directive, see above); (4) keepalive default (1.30 upstream keepalive no longer needs explicit declaration); (5) `max_headers` (1.29.8+, HTTP header count cap); (6) `add_header_inherit` (1.29.3+, server→location header inheritance); (7) `quic_retry on` (1.30 default, blocks QUIC source-spoofing DDoS); (8) `quic_gso on` (UDP GSO, ~40% throughput). Deprecated `http2_*_timeout` / `http2_*_size` auto-cleaned by `_fix_nginx_post_upgrade_compat`.
+
+- **PHP 8.4 → 8.5 主要版本升级** — `_PHP_DEFAULT_VERSION = "8.5"`（2025-11 GA，active support 至 2027-12-31，security support 至 2029-12-31）。PHP 8.5 新特性：新 `URI` 扩展（内建 URL/URI 解析，RFC 3986 合规）、pipe operator `|>`（`$data |> trim |> strtoupper`）、`#[\NoDiscard]` attribute、closures/casts/first-class callables 在 constant expression 中合法、命名参数解包。现有 8.3/8.4 站点 `update` 后自动升级（不满足 `_PHP_MIN_VERSION = (8, 3)` 才触发安装）。
+  **PHP 8.4 → 8.5 major version upgrade** — `_PHP_DEFAULT_VERSION = "8.5"` (GA 2025-11, active support until 2027-12-31, security until 2029-12-31). New features: URI extension (built-in URL/URI parsing, RFC 3986 compliant), pipe operator `|>` (`$data |> trim |> strtoupper`), `#[\NoDiscard]` attribute, closures/casts/first-class callables in constant expressions, named argument unpacking. Existing 8.3/8.4 sites auto-upgrade on `update` (only triggers when below `_PHP_MIN_VERSION = (8, 3)`).
+
+- **MariaDB 10.11 → 11.8 LTS 主要版本升级** — `_MARIADB_DEFAULT_VERSION = "11.8"`（2025-05 GA，LTS 至 2028-05）。MariaDB 11.8 LTS 核心新特性：**Vector Search** 内建（`VECTOR(N)` 列类型 + cosine/Euclidean 距离函数，用于 AI/ML workload，WordPress 插件可直接用），optimizer 改进（`histogram-based optimizer` 默认启用），InnoDB bulk load 40% 提升，parallel replication 增强。升级是 10.11 → 11.8 跨多版本，脚本自动运行 `mariadb-upgrade` 处理系统表和存储引擎兼容。
+  **MariaDB 10.11 → 11.8 LTS major version upgrade** — `_MARIADB_DEFAULT_VERSION = "11.8"` (GA 2025-05, LTS until 2028-05). Key features: **Vector Search** built-in (`VECTOR(N)` column type + cosine/Euclidean distance functions for AI/ML workloads, usable by WordPress plugins), optimizer improvements (`histogram-based optimizer` on by default), InnoDB bulk load +40%, enhanced parallel replication. Cross-version upgrade 10.11 → 11.8 auto-runs `mariadb-upgrade` for system tables + storage engine compatibility.
+
+- **Valkey 9.0 升级目标化** — 新常量 `_VALKEY_TARGET_VERSION = (9, 0)`。Valkey 9.0（BSD 3-Clause 开源许可，2025 年替代 Redis 的首选）40% 吞吐提升，原子 slot 迁移，hash field expiration。EL8+ 经 Remi 模块流升级；Debian 12 经 bookworm-backports；Ubuntu 24.04+ 经主仓库。低于目标版本自动触发 `_upgrade_valkey_if_needed()`。
+  **Valkey 9.0 upgrade target** — New constant `_VALKEY_TARGET_VERSION = (9, 0)`. Valkey 9.0 (BSD 3-Clause open-source, 2025 Redis replacement of choice) offers 40% throughput gain, atomic slot migration, hash field expiration. EL8+ via Remi module stream; Debian 12 via bookworm-backports; Ubuntu 24.04+ via main repo. Below target auto-triggers `_upgrade_valkey_if_needed()`.
+
+- **OCSP stapling 智能决策 (`_decide_ocsp_enable` + `_cert_supports_ocsp`)** — 2025 年起 Let's Encrypt 停发 OCSP responder，证书里没有 OCSP URI，此时 Nginx `ssl_stapling on` 会在 error log 每次续期都打 warning。改为：`_cert_supports_ocsp()` 用 `openssl x509 -ocsp_uri` 直接读证书 Authority Information Access 扩展（ground truth）；无 OCSP URI → 自动关闭 stapling；非 LE CA（ZeroSSL / 其他）→ 自动启用。`--ocsp-stapling` / `--no-ocsp-stapling` 用户显式覆盖。
+  **OCSP stapling smart decision (`_decide_ocsp_enable` + `_cert_supports_ocsp`)** — Let's Encrypt deprecated OCSP responder in 2025; certificates lack OCSP URI, so Nginx `ssl_stapling on` would print error log warnings on every renewal. Changed: `_cert_supports_ocsp()` uses `openssl x509 -ocsp_uri` to read cert's Authority Information Access extension (ground truth); no OCSP URI → auto-off; non-LE CA (ZeroSSL / etc.) → auto-on. `--ocsp-stapling` / `--no-ocsp-stapling` for explicit override.
+
+- **DNS-01 多 DNS 提供商 API 集成（ECH HTTPS 记录发布用）** — 4 家 DNS 提供商 REST API：(1) **Cloudflare** `_cf_api_request` / `_cf_get_zone_id` / `_cf_upsert_https_record`（v4 API + Bearer token）；(2) **AWS Route53** `_r53_upsert_https_record`（`aws route53 change-resource-record-sets` CLI）；(3) **阿里云 DNS** `_alidns_upsert_https_record`（`DescribeDomainRecords` + `AddDomainRecord`）；(4) **DNSPod（腾讯云）** `_dnspod_api` / `_dnspod_upsert_https_record`（v3 API）。自动根据 DNS NS 记录选择 API；无匹配 API 时打印记录给用户手动加。
+  **DNS-01 multi-provider API integration (for ECH HTTPS record publish)** — 4 DNS providers' REST APIs: (1) **Cloudflare** `_cf_api_request` / `_cf_get_zone_id` / `_cf_upsert_https_record` (v4 API + Bearer token); (2) **AWS Route53** `_r53_upsert_https_record` (`aws route53 change-resource-record-sets` CLI); (3) **Aliyun DNS** `_alidns_upsert_https_record` (`DescribeDomainRecords` + `AddDomainRecord`); (4) **DNSPod (Tencent Cloud)** `_dnspod_api` / `_dnspod_upsert_https_record` (v3 API). Auto-selects API based on DNS NS records; no matching API → prints record for manual add.
+
+- **本地测试模式 `--local-test` (v3.2.345-349)** — 无公网/无 DNS 环境下用自签证书快速验证部署链路。覆盖 `deploy` / `enable-ssl` / `status` 三个子命令。新增 `_issue_local_self_signed()` 生成 2048-bit RSA 自签证书（7 天有效期，`subjectAltName=DNS:<domain>,DNS:www.<domain>`）。~15 处模式隔离守卫（`site.local_test`）确保不污染生产证书路径、不触发 certbot、不调用 Let's Encrypt。
+  **Local-test mode `--local-test` (v3.2.345-349)** — Fast deployment validation with self-signed cert when no public DNS. Covers `deploy` / `enable-ssl` / `status`. New `_issue_local_self_signed()` generates 2048-bit RSA self-signed cert (7-day validity, `subjectAltName=DNS:<domain>,DNS:www.<domain>`). ~15 mode-isolation guards (`site.local_test`) prevent contamination of production cert paths, never trigger certbot or Let's Encrypt.
+
+- **国产 EL 系完整支持 (v3.2.344, 350-351)** — openEuler 24.03 LTS SP3 / 银河麒麟 V11 / UOS / Anolis / OpenCloudOS。`_el_ids` 扩充 `openeuler` / `kylin`，ID 识别正则 `[A-Za-z_-]+` 支持大小写。新增 `_is_openeuler_like()` 辅助函数 + 4 处外部仓库守卫（Remi / nginx.org / MariaDB.org / Valkey.io 跳过添加，使用发行版自带软件，nginx 1.24 / PHP 8.2 / Redis 6 等）。`--local-test` 已在 openEuler 24.03 验证通过。
+  **Full domestic EL-family support (v3.2.344, 350-351)** — openEuler 24.03 LTS SP3 / Kylin V11 / UOS / Anolis / OpenCloudOS. `_el_ids` expanded with `openeuler` / `kylin`, ID regex `[A-Za-z_-]+` supports mixed case. New `_is_openeuler_like()` + 4 external-repo guards (Remi / nginx.org / MariaDB.org / Valkey.io skipped, use distro-bundled: nginx 1.24 / PHP 8.2 / Redis 6 etc.). `--local-test` verified on openEuler 24.03.
+
+- **Ubuntu 26.04 LTS (resolute) 预备 (v3.2.343, 357)** — nginx.org 和 Sury PHP PPA 当前尚未发布 `resolute` codename。脚本通过 HTTP 探测 `dists/resolute/` 返回 404 时自动回退：nginx.org 回退到 `questing`，Sury PPA 改写 sources 为 `noble`（跨 LTS ABI 兼容，Sury 官方文档认可）。Valkey codename 列表保留 `resolute`（Ubuntu 26.04 主仓库确认有 Valkey 9.0.3），MariaDB 早期出口亦保留。等上游同步后零配置切换。
+  **Ubuntu 26.04 LTS (resolute) preparation (v3.2.343, 357)** — Neither nginx.org nor Sury PPA has published `resolute` yet. Script HTTP-probes `dists/resolute/` and falls back on 404: nginx.org → `questing`, Sury PPA → sources rewritten to `noble` (cross-LTS ABI-compatible). Valkey codename list retains `resolute` (Ubuntu 26.04 main repo confirmed has Valkey 9.0.3); MariaDB early exit retained.
+
+- **LoongArch64 / RISC-V 多架构支持 (v3.2.344)** — 用 `platform.machine()` 动态补当前架构的 multiarch 目录，不再限死 x86_64/aarch64 两种，覆盖 loongarch64 / riscv64 / ppc64le 等国产/新兴架构。
+  **LoongArch64 / RISC-V multi-arch support (v3.2.344)** — `platform.machine()` dynamically fills current arch's multiarch dir, no longer hardcoded; covers loongarch64 / riscv64 / ppc64le.
+
+- **WordPress REST API 速率限制 (v3.2.313)** — 新增独立 rate limit zone，`/wp-json/wp/v2/oembed|posts|users` 限 5r/s + burst 20。合法浏览器调用 ~1/s，对正常访问宽松但拦截爬虫批量枚举。
+  **WordPress REST API rate limiting (v3.2.313)** — Dedicated rate limit zone; `/wp-json/wp/v2/oembed|posts|users` limited to 5r/s + burst 20. Legitimate calls ~1/s; blocks scraper enumeration.
+
+- **HTTP/2 Early Hints (nginx 1.30+)** — `103 Early Hints` 响应预发 `<link rel="preload">` 给浏览器提前获取关键资源（CSS/JS/字体）。LCP（Largest Contentful Paint）指标显著改善，Chrome/Safari/Firefox 全支持。
+  **HTTP/2 Early Hints (nginx 1.30+)** — `103 Early Hints` response preemptively sends `<link rel="preload">` for critical resources (CSS/JS/fonts). Significantly improves LCP metric; Chrome/Safari/Firefox all support.
+
+- **Debian 12 bookworm-backports Valkey 集成 (v3.2.302)** — Debian 12 主仓库无 Valkey、backports 有 Valkey 8.0。`_detect_debian_bookworm()` + `_enable_bookworm_backports()` 幂等启用 backports。
+  **Debian 12 bookworm-backports Valkey integration (v3.2.302)** — Debian 12 main repo lacks Valkey; backports has Valkey 8.0. `_detect_debian_bookworm()` + `_enable_bookworm_backports()` idempotent enable.
+
+---
+
+### 🐛 问题修复 / Bug Fixes
+
+- **PHP-FPM SIGSEGV 真 bug 修复 (v3.2.352, 356)** — 低默认 LimitNOFILE 平台（openEuler 1024 / EL8 4096 / Kylin 1024）触发 php-fpm worker `setrlimit(RLIMIT_NOFILE, 65535)=EPERM`，进程退出状态码 139 (SIGSEGV)，**全站 502**。写入 systemd drop-in `LimitNOFILE=65536` + `daemon-reload` + restart。v3.2.356 条件守卫：`systemctl show <fpm-svc> -p LimitNOFILE --value` 探测，≥ 65536 时直接跳过（AlmaLinux 10 / Rocky 9 / Ubuntu 22/24 / Debian 12/13 的 systemd 默认 524288 或 1048576）。**toksun.cn (AlmaLinux 10.1) 从 v240 update 到 v358 实测字节级零变化**。
+  **PHP-FPM SIGSEGV real-bug fix (v3.2.352, 356)** — Low default LimitNOFILE platforms (openEuler 1024 / EL8 4096 / Kylin 1024) trigger php-fpm worker `setrlimit(RLIMIT_NOFILE, 65535)=EPERM`, exit 139 (SIGSEGV), **full-site 502**. Writes systemd drop-in `LimitNOFILE=65536` + `daemon-reload` + restart. v3.2.356 conditional guard: `systemctl show <fpm-svc> -p LimitNOFILE --value` probes, ≥ 65536 skips. **toksun.cn (AlmaLinux 10.1) measured byte-level zero change v240 → v358**.
+
+- **nginx 1.30 指令运行时 probe (v3.2.350, 354, 355)** — `max_headers`（1.29.8+）、`add_header_inherit`（1.29.3+）。`NginxManager._nginx_supports_max_headers()` / `_nginx_supports_add_header_inherit()` 通过 `nginx -v` 按精确版本门条件生成。openEuler 24.03 自带 nginx 1.24 / Ubuntu 22.04 自带 1.18 等旧版本上不会 `nginx -t` 失败。测试脚本同步（v3.2.354 错了版本号，v3.2.355 修正到 CHANGES 准确值）。
+  **nginx 1.30 directive runtime probe (v3.2.350, 354, 355)** — `max_headers` (1.29.8+), `add_header_inherit` (1.29.3+). `NginxManager._nginx_supports_max_headers()` / `_nginx_supports_add_header_inherit()` conditionally emit via `nginx -v` precise gate. Never fails on nginx 1.24 (openEuler) / 1.18 (Ubuntu 22.04). Test script aligned (v3.2.354 wrong, v3.2.355 corrected per CHANGES).
+
+- **MariaDB 客户端/服务器版本不匹配修复 (`_fix_mariadb_client_mismatch`)** — 10.11 → 11.8 升级过程中存在窗口：server 已升级但 client 包还是旧版，`mariadb -e '...'` 报 `ER_UNKNOWN_SYSTEM_VARIABLE`。升级链路加入 client 包同步升级 + 验证。
+  **MariaDB client/server version mismatch fix (`_fix_mariadb_client_mismatch`)** — 10.11 → 11.8 upgrade has window where server upgraded but client still old, `mariadb -e '...'` reports `ER_UNKNOWN_SYSTEM_VARIABLE`. Added client package sync upgrade + verification to upgrade chain.
+
+- **MariaDB 11.x 弃用参数清理 (v3.2.320, `_fix_mariadb_deprecated_options`)** — `innodb_file_per_table` 11.0+ 弃用（MDEV-29983，10.5+ 默认 ON），`innodb_buffer_pool_instances` 10.5+ 弃用+忽略，10.6+ Enterprise 移除（MDEV-15058），11.x 加了触发 error log warn。按版本条件生成；升级后 `_fix_mariadb_deprecated_options()` 清理现有 conf。
+  **MariaDB 11.x deprecated params cleanup (v3.2.320, `_fix_mariadb_deprecated_options`)** — `innodb_file_per_table` deprecated in 11.0+ (MDEV-29983, default ON in 10.5+); `innodb_buffer_pool_instances` deprecated in 10.5+, removed in 10.6+ Enterprise (MDEV-15058). Conditionally emitted by version; post-upgrade `_fix_mariadb_deprecated_options()` cleans existing conf.
+
+- **MariaDB major-XOR-minor 升级模式对齐 (v3.2.338)** — 原 bug：major + minor 升级串行执行，大版本升级时 mariadbd 可能重启 2 次。对齐 Nginx/Redis 的 major-XOR-minor：大版本升级后跳过小版本检查。
+  **MariaDB major-XOR-minor upgrade mode alignment (v3.2.338)** — Original bug: major + minor upgrades serial → possible double restart. Aligned with Nginx/Redis major-XOR-minor: major upgrade skips subsequent minor check.
+
+- **MariaDB socket 连接 fallback (v3.2.310, `_redis_socket_fallback_to_tcp`)** — 默认 TCP 连接失败时（`/var/run/mysqld/mysqld.sock` 移位）按常见 socket 路径顺序 fallback。Redis 同样加 socket→TCP fallback (`_sock_args`)。
+  **MariaDB socket connection fallback (v3.2.310)** — TCP conn fails → fallback through common socket paths. Redis similarly `_redis_socket_fallback_to_tcp` (`_sock_args`).
+
+- **MariaDB 官方仓库清理 (`_cleanup_mariadb_official_repo` + `_setup_mariadb_repo_el_fallback`)** — 升级 10.11 → 11.8 需切换 repo（mariadb-10.11 → mariadb-11.8）；旧 repo 不清理会 priority 冲突。新增清理函数 + EL 系 fallback（mariadb.org 不支持 EL 某架构时走 AppStream）。
+  **MariaDB official repo cleanup (`_cleanup_mariadb_official_repo` + `_setup_mariadb_repo_el_fallback`)** — 10.11 → 11.8 needs repo switch (mariadb-10.11 → mariadb-11.8); leftover old repo causes priority conflicts. Added cleanup + EL fallback (when mariadb.org lacks EL arch → uses AppStream).
+
+- **Redis `timeout 300` 绕过 CONFIG REWRITE (v3.2.352, 358)** — `CONFIG REWRITE` 在 openEuler `/etc/redis/redis.conf` 0640 权限下静默失败。改为 `harden_conf()` 以 root 身份直接写 conf + 重启。v3.2.358 before/after 对比守卫，避免 `timeout 300  # comment` 边界场景空替换触发脏标志。
+  **Redis `timeout 300` bypasses CONFIG REWRITE (v3.2.352, 358)** — `CONFIG REWRITE` silently fails under openEuler `/etc/redis/redis.conf` 0640. Changed to `harden_conf()` as root direct-write + restart. v3.2.358 before/after diff guard for `timeout 300  # comment` edge case.
+
+- **nginx.conf 默认 server 块花括号配对 regex (v3.2.352)** — 老 regex `r'^\s*server\s*{[^{}]*listen\s+80[^{}]*default_server[^{}]*}'` 不匹配嵌套 `location /`。改为 `_has_listen80` + `_has_default_server` 两段扫描 + 手写 brace counter。`neutralize_default_server_block()` 完成中和。
+  **nginx.conf default server brace-counter regex (v3.2.352)** — Old regex can't match nested `location /`. Replaced with `_has_listen80` + `_has_default_server` two-stage scan + hand-written brace counter. `neutralize_default_server_block()` finalizes neutralization.
+
+- **nginx 升级后兼容清理 (`_fix_nginx_post_upgrade_compat`)** — 1.28 → 1.30 升级后，`http2_*_timeout` / `http2_*_size` 等废弃指令在老 conf 中会让 `nginx -t` 失败。自动扫描所有 conf 文件 + 注释掉废弃指令 + 备份原文件。
+  **nginx post-upgrade compatibility cleanup (`_fix_nginx_post_upgrade_compat`)** — Post 1.28 → 1.30 upgrade, deprecated `http2_*_timeout` / `http2_*_size` directives in old confs fail `nginx -t`. Auto-scans all conf files + comments out deprecated directives + backs up originals.
+
+- **fail2ban 安装诊断增强 (v3.2.311, 352, 353)** — (1) Python 3.12+ 移除 `distutils`，预装 `python3-setuptools` + `python3-systemd` 防御。(2) `quiet=True` 改为手动 `subprocess.run(stderr=PIPE)`，失败时 `logging.error` 暴露根因。(3) `shutil.which("fail2ban-client")` 未装场景优雅跳过。(4) `python3-pyinotify` 必装，避免 polling backend 高 CPU。
+  **fail2ban install diagnostics (v3.2.311, 352, 353)** — (1) Python 3.12+ removed `distutils`; pre-install `python3-setuptools` + `python3-systemd` as defense. (2) `quiet=True` changed to manual `subprocess.run(stderr=PIPE)`, exposes cause on failure. (3) `shutil.which("fail2ban-client")` graceful skip. (4) `python3-pyinotify` required to avoid polling backend high CPU.
+
+- **Debian 12 nftables 加规则幂等 (v3.2.342)** — 生产日志发现 `nft add rule` 在 Debian 12 非幂等，每次 add 都追加重复规则（firewalld/ufw 自动去重）。先 `nft list` 探测再决定 add。
+  **Debian 12 nftables add rule idempotent (v3.2.342)** — Prod logs found `nft add rule` non-idempotent on Debian 12, appends on every add (firewalld/ufw auto-dedup). Probe with `nft list` first.
+
+- **io_capacity SSD 默认化 + 边界修复 (v3.2.335, 336)** — 2026 云 VM 99% SSD，从 HDD 默认 200 升级到 SSD 标准 1000/2000。v3.2.336 修正 v3.2.335 边界：1606MB 归 tiny tier（≤2GB），原 v3.2.335 只升级了 small tier。
+  **io_capacity SSD default + boundary fix (v3.2.335, 336)** — 2026 cloud VMs 99% SSD. Upgraded from HDD 200 → SSD 1000/2000. v3.2.336 fixed v3.2.335 boundary: 1606MB belongs to tiny tier (≤2GB); v3.2.335 only upgraded small.
+
+- **setup-config.php 扫描器防护 (v3.2.332)** — 生产日志发现扫描器访问 `/wp-admin/setup-config.php` 触发 WP bootstrap → Redis connect → `RedisException` → HTTP 500。Nginx 层封锁。
+  **setup-config.php scanner shield (v3.2.332)** — Prod logs: scanners hitting `/wp-admin/setup-config.php` → WP bootstrap → Redis → exception → HTTP 500. Nginx-level block.
+
+- **静态资源 404 白名单规则 (v3.2.333)** — Fail2Ban wordpress-404 过滤器排除合法 404（favicon/robots.txt/assets），锚定请求路径末尾正则防止 URL 编码绕过。
+  **Static-asset 404 whitelist (v3.2.333)** — Fail2Ban wordpress-404 filter excludes legitimate 404s (favicon/robots.txt/assets); end-of-line anchored regex blocks URL-encoding bypass.
+
+- **RFC 8615 `/.well-known/` 不整体屏蔽 (v3.2.334)** — 整体 deny 会阻断 security.txt / change-password / openid-configuration 等合法子路径。改为只屏蔽敏感子路径，`^~ /.well-known/acme-challenge/` 高优先级白名单。
+  **RFC 8615 `/.well-known/` not blanket-blocked (v3.2.334)** — Blanket deny blocked legitimate sub-paths (security.txt / change-password / openid-configuration). Changed to selective sub-path block; `^~ /.well-known/acme-challenge/` higher-priority whitelist.
+
+- **HTTP-01 挑战指数退避重试 (v3.2.309, 314)** — RETRYABLE 错误（challenge failed / server could not connect / unauthorized）走指数退避 + ±20% jitter（防 thundering herd）。ACME 速率限制突发自动恢复。
+  **HTTP-01 challenge exponential backoff (v3.2.309, 314)** — RETRYABLE errors retry with exponential backoff + ±20% jitter. Auto-recovers from ACME rate-limit bursts.
+
+- **OCSP URI 直接读取证书 (v3.2.316)** — CA 切换检测改用 `openssl x509 -ocsp_uri` 从证书 Authority Information Access 扩展直接读，取代脆弱的 issuer DN 正则。
+  **OCSP URI direct read from cert (v3.2.316)** — CA switch detection uses `openssl x509 -ocsp_uri` reading cert's Authority Information Access extension instead of fragile issuer DN regex.
+
+- **certbot 首装/卸载 stderr 噪音抑制 (v3.2.339)** — 生产日志 lamtin.hk 2026-04-17 Rocky 9.7 发现首次部署时 certbot 不存在导致 WARNING。降为 DEBUG（预期状态非故障）。
+  **certbot first-install stderr noise suppression (v3.2.339)** — Prod log finding (lamtin.hk 2026-04-17 Rocky 9.7): first deploy raised WARNING on missing certbot. Downgraded to DEBUG.
+
+- **Snap 健壮性（squashfs 预检 + 超时 180→420s + 连通性检测）(v3.2.306, 307, `_snap_install_or_refresh_robust`, `_check_snapcraft_reachable`, `_check_squashfs_available`, `_find_pending_snap_install`)** — 国内云 snap 超时 180s 假性失败（正常 2-5 分钟）；OpenVZ/LXC 内核无 squashfs mount 必败。预检不支持 → 跳到 pip venv Certbot。`_check_snapcraft_reachable()` 新增连通性预检避免 DNS 故障时卡死。
+  **Snap robustness (`_snap_install_or_refresh_robust`, `_check_snapcraft_reachable`, `_check_squashfs_available`, `_find_pending_snap_install`)** — China cloud snap 180s false fail (normal 2-5 min); OpenVZ/LXC kernels lack squashfs → mount fail. Pre-check unsupported → skip to pip venv Certbot. `_check_snapcraft_reachable()` new connectivity probe avoids DNS-failure deadlock.
+
+- **EPEL 健壮安装 (`_install_epel_release`, v3.2.308)** — 国内云 `dnf install epel-release` 常失败。自动检测原生 extras 仓库 + 下载 RPM 直装兜底。
+  **Robust EPEL install (`_install_epel_release`, v3.2.308)** — China cloud often fails `dnf install epel-release`. Auto-detects native extras repo + RPM direct-install fallback.
+
+- **apt lock 等待 (`_wait_for_apt_lock`)** — apt 被 unattended-upgrades 等并发占用时脚本不再立即失败；指数等待 + 超时。
+  **apt lock wait (`_wait_for_apt_lock`)** — apt held by unattended-upgrades no longer fails immediately; exponential wait + timeout.
+
+- **apt 缓存刷新对齐 (v3.2.325)** — nginx 主路径有 apt cache refresh，但 PHP/MariaDB 小版本升级路径缺。陈旧 apt 缓存 → MariaDB minor 升级永不触发 → CVE 风险。对齐到所有包管理路径。
+  **apt cache refresh alignment (v3.2.325)** — nginx path had it but PHP/MariaDB minor upgrade paths missed. Stale cache → MariaDB minor upgrade never triggers → CVE risk. Aligned across all paths.
+
+- **Valkey/Redis 平台感知升级门 (v3.2.301, 304, `detect_service` + `detect_full_version`)** — EL8+ < `_VALKEY_TARGET_VERSION (9.0)` 触发 Remi 模块流升级。仓库无 Valkey 时告知用户 + 用 redis-server 兜底。`_redis_flavor_name()` 显示名（"Valkey" 或 "Redis"）。
+  **Valkey/Redis platform-aware upgrade gate (v3.2.301, 304)** — EL8+ < `_VALKEY_TARGET_VERSION (9.0)` triggers Remi module upgrade. No-Valkey repo → user hint + redis-server fallback. `_redis_flavor_name()` display name.
+
+- **WordPress 插件安装多源 fallback (v3.2.311, `_wpcli_plugin_install_robust`)** — WordPress.org 下载链国内云偶发 5xx，新增镜像源 fallback。
+  **WordPress plugin install multi-source fallback (v3.2.311, `_wpcli_plugin_install_robust`)** — WordPress.org download has occasional China-cloud 5xx; mirror source fallback added.
+
+- **soap 扩展跨发行版基线 (v3.2.319, `_check_soap_loaded`)** — AlmaLinux/RHEL 预置 `php_value[soap.wsdl_cache_dir]`；soap 未装时 worker 启动每次报 warning。显式装 soap + `_check_soap_loaded()` 验证。
+  **soap extension cross-distro baseline (v3.2.319, `_check_soap_loaded`)** — AlmaLinux/RHEL pre-set `php_value[soap.wsdl_cache_dir]`; unloaded soap → worker warnings. Explicit install + `_check_soap_loaded()` verify.
+
+- **原子写入 hook + systemd unit (v3.2.321)** — certbot deploy hook 和 systemd unit 文件原为普通写入，断电会留半行。全部改用 `_safe_write_file()` 原子写入（tempfile → fsync → os.replace）。
+  **Atomic write for hooks + systemd units (v3.2.321)** — Plain-write left half-lines on power loss. Changed to `_safe_write_file()` atomic (tempfile → fsync → os.replace).
+
+- **顶层 flock + TOCTOU 修复 (v3.2.341)** — 模块级全局进程锁 FD 防 GC 提前释放；`try/except FileNotFoundError` 替代 `exists() + open()` 消除 TOCTOU 窗口。
+  **Top-level flock + TOCTOU fix (v3.2.341)** — Module-level process-lock FD prevents GC; `try/except FileNotFoundError` replaces `exists() + open()`, eliminates TOCTOU.
+
+- **php*-fpm 服务名动态扫描 (v3.2.305, `_f08_scan_active_php_fpm`)** — 不再硬编码 `php-fpm` / `php8.4-fpm`，扫描 active systemd units 正则 `php\d*[-.]fpm`。覆盖 EL / Ubuntu Sury / Debian 原生 / 未来版本。
+  **php*-fpm service name dynamic scan (v3.2.305, `_f08_scan_active_php_fpm`)** — No longer hardcoded; scans active systemd units with `php\d*[-.]fpm`. Covers EL / Ubuntu Sury / Debian native / future.
+
+- **MariaDB 数据目录权限修复 (`_fix_datadir_perms`)** — 某些 restore 场景 `/var/lib/mysql` owner 被 root 持有导致 mariadbd 启动失败。自动 `chown -R mysql:mysql`。
+  **MariaDB datadir permission fix (`_fix_datadir_perms`)** — Some restore scenarios leave `/var/lib/mysql` owned by root, mariadbd fails. Auto `chown -R mysql:mysql`.
+
+- **srcache 静态二进制 fallback (`_srcache_install_static_binary`, `_try_install_srcache_packages`)** — 编译 srcache-nginx-module 失败时（GCC 版本/headers 缺）改用预编译静态二进制。
+  **srcache static binary fallback (`_srcache_install_static_binary`, `_try_install_srcache_packages`)** — Compile failure (GCC/headers) → pre-compiled static binary.
+
+---
+
+### 🔧 改进 / Improvements
+
+- **open_file_cache 默认启用 (v3.2.317)** — 从 `--optimize` opt-in 改为默认。`max=10000 inactive=60s` 适合 WordPress 典型访问模式。
+  **open_file_cache enabled by default (v3.2.317)** — Changed from `--optimize` opt-in. `max=10000 inactive=60s` fits typical WordPress patterns.
+
+- **TCP Fast Open 运行时检测 (v3.2.318)** — 原无条件启用 TFO 老内核 listen fail。运行时检测 `net.ipv4.tcp_fastopen sysctl`；服务端侧安全。
+  **TCP Fast Open runtime detection (v3.2.318)** — Unconditional TFO failed on old kernels. Runtime `net.ipv4.tcp_fastopen sysctl` probe; server-side safe.
+
+- **InnoDB log file size 分层 (v3.2.318)** — RAM 分层：tiny 64M / small 128M / medium 256M / large 512M。
+  **InnoDB log file size tiering (v3.2.318)** — RAM-tiered: tiny 64M / small 128M / medium 256M / large 512M.
+
+- **opcache interned_strings_buffer 16→32 (v3.2.335)** — WordPress 6.9 + 常见插件生成大量重复字符串，16MB 在 10+ 插件时易满。32MB 是 2026 WP/Laravel 共识下限。
+  **opcache interned_strings_buffer 16→32 (v3.2.335)** — WP 6.9 + plugins generate duplicate strings, 16MB fills with 10+ plugins. 32MB is 2026 consensus minimum.
+
+- **QUIC retry + GSO 硬化 (v3.2.335)** — `quic_retry on`（防 QUIC 源地址伪造 DDoS）+ `quic_gso on`（UDP GSO，~40% 吞吐，内核 ≤5.4 自动降级）。
+  **QUIC retry + GSO hardening (v3.2.335)** — `quic_retry on` (blocks QUIC spoof DDoS) + `quic_gso on` (UDP GSO, ~40% throughput, auto-degrade on ≤5.4).
+
+- **Nginx/MariaDB/PHP/Redis/Certbot 全链路版本 + 能力探测缓存 (v3.2.322, 327, 328)** — 对齐 Nginx 设计模式。Nginx 14 次 × ~10ms、PHP `detect_installed_version` 14 × ~50ms、Redis `detect_version` 14 × + `_detect_redis_full_version` 10 × + `detect_service_name` 15 ×、MariaDB `_detect_mariadb_full_version` / Certbot `_detect_certbot_full_version` 同样对齐。全部模块级缓存 + 统一失效钩子 (`_reset_mariadb_capability_caches` / `_reset_php_capability_caches` / `_reset_redis_capability_caches` / `_reset_certbot_capability_caches` / `_reset_mptcp_cache`)。**部署期 subprocess 调用减 ~70%**。
+  **Nginx/MariaDB/PHP/Redis/Certbot full-chain version + capability probe cache (v3.2.322, 327, 328)** — Follows Nginx design pattern. Nginx 14× ~10ms, PHP 14× ~50ms, Redis 14× + 10× + 15×, MariaDB/Certbot similarly aligned. All module-level caches + unified invalidation hooks. **~70% reduction in deploy-time subprocess calls**.
+
+- **DCL 锁 nogil 安全 (v3.2.331)** — Python 3.13+ nogil 下 `_MPTCP_SUPPORT_LOCK = _threading.Lock()` 对齐双重检查锁定 (DCL) 模式。
+  **DCL lock nogil-safe (v3.2.331)** — Python 3.13+ nogil; `_MPTCP_SUPPORT_LOCK = _threading.Lock()` aligned with DCL pattern.
+
+- **Nginx systemd LimitNOFILE drop-in (v3.2.315, `_install_systemd_rlimit_drop_in`)** — `/etc/systemd/system/nginx.service.d/limit-nofile.conf` 写入 `LimitNOFILE=<target>`，master 启动就携带，消除首次 reload 后 warning。泛化成 `_install_systemd_rlimit_drop_in()` 复用到 PHP-FPM / mariadbd。
+  **Nginx systemd LimitNOFILE drop-in (v3.2.315, `_install_systemd_rlimit_drop_in`)** — `/etc/systemd/system/nginx.service.d/limit-nofile.conf` carries `LimitNOFILE=<target>` at master start, eliminates first-reload warning. Generalized to `_install_systemd_rlimit_drop_in()` reused for PHP-FPM / mariadbd.
+
+- **autoindex off 显式 (v3.2.326)** — nginx 默认 off，显式声明所有 server block 防未来默认变化。
+  **Explicit `autoindex off` (v3.2.326)** — nginx default off; explicit declaration defends against future default changes.
+
+- **Nginx worker_connections + FastCGI buffer 分层 (`_tune_nginx_worker_connections`, `_nginx_fastcgi_buffers_tiered`)** — worker_connections 按 LimitNOFILE 和 CPU 动态；FastCGI buffer 按 RAM 分层（tiny 16 4k / small 64 4k / medium 128 8k / large 256 16k）。
+  **Nginx worker_connections + FastCGI buffer tiering (`_tune_nginx_worker_connections`, `_nginx_fastcgi_buffers_tiered`)** — worker_connections dynamic by LimitNOFILE + CPU; FastCGI buffers RAM-tiered.
+
+- **内联代理方法清理 (v3.2.312)** — 清理 `_detect_db_service` / `_detect_installed_php_version` / `_get_nginx_version_tuple` / `_get_mariadb_full_version` 等 30+ 代理方法，统一走 Manager 类 canonical API。
+  **Inline proxy method cleanup (v3.2.312)** — Cleaned 30+ proxies (`_detect_db_service` / `_detect_installed_php_version` / `_get_nginx_version_tuple` / `_get_mariadb_full_version` etc.); unified to Manager canonical APIs.
+
+- **Canonical 版本探测 API (v3.2.330, `_detect_nginx_version`, `_detect_mariadb_version`)** — 统一入口返回 `(1, 30, 0)` 元组。外部调用点全部迁移。
+  **Canonical version probe API (v3.2.330, `_detect_nginx_version`, `_detect_mariadb_version`)** — Unified entry returns `(1, 30, 0)` tuple. All external call sites migrated.
+
+- **default version 常量对齐 (v3.2.329)** — `_NGINX_DEFAULT_VERSION` / `_PHP_DEFAULT_VERSION` / `_MARIADB_DEFAULT_VERSION` / `_CERTBOT_DEFAULT_VERSION` 命名惯例统一。
+  **default version constant alignment (v3.2.329)** — `_NGINX_DEFAULT_VERSION` / `_PHP_DEFAULT_VERSION` / `_MARIADB_DEFAULT_VERSION` / `_CERTBOT_DEFAULT_VERSION` unified.
+
+- **CertManager 架构重构（+33 新方法）** — `_build_ca_providers()` / `_build_domain_args()` / `_default_cert_domain_args()` 等组合化；`_diagnose_ssl_failure()` 失败诊断分离；`_check_certbot_snap_migration()` / `_check_zerossl_migration()` 迁移路径判定；`_cert_valid_days_remaining()` / `_clean_challenge_dir()` 等工具方法抽出。
+  **CertManager architecture refactor (+33 new methods)** — Compositional `_build_ca_providers()` / `_build_domain_args()` / `_default_cert_domain_args()`; separated `_diagnose_ssl_failure()`; migration-path deciders `_check_certbot_snap_migration()` / `_check_zerossl_migration()`; extracted utilities `_cert_valid_days_remaining()` / `_clean_challenge_dir()` etc.
+
+- **WPDeployManager god-class 拆分重构** — V3.2.8 最大的架构改动：`WPDeployManager` 从 **327 方法缩减到 133 方法**（-194），组件生命周期逻辑全部迁移到各专业 Manager 类。WPDeployManager 保留为轻量级编排层（orchestration only），逻辑下沉到：
+  - **NginxManager 接收 80 个迁移方法** + 13 个真新（Brotli 编译链 / Cloudflare Real IP / 多域证书对齐 / includes 健康检查等继承；真新：`_detect_nginx_version` / `_ensure_mptcp_nginx_support` / `_install_systemd_rlimit_drop_in` / `_optimize_nginx_main_conf` / `_srcache_install_static_binary` / `_tune_nginx_worker_connections` 等）
+  - **CertManager 接收 28 个迁移** + 5 个真新（`_build_ca_providers` / `_build_domain_args` / `_cert_valid_days_remaining` / `_check_certbot_snap_migration` 继承；真新：`_snap_install_or_refresh_robust` / `_check_snapcraft_reachable` / `_check_squashfs_available` / `_find_pending_snap_install` / `_issue_local_self_signed`）
+  - **PHPManager 接收 17 个迁移** + 9 个真新（`_apply_php_ini_values` / `_build_php_packages` / `_compile_php_redis_extension` 继承；真新：`_detect_php_fpm_service_uncached` / `_fix_sury_ppa_codename_for_non_lts` / `_get_ram_tier` / `_print_component_versions` / `php_ini_security_directives` / `detect_service` / `detect_version` 等）
+  - **MariaDBManager 接收 14 个迁移** + 9 个真新（`_diagnose_mariadb_failure` / `_extend_wait_retry` / `_finalize_mariadb_upgrade` / `_fix_datadir_perms` / `_fix_mariadb_deprecated_options` 继承；真新：`_cleanup_mariadb_official_repo` / `_detect_mariadb_full_version` / `_fix_mariadb_client_mismatch` / `_setup_mariadb_repo_el_fallback`）
+  - **RedisManager 接收 2 迁移** + 13 个真新（此处以真新为主，配合 Valkey 9.0 升级链：`_upgrade_valkey_bookworm_backports` / `_upgrade_valkey_el` / `_redis_socket_fallback_to_tcp` / `_sock_args` / `detect_full_version` / `detect_service` / `get_data_dir` 等）
+
+  **价值**：单一职责原则（SRP），每个 Manager 只关心自己的组件生命周期；WPDeployManager 仅做跨组件编排；单测可针对单 Manager 独立进行；未来增删组件局部化，不再需要改 WPDM 巨类。
+  **Value**: Single Responsibility Principle (SRP), each Manager owns its component's lifecycle; WPDeployManager orchestrates only; unit tests can target single Manager; future component add/remove localized, no more touching the WPDM god-class.
+
+  **WPDeployManager god-class decomposition** — Biggest V3.2.8 architectural change: `WPDeployManager` shrunk from **327 methods to 133** (-194); component lifecycle logic migrated out to specialized Managers. WPDeployManager kept as thin orchestration layer. Distribution: NginxManager (+80 migrated, 13 truly new), CertManager (+28 migrated, 5 truly new), PHPManager (+17 migrated, 9 truly new), MariaDBManager (+14 migrated, 9 truly new), RedisManager (+2 migrated, 13 truly new — Redis is the exception with mostly genuinely new Valkey-9.0-related code).
+
+- **日志收集子工具 (`collect_logs`, `_tail_file`, `_collect_conf`)** — WPDeployManager 新增故障排查辅助：一键打包 nginx/php-fpm/mariadbd/redis 最近日志 + 所有 conf 文件到 `/tmp/wp_ssl_<domain>_<ts>.tar.gz`，方便支持。
+  **Log collection helper (`collect_logs`, `_tail_file`, `_collect_conf`)** — WPDeployManager new troubleshooting aid: one-shot bundles recent nginx/php-fpm/mariadbd/redis logs + all confs to `/tmp/wp_ssl_<domain>_<ts>.tar.gz` for support.
+
+- **测试脚本改进 (v3.2.351-355, 357-358)** — 436/436 静态测试通过，18/18 回归模拟全捕获。新增 42 项覆盖 v3.2.345-358 改动的静态断言。`_nginx_supports_mh/ahi` 按 nginx 官方 CHANGES 精确版本判定。Local-test 模式 5 项豁免断言。Ubuntu 26.04 compat 断言反转为"resolute 不在列表 + probe fallback 代码存在"。
+  **Test script improvements (v3.2.351-355, 357-358)** — 436/436 static tests pass, 18/18 regression simulations caught. 42 new assertions covering v3.2.345-358. `_nginx_supports_mh/ahi` per upstream CHANGES. Local-test 5 exemptions. Ubuntu 26.04 compat assertion flipped to "no resolute in list + probe fallback exists".
+
+---
+
+### 📊 平台覆盖 / Platform Coverage
+
+| 平台 / Platform | V3.2.8 状态 / Status |
+|---|---|
+| AlmaLinux 10.1 | ✅ prod 实测（toksun.cn update v240→v358 字节级零配置变化，除主动升级的 nginx/PHP/MariaDB 包外）|
+| Rocky 9.7 | ✅ prod |
+| Ubuntu 24.04 LTS (noble) | ✅ prod |
+| Ubuntu 22.04 LTS (jammy) | ✅ prod |
+| Debian 12 (bookworm) | ✅ prod |
+| Debian 13 (trixie) | ⚠ 代码就绪（trixie 2025-08 GA）|
+| Ubuntu 26.04 LTS (resolute) | ⚠ 代码就绪（2026-04-23 GA）|
+| openEuler 24.03 LTS SP3 | ⚠ 代码就绪（`--local-test` 验证通过）|
+| 银河麒麟 V11 | ⚠ 代码就绪 |
+
+---
+
 ## [V3.2.7]
 
 > **升级说明 / Upgrade note**

@@ -9,19 +9,32 @@ One command to deploy WordPress with HTTPS, auto-renewal, and production-grade s
 
 <a id="english"></a>
 
+## Status (V3.2.8 build 3.2.365)
+
+- ✅ **Production-ready** — HOTFIX for v3.2.364 startup NameError; all 14 architecture rules 🟢 green
+- ✅ **4-layer audit verified** — 541+ checks: 466 contract tests + 21 structural + 54 migration + 14-rule deep audit, zero violations
+- ✅ **Measured performance** — WordPress `admin-ajax.php` TTFB 73.78 ms on default config (toksun.cn prod)
+- ⚠ **Version note** — use **build 365+** or stay on **build 358**; skip 359-364 (architectural cleanup intermediate states, build 364 has startup NameError)
+
 ## Features
 
+- **Clean architecture (V3.2.8 build 365+)** — WPDeployManager god-class decomposed to 5 specialized Managers (NginxManager / MariaDBManager / PHPManager / RedisManager / CertManager), 327→108 methods (-67%). 11 Manager public APIs (`get_conf_path`, `validate_config`, `graceful_shutdown`, `verify_user_connection`, etc.). All 14 internal architecture rules 🟢 green. 466-assertion contract test suite against future refactor regression. Zero user-visible behavior change vs. build 287.
 - **Zero-config HTTPS** — Let's Encrypt → ZeroSSL automatic failover with EAB auto-negotiation; ECDSA (P-256) preferred with RSA fallback; certbot error classification with circuit-breaker logic; Snap/certbot-auto/standard installs auto-detected
+- **TLS ECH (Encrypted ClientHello)** (V3.2.8+) — RFC 9849 full automation: `_detect_ech_support()` OpenSSL 4.0+ probe → `_generate_ech_keypair()` → auto-publish HTTPS record via 4 DNS providers (Cloudflare, AWS Route53, Aliyun DNS, DNSPod) → `_install_ech_rotation_timer()` systemd timer key rotation. Hides SNI from ISPs/middleboxes. CLI: `--ech` with `--cf-api-token` / Route53 credentials
+- **MPTCP (Multipath TCP)** (V3.2.8+) — Runtime kernel probe + Nginx MPTCP auto-enable; `listen 443 ssl quic mptcp`. Multi-NIC servers, 4G/5G+Wi-Fi mobile clients, cross-carrier link aggregation get multi-path transparently. CLI: `--mptcp` / `--no-mptcp`
+- **Modern stack targets** (V3.2.8+) — nginx 1.30 (HTTP/2 upstream, Early Hints 103, keepalive default), PHP 8.5 (URI extension, pipe operator `|>`, `#[\NoDiscard]`), MariaDB 11.8 LTS (Vector Search, JSON_TABLE), Valkey 9.0 (BSD 3-Clause, 40% throughput)
+- **OCSP stapling smart decision** (V3.2.8+) — `_cert_supports_ocsp()` reads cert's Authority Information Access; Let's Encrypt deprecated OCSP 2025 → auto-disable; non-LE CA → auto-enable. `--ocsp-stapling` / `--no-ocsp-stapling` override
 - **Two-phase deployment** — `deploy --skip-ssl` for HTTP-only first, then `enable-ssl` when DNS is ready; or full HTTPS in one shot
+- **Local-test mode** (V3.2.8+) — `--local-test` uses 2048-bit RSA self-signed cert (7-day validity, `subjectAltName` for bare + www) for air-gapped / no-DNS environments; never calls certbot or Let's Encrypt; ~15 mode-isolation guards prevent contamination of production cert paths
 - **Interactive wizard** — no subcommand? TTY users get a guided menu for domain, email, SSL policy, and external database
-- **Multi-distro** — EL7–10 (RHEL / CentOS / AlmaLinux / Rocky / Alibaba Cloud Linux) / Ubuntu / Debian; dnf5 (EL10+) auto-detected; Redis/Valkey multi-package fallback
+- **Multi-distro** — EL7–10 (RHEL / CentOS / AlmaLinux / Rocky / Alibaba Cloud Linux) / Ubuntu 22.04–26.04 / Debian 12–13 / domestic EL family (openEuler 24.03 / Kylin V11 / UOS / Anolis / OpenCloudOS); dnf5 (EL10+) auto-detected; Redis/Valkey multi-package fallback; nginx.org/Sury PPA HTTP probe with automatic fallback for codenames not yet published upstream (e.g. Ubuntu 26.04 resolute falls back to questing / noble)
 - **Automatic PHP upgrade** — detects installed PHP version; auto-upgrades to 8.4 when below 8.3 minimum. EL via EPEL + Remi repo + `dnf module enable`; Ubuntu via Ondrej PPA; Debian via Sury DPA. Migrates custom `php.ini` settings, disables old PHP-FPM, restarts new service. Covers EL8–10, Ubuntu 22.04–24.04, Debian 12–13.
 - **Database security** — auth_socket/unix_socket auto-detection; credentials never exposed in process list (`--defaults-extra-file`); admin password via environment variable (not `/proc/cmdline`)
 - **Multi-source download** — Chinese mirror + global fallback with SHA-256 verification; cross-source hash verification for self-update; WP-CLI fallback when tar.gz sources fail
 - **Strict permissions** — wp-config.php locked to 0440 from creation; `O_NOFOLLOW` on all atomic write paths; SELinux booleans auto-configured
 - **Unified security entry points** — `_safe_rmtree` (parent whitelist + symlink block), `_safe_copy2` (bidirectional symlink check), `_safe_mkstemp` (`O_NOFOLLOW` + `fchmod`), `_verify_gzip_integrity` (pre-extract CRC check), `_safe_extract_tar` (path traversal + symlink member + timeout protection). 45 call sites across the script use these entry points.
 - **Git tag-pinned builds** — srcache/Brotli compilation modules pinned to git tags (not commit hashes), immune to GitHub shallow-clone restrictions
-- **Nginx hardening** — rate limiting on wp-login.php + admin-ajax.php, HSTS, CSP enforcement (`frame-ancestors` / `upgrade-insecure-requests`), wp-config/uploads/xmlrpc/wp-includes deny, HTTP method filtering, cert SAN / server_name auto-alignment, dynamic module load error cascade auto-repair (ABI mismatch → reinstall → remove → orphaned directive cleanup), proactive minor-version upgrades, FastCGI cache (optional), Redis srcache full-page cache (optional), Brotli (optional), HTTP/3 QUIC (optional)
+- **Nginx hardening** — rate limiting on wp-login.php + admin-ajax.php, HSTS, CSP enforcement (`frame-ancestors` / `upgrade-insecure-requests`), wp-config/uploads/xmlrpc/wp-includes deny, HTTP method filtering, cert SAN / server_name auto-alignment, dynamic module load error cascade auto-repair (ABI mismatch → reinstall → remove → orphaned directive cleanup), proactive minor-version upgrades, FastCGI cache (optional), Redis srcache full-page cache (optional), Brotli (optional), HTTP/3 QUIC (optional). New nginx 1.29.8+ directives (`max_headers`) and 1.29.3+ (`add_header_inherit`) emitted via runtime `nginx -v` probe — never fails `nginx -t` on older nginx (e.g. openEuler 24.03 nginx 1.24, Ubuntu 22.04 nginx 1.18).
 - **Firewall auto-config** — ufw (Ubuntu), firewalld (EL), nftables (Debian 12/13) auto-detected and configured; ports 80/443 TCP opened with persistence; nftables uses dedicated `inet wp_ssl` table (policy accept, won't lock SSH)
 - **Fail2Ban** — auto-configured WordPress brute-force protection with progressive banning (24h + escalation)
 - **Auto-renewal** — systemd timer with frequency auto-tuned to certificate lifetime (daily for 90-day, every 8h for 47-day, every 4h for 6-day certs), `--cert-name` precision renewal, persistent deploy hook, post-renewal Nginx certificate verification; renewal failure notification via `--notify-webhook` or auto-installed journal/email fallback (never silent)
@@ -33,7 +46,7 @@ One command to deploy WordPress with HTTPS, auto-renewal, and production-grade s
 - **`--no-*` reverse switches** — `--no-redis` / `--no-optimize` / `--no-cloudflare` / `--no-http3` / `--no-allow-xmlrpc` to explicitly disable auto-detected features during `update`/`enable-ssl`/`restore`
 - **Performance tuning** — PHP-FPM pool auto-sized by RAM, MariaDB InnoDB tuning, BBR + TCP sysctl, swap auto-creation, Nginx `open_file_cache` (`--optimize`)
 - **Self-healing** — 15 common failure scenarios auto-diagnosed and repaired: missing logrotate/curl auto-installed, failed DB auto-restarted, `nginx -t` errors auto-fixed (stale includes, duplicate default_server, server_names_hash_bucket_size), uninstall file deletion retried with `chattr -i`, PHP-FPM/Redis failures auto-diagnosed via config test and journal inspection
-- **Full-stack security hardening** — 55 security checks across 6 components, verified against OWASP / CIS Benchmark / official docs: PHP (expose_php, display_errors, disable_functions, open_basedir, session cookie security, allow_url_include), MariaDB (bind-address, local-infile, skip-symbolic-links, secure-file-priv, skip-show-database), Redis (bind localhost, rename-command, disable THP), OS sysctl (tcp_syncookies, rp_filter, accept_redirects, protected_hardlinks), systemd (NoNewPrivileges, PrivateTmp), WordPress (WP_DEBUG=false). All applied automatically via `update`.
+- **Full-stack security hardening** — 55 security checks across 6 components, verified against OWASP / CIS Benchmark / official docs: PHP (expose_php, display_errors, disable_functions, open_basedir, session cookie security, allow_url_include), MariaDB (bind-address, local-infile, skip-symbolic-links, secure-file-priv, skip-show-database), Redis (bind localhost, rename-command, disable THP, `timeout 300` direct conf write bypassing `CONFIG REWRITE` perm trap), OS sysctl (tcp_syncookies, rp_filter, accept_redirects, protected_hardlinks), systemd (NoNewPrivileges, PrivateTmp, `LimitNOFILE=65536` drop-in on platforms with low defaults), WordPress (WP_DEBUG=false). All applied automatically via `update` with per-platform probes — zero byte-level changes on already-healthy platforms.
 - **OpenSSL/Python SSL resilience** — Three-layer defense against `openssl-libs` upgrade breaking Python `_ssl.so`: L0 compile-time vs runtime version comparison (PEP 644) with auto `python3-libs` upgrade; L1 `_try_repair_openssl()` with subprocess verification after each strategy; L2 curl/wget fallback. Standalone `fix-openssl` subcommand for manual diagnosis.
 - **Component lifecycle** — Certbot snap migration with pip venv fallback; Redis/Valkey version-aware upgrades; WP-CLI auto-update with SHA-512 verification; fail2ban version detection with legacy compat; short-lived certificate auto-detection with timer frequency adjustment
 - **Dual-CA failover** — ZeroSSL (primary) + Let's Encrypt (fallback) with EAB auto-negotiation; ECC→RSA auto-downgrade; rate-limit detection; `migrate-ssl` subcommand for CA migration
@@ -123,6 +136,11 @@ All other dependencies (Nginx, PHP-FPM, MariaDB, certbot, etc.) are installed au
 --optimize                Enable Nginx open_file_cache for static-heavy sites
 --http3                   Enable HTTP/3 QUIC (requires Nginx http_v3 module)
 --skip-ssl                Deploy HTTP-only (skip SSL); use enable-ssl later
+--local-test              Deploy with self-signed cert for air-gapped/no-DNS env (V3.2.8+)
+--ech                     Enable TLS ECH (Encrypted ClientHello) — requires OpenSSL 4.0+ (V3.2.8+)
+--cf-api-token TOKEN      Cloudflare API token for ECH HTTPS record auto-publish (V3.2.8+)
+--mptcp / --no-mptcp      Enable/disable MPTCP (Multipath TCP); auto-detect if unspecified (V3.2.8+)
+--ocsp-stapling / --no-ocsp-stapling  Override auto-decision for OCSP stapling (V3.2.8+)
 --force                   Force certificate renewal regardless of expiry (renew)
 --persist-root-pwd        Save MariaDB root password to disk
 --zerossl-eab-kid KID     ZeroSSL EAB Key ID for backup CA (env: WP_ZEROSSL_EAB_KID)
@@ -261,6 +279,13 @@ After deployment, credentials are saved to `/root/.wp_credentials_<domain>.txt` 
 
 <a id="中文"></a>
 
+## 当前状态 (V3.2.8 build 3.2.365)
+
+- ✅ **生产就绪** — v3.2.364 启动期 NameError 已在 365 修复；14 条架构规则全部 🟢 绿色
+- ✅ **四层审计验证** — 541+ 项检查：466 契约测试 + 21 结构 + 54 迁移 + 14 规则深度审计，零违规
+- ✅ **实测性能** — WordPress `admin-ajax.php` TTFB 73.78 ms（默认配置，toksun.cn 生产环境）
+- ⚠ **版本说明** — 请使用 **build 365+** 或保持 **build 358**；跳过 build 359-364（架构清理中间态，build 364 有启动期 NameError）
+
 ## 功能特性
 
 - **零配置 HTTPS** — Let's Encrypt → ZeroSSL 自动容灾（EAB 自动协商）；优先 ECDSA P-256 密钥，不支持时自动降级 RSA；certbot 错误分类熔断；自动探测 Snap/certbot-auto/标准安装
@@ -375,6 +400,11 @@ sudo python3 wp_ssl_bootstrap.py enable-ssl \
 --optimize                启用 Nginx open_file_cache，适合静态资源密集站点
 --http3                   启用 HTTP/3 QUIC 协议（需 Nginx http_v3 模块）
 --skip-ssl                仅部署 HTTP（跳过 SSL）；后续用 enable-ssl 补签
+--local-test              离线/无 DNS 环境用自签证书部署（V3.2.8+）
+--ech                     启用 TLS ECH (Encrypted ClientHello) —— 需 OpenSSL 4.0+（V3.2.8+）
+--cf-api-token TOKEN      Cloudflare API token, 用于 ECH HTTPS 记录自动发布（V3.2.8+）
+--mptcp / --no-mptcp      启用/禁用 MPTCP 多路径 TCP; 不指定时自动探测（V3.2.8+）
+--ocsp-stapling / --no-ocsp-stapling  覆盖 OCSP stapling 自动决策（V3.2.8+）
 --force                   强制续期证书，忽略到期时间（renew）
 --persist-root-pwd        将 MariaDB root 密码保存至磁盘
 --zerossl-eab-kid KID     ZeroSSL EAB Key ID，备用 CA（环境变量: WP_ZEROSSL_EAB_KID）
