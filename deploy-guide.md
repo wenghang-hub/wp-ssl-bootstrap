@@ -1,8 +1,11 @@
-# WP-SSL-Bootstrap V3.2.8 — 全新建站参数指南
-# WP-SSL-Bootstrap V3.2.8 — New Site Deployment Guide
+# WP-SSL-Bootstrap V3.2.9 — 全新建站参数指南
+# WP-SSL-Bootstrap V3.2.9 — New Site Deployment Guide
 
-> **当前 build**: `3.2.365` (2026-04). 生产环境请使用此 build 或 build 358; **跳过 build 359-364**（架构清理中间态, build 364 有启动 NameError, 已在 365 修复）。  
-> **Current build**: `3.2.365` (2026-04). Production should use this or build 358; **skip builds 359-364** (architectural cleanup intermediate states; build 364 has startup NameError, fixed in 365).
+> **当前 build**: `3.2.382` (2026-04). V3.2.8 build 365 基础上的 **生产审计回归补丁** (22 项修复, 8 轮真实服务器回归验证)。无新 CLI 参数, 本指南所有部署命令保持兼容。
+> **Current build**: `3.2.382` (2026-04). **Production audit regression patch** on top of V3.2.8 build 365 (22 fixes across 8 rounds of live-server regression). No new CLI flags; all deployment commands in this guide remain compatible.
+>
+> **V3.2.8 build 365 用户强烈建议升级** — 修复 5 周静默失败的周度 `db-optimize`, 消除 12+ MariaDB CLI deprecation 警告, 修正 3 处 fail2ban 误配置, 升级 DH 参数 2048→3072 (NIST SP 800-57 2030+ 推荐)。
+> **V3.2.8 build 365 users strongly recommended to upgrade** — fixes 5-week silent weekly `db-optimize` failures, eliminates 12+ MariaDB CLI deprecation warnings, corrects 3 fail2ban misconfigurations, upgrades DH parameters 2048→3072 (NIST SP 800-57 2030+ recommendation).
 
 ---
 

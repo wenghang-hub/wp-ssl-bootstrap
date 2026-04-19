@@ -4,6 +4,133 @@ All notable changes to WP-SSL-Bootstrap are documented in this file.
 本文件记录 WP-SSL-Bootstrap 的所有重要变更。
 ---
 
+## [V3.2.9]
+
+> **升级说明 / Upgrade note**
+> V3.2.9 是 V3.2.8 基础上的 **生产审计回归补丁** (quality/bugfix release), 不是特性发布。
+> Build `365` → `381` (+22 项修复 / +291 代码行 / +3 模块级函数 / +5 模块级常量)。
+>
+> V3.2.9 is a **production audit regression patch** (quality/bugfix) on top of V3.2.8, not a feature release.
+> Build `365` → `381` (+22 fixes / +291 LOC / +3 module-level functions / +5 module-level constants).
+>
+> **关键修复 / Critical fixes**:
+> - **mysqlcheck 5 周静默失败** — V3.2.8 build 365 的 `db-optimize.service` 使用 `mysqlcheck --single-transaction`, 该选项是 `mysqldump` 独有, `mysqlcheck`/`mariadb-check` 不识别。每周日 03:00 的 optimize 任务 5 周累计静默失败 5 次 (status=2/INVALIDARGUMENT)。**5-week silent mysqlcheck failure** — V3.2.8 build 365 `db-optimize.service` used `mysqlcheck --single-transaction`; that flag is exclusive to `mysqldump`. Weekly optimize silently failed 5 times.
+> - **MariaDB CLI 命名过渡** — 新增 `_mariadb_cli()` helper + `_MARIADB_CLI_MAPPING` dict, 12+ 处调用优先 `mariadb-*` (MariaDB 10.5+ rename), 消除 11.x+ deprecation 警告。**MariaDB CLI transition** — new `_mariadb_cli()` helper + `_MARIADB_CLI_MAPPING` dict unifies 12+ call sites to prefer `mariadb-*` (MariaDB 10.5+ rename), silencing 11.x+ deprecation warnings.
+> - **systemd 服务沙箱对齐** — db-optimize + wp-cron 加入 `NoNewPrivileges=true` + `PrivateTmp=true`。**Systemd sandboxing alignment** — db-optimize + wp-cron add `NoNewPrivileges=true` + `PrivateTmp=true`.
+> - **Fail2Ban CF CIDR 白名单** — 新增 `_read_cloudflare_cidrs()`, 读 `/etc/nginx/conf.d/cloudflare-real-ip.conf` 的 CF CIDR 自动注入 wordpress/scanner/4xx-flood 的 `ignoreip`, 防御性避免 realip 失效时自毁。**Fail2Ban CF CIDR allowlist** — new `_read_cloudflare_cidrs()` auto-injects CF CIDR into jails' `ignoreip`, defensively preventing self-inflicted bans if realip fails.
+> - **DH 参数 2048 → 3072** — `ssl_dhparam` 从 `ffdhe2048` 升到 `ffdhe3072` (NIST SP 800-57 建议 2030+ 用 3072), fallback timeout 120s → 300s。**DH parameters 2048 → 3072** — `ssl_dhparam` `ffdhe2048` → `ffdhe3072` (NIST SP 800-57 recommends 3072 for 2030+), fallback timeout 120s → 300s.
+> - **审计分类器 UX 一致性** — 4 项 `collect-logs` 审计报告 UX 修复: systemd unit 名拆分 / 脚本 INFO 伪阳性过滤 / PHP-FPM logrotate NOTICE 归噪音 / unknown 信号渲染。**Audit classifier UX consistency** — 4 `collect-logs` UX fixes: per-unit systemd advice / script INFO false-positive filter / PHP-FPM logrotate NOTICE as noise / unknown signal rendering.
+>
+> **升级收益 / Upgrade benefits**: V3.2.8 build 365 用户强烈建议升级 — 修复 5 周累积的静默周度 db-optimize 失败, 消除 12+ MariaDB CLI deprecation 警告, 修正 3 处 fail2ban 误配置, 统一审计报告三层计数。
+> Strongly recommended for V3.2.8 build 365 users — fixes 5 weeks of silent weekly db-optimize failures, eliminates 12+ MariaDB CLI deprecation warnings, corrects 3 fail2ban misconfigurations, unifies audit report three-layer counts.
+>
+> **验证规模 / Verification scale**: `verify_refactor.py` 78/78 + `test_integration.py --phase static` 472/472 + toksun.cn 生产环境 6 轮真实部署回归 (🟡 B → 🟢 A+ 零阻塞)。
+> `verify_refactor.py` 78/78 + `test_integration.py --phase static` 472/472 + toksun.cn production: 8-round live deployment regression (🟡 B → 🟢 A+ zero-blocker).
+>
+> **诚实撤销 / Honest withdrawals**: 审计过程中主动撤销 4 项不成立的初始发现: ❼ (RandomizedDelaySec 已存在) / ⓮ (is_debian 分支已存在) / ❾ (GPG 3 节点 fallback 已存在) / ❿ (超时统一, 风险>收益, 延期)。
+> During audit, actively withdrew 4 initially-flagged items that did not hold: ❼ (RandomizedDelaySec already present) / ⓮ (is_debian branch already present) / ❾ (GPG 3-node fallback already present) / ❿ (timeout unification, risk > benefit, deferred).
+>
+> **兼容性 / Compatibility**: 无新 CLI 参数, 无新子命令, 无破坏性配置变化。V3.2.8 build 365 已部署站点通过 `update` 子命令一键升级, 幂等生效。
+> No new CLI flags, no new subcommands, no breaking config changes. Existing V3.2.8 build 365 sites upgrade idempotently via `update`.
+>
+> **🆕 build 365 用户首次看到的大功能 / Big feature new to build 365 users**: `collect-logs` 子命令的 **结构化审计报告生成器** (1,316 行新代码, 此功能在 build 366-379 的中间 build 引入, V3.2.9 为首次正式发布打包):
+> The **structured audit report generator** for `collect-logs` (1,316 LOC new code, introduced across intermediate builds 366-379, first officially bundled in V3.2.9):
+> - `_generate_site_audit_report()` 生成 1,300+ 行 `site-audit-report.md` (7 章节: 组件版本 / 端口监听 / SSL/TLS / 性能特性 / 安全加固 / Web 流量 / 主机资源 / 日志分类 / 运行时验证)
+> - `_generate_site_audit_report()` produces 1,300+ line `site-audit-report.md` (7 sections)
+> - `_print_audit_summary()` 控制台紧凑摘要 (评级 / 缓存命中率 / 攻击拦截数 / 封禁 IP / 待关注事项)
+> - `_print_audit_summary()` compact console summary (rating / cache hit rate / attacks blocked / banned IPs / items of concern)
+> - 三分类日志分类器 (`_signal_summary`): **🛡 defense** (防御生效证据) / **🔇 noise** (已知良性噪音) / **⚠️ signal** (真实需关注) — 不再把攻击拦截/重启通知误当问题
+> - Three-way log classifier (`_signal_summary`): **🛡 defense** / **🔇 noise** / **⚠️ signal** — no longer mistakes attack blocks / restart notices as problems
+> - 智能评级 🟢 A+ / 🟡 A / 🟡 B / 🔴 严重 (基于 signal 数 + 严重度 + 组件健康综合判定)
+> - Smart rating 🟢 A+ / 🟡 A / 🟡 B / 🔴 Critical (composite judgment based on signal count + severity + component health)
+
+---
+
+### 修复矩阵 / Fix Matrix
+
+| 分类 / Category | 编号 / ID | 修复 / Fix |
+|---|---|---|
+| **关键 bug / Critical bug** | ❶❷❸ | `mysqlcheck --single-transaction` 移除; 优先 `mariadb-check` / remove `--single-transaction`; prefer `mariadb-check` |
+| **架构 / Architecture** | ⓰ | `_mariadb_cli()` helper + `_MARIADB_CLI_MAPPING` 统一 CLI 调用 / unifies CLI calls |
+| | ❻ | `_probe_redis_port()` helper 动态读 redis/valkey.conf 的 port 指令 / dynamically reads port directive |
+| | ⓱ | Nginx 最小回退 `--user`/`--modules-path` 经 `PlatformInfo` 动态填 / dynamic fill via PlatformInfo |
+| **安全 / Security** | ⓫ | `_read_cloudflare_cidrs()` 条件注入 fail2ban ignoreip / conditional CF CIDR injection |
+| | ⓲ | db-optimize + wp-cron systemd `NoNewPrivileges=true` + `PrivateTmp=true` |
+| | ㉑ | EAB env 文件 post-write stat 核验 + `_safe_chmod` + chown 强制修正 / post-write stat verification + forced correction |
+| | ⓯ | ssl_dhparam `ffdhe2048` → `ffdhe3072`; fallback timeout 120s → 300s |
+| **配置 / Config** | ⓐ | wp-cron ExecStart 移除 `--allow-root` 死代码 / remove dead `--allow-root` |
+| | ⓳ | fail2ban `datepattern = {DEFAULT}` (官方关键字, 覆盖多格式) / official keyword covering multiple formats |
+| | ⓴ | firewalld zone 正则放宽支持 9+ zone / regex widened to support 9+ zones |
+| **审计器 UX / Audit UX** | ㉒ | systemd 异常退出 advice 按 unit 拆分 (regex `.*?` 非贪婪) / per-unit advice split (non-greedy regex) |
+| | ㉓ | 关键字扫描排除脚本自身 INFO/DEBUG + journal 续行 / exclude script INFO/DEBUG + continuation lines |
+| | ㉔ | `_noise_patterns` 新增 PHP-FPM logrotate NOTICE 识别 / add PHP-FPM logrotate NOTICE recognition |
+| | ㉕ | `_findings` 渲染 sev 加 `'unknown'`, 三层计数一致 / sev allowlist adds `'unknown'`, three layers consistent |
+| **restore 修复 / Restore fix** | ㉖ | `_restore_webroot_files` 解压后 chown + chmod 修复 umask 077 导致的 dir 权限 700 问题 / post-extract chown + chmod fixes dir perm 700 caused by umask 077 (Ubuntu 24.04 645/645 regression test triggered) |
+| **审计器 UX（续）/ Audit UX (cont'd)** | ㉗ | `_noise_patterns` 新增 srcache 能力探测临时 conf + deploy 早期 php-fpm sock 权限瞬态, 新鲜 deploy 评级从 🟢 A 升到 🟢 A+ / srcache probe temp conf + deploy-early php-fpm sock transient added, fresh-deploy rating 🟢 A → 🟢 A+ |
+| **可维护性 / Maintainability** | ❹ | `_mariadb_alt` → `_mariadb_cross_platform_dir` (语义化命名 / semantic naming) |
+| | ❺ | PHP-FPM 内存常量提取: `_PHP_FPM_WORKER_PEAK_MB=70` + `_PHP_FPM_RAM_BUDGET_RATIO=0.5` |
+| | ❽ | libssl 包名列表加 forward-compat 注释 (Debian 11→12→13 演进) / forward-compat comment (Debian evolution) |
+
+---
+
+### 新增模块级符号 / New Module-Level Symbols
+
+**函数 / Functions** (3):
+- `_mariadb_cli(tool)` — CLI 命名过渡 / CLI naming transition
+- `_probe_redis_port()` — Redis/Valkey 端口探测 / port probe
+- `_read_cloudflare_cidrs()` — CF CIDR 读取 / CIDR read
+
+**常量 / Constants** (5):
+- `_MARIADB_CLI_MAPPING` — CLI 名称映射表 / name mapping dict
+- `_PHP_FPM_WORKER_PEAK_MB = 70` — PHP-FPM worker 峰值内存 / worker peak memory
+- `_PHP_FPM_RAM_BUDGET_RATIO = 0.5` — 总 RAM 分配比例 / total RAM allocation ratio
+- `_CF_REALIP_CONF` — Cloudflare realip nginx conf 路径 / realip nginx conf path
+- `_REDIS_CONF_CANDIDATES` — Redis/Valkey conf 候选路径 / conf candidate paths
+
+---
+
+### 权威来源对齐 / Authoritative Source Alignment
+
+| 修改 / Change | 来源 / Source |
+|---|---|
+| mysqlcheck 选项 / options | Oracle MySQL 8.4 Reference Manual; MariaDB.com/docs |
+| mariadb-* 迁移 / migration | MariaDB KB 10.5+; WP-CLI issue #270; DDev issue #6861 |
+| systemd hardening | redhat.com/mastering-systemd; Fedora wiki; Rocky Linux docs |
+| Fail2Ban `{DEFAULT}` | manpages.debian.org/fail2ban/jail.conf.5 |
+| Fail2Ban + CF | SpinupWP / DigitalOcean / nesrual (支持 / support) + Plesk 论坛 / forum (争议 / contested) |
+| DH 参数长度 / DH length | NIST SP 800-131A Rev.2; SP 800-57 Part 1; Mozilla SSL Generator v5.7 |
+| PHP-FPM 内存 / memory | DCHost (2025-12); DoHost (2026-03); Kinamo |
+| Valkey/Redis 配置 / config | valkey.io 官方 / official; Arch Wiki; Percona blog |
+| firewalld zones | firewalld.org manpages; SUSE docs; CIQ Rocky Linux |
+| Nginx Debian 编译 / compile | LinuxCapable 2024 |
+
+---
+
+### 迭代过程 / Iteration Process
+
+8 轮真实服务器部署 + 回归验证:
+
+| 轮 / Round | 修复 / Fix | 评级 / Rating |
+|---|---|---|
+| 1 | 初版 17 项硬编码 + bug / Initial 17 hardcode+bug | 🟡 B + 2 项 / items |
+| 2 | ⓳ `{DEFAULT}` 语法 / syntax | 🟡 B |
+| 3 | ㉒ 正则 `.*?` / regex | 🟡 A + 1 项 / item |
+| 4 | ㉓ 脚本 INFO 过滤 / script INFO filter | 🟡 A + 1 项 / item |
+| 5 | ㉔ PHP-FPM logrotate 归噪音 / logrotate as noise | 🟢 **A+ 零阻塞 / A+ zero-blocker** |
+| 6 | ㉕ UX 一致性 / consistency | 🟢 A+ |
+
+| 7 | ㉖ restore webroot chown + chmod / restore webroot chown + chmod | ✅ **Ubuntu 24.04 645/645 全绿 / full green** |
+| 8 | ㉗ srcache probe + php-fpm sock 瞬态归噪音 / srcache probe + php-fpm sock transient as noise | ✅ **Debian 13 🟢 A+ 零未归类 / zero unclassified** |
+
+最终 toksun.cn 生产数据 / Final toksun.cn production metrics:
+- 缓存命中率 / Cache hit rate: 90.87%
+- 已拦截攻击 / Attacks blocked: 149
+- 自动封禁 IP / Auto-banned IPs: 2
+- 负载 / Load: 0.21
+- 内存 / Memory: 48%
+
+---
+
 ## [V3.2.8]
 
 > **升级说明 / Upgrade note**

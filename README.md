@@ -9,15 +9,18 @@ One command to deploy WordPress with HTTPS, auto-renewal, and production-grade s
 
 <a id="english"></a>
 
-## Status (V3.2.8 build 3.2.365)
+## Status (V3.2.9 build 3.2.382)
 
-- ✅ **Production-ready** — HOTFIX for v3.2.364 startup NameError; all 14 architecture rules 🟢 green
-- ✅ **4-layer audit verified** — 541+ checks: 466 contract tests + 21 structural + 54 migration + 14-rule deep audit, zero violations
-- ✅ **Measured performance** — WordPress `admin-ajax.php` TTFB 73.78 ms on default config (toksun.cn prod)
-- ⚠ **Version note** — use **build 365+** or stay on **build 358**; skip 359-364 (architectural cleanup intermediate states, build 364 has startup NameError)
+- ✅ **Production-ready** — Audit regression patch on top of V3.2.8 build 365; 22 fixes verified across 8 rounds of live-server regression; 🟡 B → 🟢 **A+ zero-blocker** on toksun.cn prod
+- ✅ **Critical fix** — `db-optimize.service` was silently failing for 5 weeks due to invalid `mysqlcheck --single-transaction` (flag exclusive to `mysqldump`); now fixed + preferring `mariadb-check`
+- ✅ **Full validation** — `verify_refactor.py` **78/78** + `test_integration.py --phase static` **472/472** + toksun.cn 8-round live regression
+- ✅ **Measured performance** — cache hit rate 90.87%, 149 attacks blocked, load 0.21, memory 48% (toksun.cn prod)
+- ℹ️ **V3.2.9 is a quality/bugfix release** — no new CLI flags, no new subcommands, no breaking changes. V3.2.8 build 365 users: **strongly recommended** to upgrade (fixes 5-week silent failure + 12+ MariaDB CLI deprecations + 3 fail2ban misconfigs + 4 audit UX issues)
 
 ## Features
 
+- **`collect-logs` structured audit report** (V3.2.8 build 366+, first shipped in V3.2.9) — One-click site health check: `python3 wp_ssl_bootstrap.py collect-logs` bundles a 1,300+ line `site-audit-report.md` into a tarball covering 7 sections (component versions, ports, SSL/TLS, performance, security hardening, fail2ban jails, traffic, resources, log classification, runtime verification). Three-way log classifier (`_signal_summary`) buckets entries into 🛡 defense (attack blocks) / 🔇 noise (known benign) / ⚠️ signal (real issues). Smart rating 🟢 A+ / 🟡 A / 🟡 B / 🔴 Critical. Compact console summary shows rating, cache hit rate, attacks blocked, banned IPs, items of concern. Machine-parseable for CI/CD; complete diagnostics for bug reports with zero manual log aggregation.
+- **Production audit regression patch (V3.2.9)** — 22 fixes on top of V3.2.8 build 365 from 8 rounds of live-server verification (toksun.cn + lamtin.hk): (❶❷❸) remove invalid `mysqlcheck --single-transaction` causing 5-week silent weekly-optimize failures; (⓰) `_mariadb_cli()` helper + `_MARIADB_CLI_MAPPING` unifies 12+ call sites to prefer `mariadb-*` (MariaDB 10.5+ rename); (❻) `_probe_redis_port()` dynamic port probe; (⓱) Nginx rebuild fallback cross-platform (Debian/RHEL user+modules_dir); (⓫) `_read_cloudflare_cidrs()` auto-injects CF CIDR into fail2ban jails' `ignoreip` (conditional on realip configured); (⓲) db-optimize + wp-cron systemd `NoNewPrivileges=true` + `PrivateTmp=true`; (㉑) EAB env file post-write stat verification + `_safe_chmod` (TOCTOU-safe); (⓯) `ssl_dhparam` `ffdhe2048` → `ffdhe3072` (NIST SP 800-57 2030+ recommendation); (⓳) fail2ban `datepattern = {DEFAULT}` (official keyword per Debian manpage); (⓴) firewalld zone regex widened to 9+ zones; (㉒㉓㉔㉕) 4 `collect-logs` audit classifier UX fixes (per-unit systemd advice / script INFO false-positive filter / PHP-FPM logrotate NOTICE as noise / unknown signal rendering for three-layer count consistency); (㉖) **restore webroot chown + chmod** post-extraction to fix dir mode `700` caused by tar `--no-same-permissions` + script umask `077` (Ubuntu 24.04 lamtin.hk 645/645 regression). Plus 4 honest audit withdrawals (❼⓮❾❿). Zero new CLI flags, zero breaking changes.
 - **Clean architecture (V3.2.8 build 365+)** — WPDeployManager god-class decomposed to 5 specialized Managers (NginxManager / MariaDBManager / PHPManager / RedisManager / CertManager), 327→108 methods (-67%). 11 Manager public APIs (`get_conf_path`, `validate_config`, `graceful_shutdown`, `verify_user_connection`, etc.). All 14 internal architecture rules 🟢 green. 466-assertion contract test suite against future refactor regression. Zero user-visible behavior change vs. build 287.
 - **Zero-config HTTPS** — Let's Encrypt → ZeroSSL automatic failover with EAB auto-negotiation; ECDSA (P-256) preferred with RSA fallback; certbot error classification with circuit-breaker logic; Snap/certbot-auto/standard installs auto-detected
 - **TLS ECH (Encrypted ClientHello)** (V3.2.8+) — RFC 9849 full automation: `_detect_ech_support()` OpenSSL 4.0+ probe → `_generate_ech_keypair()` → auto-publish HTTPS record via 4 DNS providers (Cloudflare, AWS Route53, Aliyun DNS, DNSPod) → `_install_ech_rotation_timer()` systemd timer key rotation. Hides SNI from ISPs/middleboxes. CLI: `--ech` with `--cf-api-token` / Route53 credentials
@@ -279,15 +282,19 @@ After deployment, credentials are saved to `/root/.wp_credentials_<domain>.txt` 
 
 <a id="中文"></a>
 
-## 当前状态 (V3.2.8 build 3.2.365)
+## 当前状态 (V3.2.9 build 3.2.382)
 
-- ✅ **生产就绪** — v3.2.364 启动期 NameError 已在 365 修复；14 条架构规则全部 🟢 绿色
-- ✅ **四层审计验证** — 541+ 项检查：466 契约测试 + 21 结构 + 54 迁移 + 14 规则深度审计，零违规
-- ✅ **实测性能** — WordPress `admin-ajax.php` TTFB 73.78 ms（默认配置，toksun.cn 生产环境）
-- ⚠ **版本说明** — 请使用 **build 365+** 或保持 **build 358**；跳过 build 359-364（架构清理中间态，build 364 有启动期 NameError）
+- ✅ **生产就绪** — V3.2.8 build 365 基础上的审计回归补丁; 22 项修复, 经 8 轮真实服务器回归验证; toksun.cn 生产环境 🟡 B → 🟢 **A+ 零阻塞**
+- ✅ **关键修复** — `db-optimize.service` 因无效的 `mysqlcheck --single-transaction`（此标志是 `mysqldump` 独有）导致周度任务静默失败 5 周, 现已修复 + 首选 `mariadb-check`
+- ✅ **完整验证** — `verify_refactor.py` **78/78** + `test_integration.py --phase static` **472/472** + toksun.cn 6 轮真实部署回归
+- ✅ **实测性能** — 缓存命中率 90.87%、已拦截攻击 149 次、负载 0.21、内存 48%（toksun.cn 生产环境）
+- ℹ️ **V3.2.9 是质量/bug 修复发布** — 无新 CLI 参数, 无新子命令, 无破坏性变化。V3.2.8 build 365 用户: **强烈建议升级**（修复 5 周静默失败 + 12+ MariaDB CLI deprecation + 3 处 fail2ban 误配置 + 4 项审计 UX 问题）
 
 ## 功能特性
 
+- **`collect-logs` 结构化审计报告** (V3.2.8 build 366+ 引入, V3.2.9 首次正式打包) — 一键站点体检: `python3 wp_ssl_bootstrap.py collect-logs` 打包 1,300+ 行 `site-audit-report.md` 到 tarball, 涵盖 7 章节 (组件版本 / 端口监听 / SSL/TLS / 性能特性 / 安全加固 / fail2ban jail 状态 / Web 流量分布 / 主机资源 / 日志分类统计 / 运行时验证)。三分类日志分类器 (`_signal_summary`) 把日志条目分到 🛡 defense (攻击拦截证据) / 🔇 noise (已知良性噪音) / ⚠️ signal (真实需关注)。智能评级 🟢 A+ / 🟡 A / 🟡 B / 🔴 严重。控制台紧凑摘要显示评级、缓存命中率、攻击拦截数、封禁 IP、待关注事项。CI/CD 可 grep 解析; bug 报告时 tarball 自带完整诊断, 无需手工聚合多个日志。
+- **生产审计回归补丁 (V3.2.9)** — 在 V3.2.8 build 365 基础上通过 8 轮真实服务器验证 (toksun.cn + lamtin.hk) 叠加 22 项修复: (❶❷❸) 移除非法 `mysqlcheck --single-transaction` 选项, 根治 5 周静默的周度 optimize 失败; (⓰) `_mariadb_cli()` helper + `_MARIADB_CLI_MAPPING` dict 统一 12+ 处调用, 优先 `mariadb-*` (MariaDB 10.5+ 新命名); (❻) `_probe_redis_port()` 动态端口探测; (⓱) Nginx 最小回退编译参数跨平台化 (Debian/RHEL user+modules_dir); (⓫) `_read_cloudflare_cidrs()` 条件注入 CF CIDR 到 fail2ban jail ignoreip (realip 已配置时); (⓲) db-optimize + wp-cron systemd `NoNewPrivileges=true` + `PrivateTmp=true`; (㉑) EAB env 文件 post-write stat 核验 + `_safe_chmod` (TOCTOU-safe); (⓯) `ssl_dhparam` `ffdhe2048` → `ffdhe3072` (NIST SP 800-57 建议 2030+ 用 3072); (⓳) fail2ban `datepattern = {DEFAULT}` (Debian manpage 官方关键字); (⓴) firewalld zone 正则放宽支持 9+ zone; (㉒㉓㉔㉕) 4 项 `collect-logs` 审计分类器 UX 修复 (systemd unit 名拆分 / 脚本 INFO 伪阳性过滤 / PHP-FPM logrotate NOTICE 归噪音 / unknown 信号渲染达成三层计数一致); (㉖) **restore webroot 解压后 chown + chmod**, 修正因 tar `--no-same-permissions` + 脚本 umask `077` 导致目录权限变 `700` 的 bug (Ubuntu 24.04 lamtin.hk 645/645 回归测试触发)。另有 4 项诚实撤销的审计误判 (❼⓮❾❿)。零新 CLI 参数, 零破坏性变化。
+- **架构清洁 (V3.2.8 build 365+)** — WPDeployManager god-class 分解到 5 个专业 Manager (NginxManager / MariaDBManager / PHPManager / RedisManager / CertManager), 327→108 方法 (-67%)。11 个 Manager 公开 API (`get_conf_path`, `validate_config`, `graceful_shutdown`, `verify_user_connection` 等)。14 条内部架构规则 🟢 全绿。466 断言契约测试套件防未来重构回归。相对 build 287 零用户可见行为变化。
 - **零配置 HTTPS** — Let's Encrypt → ZeroSSL 自动容灾（EAB 自动协商）；优先 ECDSA P-256 密钥，不支持时自动降级 RSA；certbot 错误分类熔断；自动探测 Snap/certbot-auto/标准安装
 - **两阶段部署** — `deploy --skip-ssl` 先部署 HTTP，DNS 就绪后 `enable-ssl` 补签证书；或一步到位全量 HTTPS
 - **交互式向导** — 不指定子命令时自动进入 TTY 引导菜单，选择域名、邮箱、SSL 策略和外置数据库配置

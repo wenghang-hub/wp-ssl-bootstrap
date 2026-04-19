@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""WP-SSL-Bootstrap V3.2.8+ 集成测试脚本
+"""WP-SSL-Bootstrap V3.2.8+ 集成测试脚本 (synced → build 3.2.379 + v6/v7 patch)
 
-在真实服务器上端到端验证脚本所有功能。
+在真实服务器上端到端验证脚本所有功能.
+
+静态契约覆盖到 v3.2.379 + v6/v7 补丁 (含 collect-logs 审计报告链 + 信号分类
++ FIX-❶..㉕ 回归修复 + ⓯ DH 参数 3072 升级).
+实机检查含 site-audit-report.md / resource-snapshot.txt 的内容验证.
 
 用法:
   # 交互式 (推荐 — 自动检测域名/邮箱/基线/平台):
@@ -533,12 +537,19 @@ def port_listening(port):
     r = run(f"ss -tlnp | grep :{port}")
     return r.returncode == 0
 
-def curl_status(url, timeout=10, insecure=False, resolve_to=None):
-    """获取 HTTP 状态码。
+def curl_status(url, timeout=10, insecure=False, resolve_to=None,
+                retry_on_transient=True):
+    """获取 HTTP 状态码.
 
     resolve_to: 可选, 形如 "127.0.0.1" — 强制 curl 直连回环/本机地址,
-                Host 头仍用 URL 中的域名。用于绕过 CDN (Cloudflare) 代理,
-                直接探测源站 nginx 的 :80/:443 响应。
+                Host 头仍用 URL 中的域名. 用于绕过 CDN (Cloudflare) 代理,
+                直接探测源站 nginx 的 :80/:443 响应.
+
+    [v4-opt] retry_on_transient: 返回码为 0 (curl 彻底连不上, 如 DNS/超时/
+                拒连) 时做指数退避重试 (base=0.5s, factor=2, max 3 次).
+                依据 AWS retry-backoff 指南 + Tenacity 模式 — 只重试瞬时失败,
+                HTTP 4xx/5xx 是合法结果不重试.
+                测试用例要禁用重试时传 retry_on_transient=False.
     """
     cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
            "--max-time", str(timeout)]
@@ -553,8 +564,23 @@ def curl_status(url, timeout=10, insecure=False, resolve_to=None):
                 _port = "443" if _scheme == "https" else "80"
             cmd.extend(["--resolve", f"{_host}:{_port}:{resolve_to}"])
     cmd.append(url)
-    r = run(cmd)
-    return int(r.stdout.strip()) if r.stdout.strip().isdigit() else 0
+
+    _attempts = 3 if retry_on_transient else 1
+    _delay = 0.5
+    for _i in range(_attempts):
+        r = run(cmd)
+        _code = int(r.stdout.strip()) if r.stdout.strip().isdigit() else 0
+        # 非 0 = 得到 HTTP 响应 (含 4xx/5xx), 直接返回不重试
+        if _code != 0:
+            return _code
+        # 0 = curl 连接失败 (DNS/timeout/refused), 瞬态, 可重试
+        if _i < _attempts - 1:
+            # 指数退避 + 轻量抖动 (±20%) — AWS retry-backoff 模式
+            import random as _random
+            _jitter = _random.uniform(0.8, 1.2)
+            time.sleep(_delay * _jitter)
+            _delay *= 2
+    return 0
 
 def cert_info(domain):
     """获取证书信息"""
@@ -733,10 +759,36 @@ class IntegrationTest:
             flags += f" --notify-webhook {shlex.quote(self.ctx.notify_webhook)}"
         return flags
 
-    def check(self, name, condition, msg=""):
-        """记录测试结果"""
+    # [v4-opt] 失败分类常量: 参考 pytest smart retry (GH #13802) 分类策略
+    # - CONFIG: 主脚本配置/契约断言 (AST/静态分析)
+    # - SERVICE: systemd/进程/端口等服务层断言
+    # - NETWORK: 网络依赖 (DNS/HTTPS/webhook/cert 签发) — 瞬时失败可重试
+    # - SECURITY: 权限/header/敏感信息脱敏
+    # - ENV: 环境/前置条件 (基线文件/依赖工具缺失)
+    # - ASSERTION: 其他通用断言 (默认值)
+    _CATEGORIES = frozenset(
+        {"CONFIG", "SERVICE", "NETWORK", "SECURITY", "ENV", "ASSERTION"})
+
+    def check(self, name, condition, msg="", category="ASSERTION"):
+        """记录测试结果.
+
+        [v4-opt] 扩展: 自动填充 duration (从 _check_t0 到当前时间),
+        并支持 category 分类标签, 便于 triage 时按类别聚合失败.
+        """
+        # 每次 check 起算点: 上一次 check 结束到这次 check 结束的时长
+        # (粗粒度, 但足够识别 >100ms 的慢检查)
+        _now = time.time()
+        _dur = _now - getattr(self, "_check_t0", _now)
+        self._check_t0 = _now
+
+        if category not in self._CATEGORIES:
+            category = "ASSERTION"
+
         r = TestResult(name=name, phase=self._phase, passed=bool(condition),
-                       message=msg if not condition else "")
+                       message=msg if not condition else "",
+                       duration=_dur)
+        # TestResult 原只有 4 字段, 追加 category 作为实例属性 (dataclass 兼容)
+        r.category = category
         self.ctx.results.append(r)
         mark = "✅" if r.passed else "❌"
         print(f"  {mark} {name}" + (f" — {msg}" if msg and not r.passed else ""))
@@ -797,6 +849,7 @@ class IntegrationTest:
         print(f"  {t('phase_n_of', n=self.ctx.phases.index(phase)+1, total=len(self.ctx.phases))}: {phase.upper()}")
         print(f"{'='*60}")
         t0 = time.time()
+        self._check_t0 = t0  # [v4-opt] 重置 check 计时基准, 避免 phase 间干扰
         try:
             fn()
         except Exception as e:
@@ -3649,8 +3702,9 @@ class IntegrationTest:
                    and "nginx-4xx-flood" in new_src,
                    "缺少 Fail2Ban 扫描器/4xx 防护 jail")
         self.check("P289_dhparam",
-                   "dhparam" in new_src and "ffdhe2048" in new_src,
-                   "缺少 DH 参数文件生成 (RFC 7919)")
+                   "dhparam" in new_src
+                   and ("ffdhe2048" in new_src or "ffdhe3072" in new_src),
+                   "缺少 DH 参数文件生成 (RFC 7919 ffdhe2048/3072)")
         # OCSP Stapling 策略: 仅按签发商判定 (LE 禁用, ZeroSSL/其他启用)
         # 不再按 _is_china_network 判定 — ZeroSSL 在国内可用, nginx soft-fail 兜底
         self.check("P289_ocsp_per_ca",
@@ -4165,6 +4219,67 @@ class IntegrationTest:
 
         # ══════════════════════════════════════════════════════════════════
         # [v3.2.365] ★★★ 陷阱契约测试结束
+        # ══════════════════════════════════════════════════════════════════
+
+        # ══════════════════════════════════════════════════════════════════
+        # [v3.2.366-379] ★★★ collect-logs 审计报告链契约测试 ★★★
+        # 主脚本在这段 build 窗口的核心功能: collect-logs 子命令的分类统计
+        # 一致性 + 审计报告生成 + systemd 失败智能识别. 这些新 API/行为点
+        # 应被静态断言固化, 防止后续重构误删.
+        # ══════════════════════════════════════════════════════════════════
+
+        _wpdm_methods = cls_methods(nt, "WPDeployManager")
+
+        # [v3.2.367] 审计报告生成器必须作为 WPDeployManager 方法存在.
+        # collect_logs 依赖它生成人类可读的 site_audit_*.md 风格报告.
+        self.check(
+            "v3_2_367_audit_report_generator_exists",
+            "_generate_site_audit_report" in _wpdm_methods,
+            "v3.2.367 要求: WPDeployManager._generate_site_audit_report "
+            "必须存在 (审计报告生成入口)")
+
+        # [v3.2.367] collect_logs 必须产出 site-audit-report.md.
+        # 远程支持靠 `tar -xzOf wp-logs-*.tar.gz site-audit-report.md | less` 快速定位.
+        self.check(
+            "v3_2_367_audit_md_output_path",
+            "site-audit-report.md" in new_src,
+            "v3.2.367 要求: collect_logs 应产出 site-audit-report.md "
+            "(作为诊断包内的审计报告入口文件)")
+
+        # [v3.2.378] 统一资源数据源: resource-snapshot.txt 被 collect_logs
+        # 开头采集, 后续 (健康评估/审计报告) 复用, 避免重复解析.
+        self.check(
+            "v3_2_378_resource_snapshot_source",
+            "resource-snapshot.txt" in new_src,
+            "v3.2.378 要求: collect_logs 应生成 resource-snapshot.txt "
+            "作为统一资源快照 (CPU/内存/磁盘/负载)")
+
+        # [v3.2.379] 分类后的信号摘要结构: _signal_summary 被用来展示过滤后
+        # 的统计, 取代 raw _signals. 保证"真实信号数"和"问题发现数"一致化.
+        self.check(
+            "v3_2_379_signal_summary_aggregation",
+            "_signal_summary" in new_src,
+            "v3.2.379 要求: 日志分类应产出 _signal_summary 聚合结构 "
+            "(过滤后数据, 统一展示)")
+
+        # [v3.2.379] collect_logs 必须扫 systemd journal 的
+        # 'Main process exited status=N' 事件, 补齐 error/crit/fatal 盲区.
+        self.check(
+            "v3_2_379_systemd_journal_main_exit_scan",
+            "Main process exited" in new_src,
+            "v3.2.379 要求: collect_logs 应扫 systemd journal 里的 "
+            "'Main process exited status=N' 事件 (systemd 失败智能识别)")
+
+        # [v3.2.379] 信号分类器必须识别 TEMPFAIL (status=75, 脚本并发锁冲突
+        # 自动避让) 为 noise — 否则会被误判为真实 SSL 签发失败.
+        self.check(
+            "v3_2_379_tempfail_status75_noise_classification",
+            "status=75" in new_src,
+            "v3.2.379 要求: 分类器应识别 status=75 (TEMPFAIL, 并发锁冲突) "
+            "归为 noise signal (不算真实故障)")
+
+        # ══════════════════════════════════════════════════════════════════
+        # [v3.2.366-379] 契约测试结束
         # ══════════════════════════════════════════════════════════════════
 
     # ── 阶段 2: 全新部署 ────────────────────────────────────────
@@ -5619,13 +5734,19 @@ class IntegrationTest:
                     _tar_names = _tar.getnames()
                     _tar_count = len(_tar_names)
                     self.check("diag_package_file_count",
-                               _tar_count >= 40,
-                               f"诊断包仅 {_tar_count} 个文件 (期望 ≥40)")
+                               _tar_count >= 42,
+                               f"诊断包仅 {_tar_count} 个文件 "
+                               f"(期望 ≥42, v3.2.367+ 含 site-audit-report.md, "
+                               f"v3.2.378+ 含 resource-snapshot.txt)")
                     # 验证关键新增文件
                     for _expected in [
                         "system-info.txt", "script-journal.log",
                         "conf-php-fpm-pool.conf", "conf-php.ini",
                         "diag-php-modules.txt",
+                        # [v3.2.367] 审计报告入口文件 (人类可读, md 格式)
+                        "site-audit-report.md",
+                        # [v3.2.378] 统一资源快照 (CPU/内存/磁盘/负载)
+                        "resource-snapshot.txt",
                     ]:
                         self.check(f"diag_has_{_expected.replace('.','_').replace('-','_')}",
                                    _expected in _tar_names,
@@ -5644,6 +5765,148 @@ class IntegrationTest:
                                 self.check("B295_diag_redis_tcp_port_0",
                                            "tcp_port:0" in _ri_content,
                                            "diag-redis-info.txt 显示 tcp_port 非 0")
+                        except Exception:
+                            pass
+                    # [v3.2.367] 审计报告内容验证 —— 不简单检测"非空",
+                    # 而是**复用主脚本的健康分析结论**做实质判定:
+                    #
+                    #   主脚本在报告里已做完整的 11 章节分析, 自带:
+                    #     - 总体结论三态:  # ✅ 站点健康 / # 🟡 有 N 项需关注 / # 🔴 N 项严重错误
+                    #     - 最终评级五档:  🟢 A+/A  🟡 B/C  🔴 需要干预
+                    #     - 13 大 section headers
+                    #
+                    #   测试脚本把这些结论直接用作判定, 避免重复实现分析逻辑.
+                    if "site-audit-report.md" in _tar_names:
+                        try:
+                            _ar_f = _tar.extractfile("site-audit-report.md")
+                            if _ar_f:
+                                _ar = _ar_f.read().decode(
+                                    "utf-8", errors="replace")
+
+                                # ─── 基础 sanity: 报告可读且格式有效 ────────
+                                self.check(
+                                    "v3_2_367_audit_report_non_empty",
+                                    len(_ar) >= 500,
+                                    f"site-audit-report.md 仅 {len(_ar)} 字节 "
+                                    f"(期望 ≥500, 空报告 = 生成失败)")
+
+                                # ─── 11 大 section 完整性 (结构骨架) ────────
+                                # 缺章节 = 生成器回归, 不是环境问题
+                                _required_sections = [
+                                    ("总体结论",   "## 🎯 总体结论"),
+                                    ("组件版本",   "## 📦 组件版本清单"),
+                                    ("网络端口",   "## 🌐 网络与监听端口"),
+                                    ("SSL/TLS",   "## 🔒 SSL/TLS 配置分析"),
+                                    ("性能特性",   "## 🚀 性能特性状态"),
+                                    ("安全加固",   "## 🛡 安全加固状态"),
+                                    ("Systemd",   "## ⏰ Systemd 定时器"),
+                                    ("主机资源",   "## 🖥 主机资源"),
+                                    ("问题发现",   "## ⚠ 发现的问题"),
+                                    ("运行时验证", "## ✔️ 运行时验证"),
+                                    ("最终评级",   "## 🏆 最终评级"),
+                                ]
+                                _missing = [cn for cn, hdr in _required_sections
+                                            if hdr not in _ar]
+                                self.check(
+                                    "v3_2_367_audit_report_sections_complete",
+                                    len(_missing) == 0,
+                                    f"审计报告缺 {len(_missing)} 个 section: "
+                                    f"{_missing[:5]}")
+
+                                # ─── 主脚本自评: 总体结论三态 ──────────────
+                                # 报告头必含三态之一; 无匹配 = 报告格式破坏
+                                _conclusion_healthy = "# ✅ 站点健康" in _ar
+                                _conclusion_warn_m = re.search(
+                                    r'# 🟡 站点运行正常, 有 (\d+) 项需关注', _ar)
+                                _conclusion_crit_m = re.search(
+                                    r'# 🔴 站点检测到 (\d+) 项严重错误', _ar)
+
+                                _has_conclusion = (_conclusion_healthy
+                                                    or _conclusion_warn_m
+                                                    or _conclusion_crit_m)
+                                self.check(
+                                    "v3_2_367_audit_report_conclusion_parseable",
+                                    _has_conclusion,
+                                    "审计报告总体结论行无法识别 "
+                                    "(格式破坏: 缺三态之一)")
+
+                                # ─── 核心健康断言: 报告不能说站点严重错误 ────
+                                # 🔴 严重错误 = 主脚本自己判定"需要干预" → 测试失败
+                                _crit_count = (int(_conclusion_crit_m.group(1))
+                                                if _conclusion_crit_m else 0)
+                                self.check(
+                                    "audit_report_no_critical_errors",
+                                    _crit_count == 0,
+                                    f"主脚本自评站点有 {_crit_count} 项严重错误 "
+                                    f"(见 site-audit-report.md 问题发现章节)")
+
+                                # ─── 最终评级: 五档解析 ───────────────────
+                                # 🟢 A+/A = 健康; 🟡 B/C = 运行但不理想;
+                                # 🔴 需要干预 = 严重 (直接 FAIL)
+                                _rating = "未知"
+                                for _pat, _lbl in [
+                                    (r'🟢 \*\*生产级 A\+\*\*', "A+"),
+                                    (r'🟢 \*\*生产级 A\*\*',   "A"),
+                                    (r'🟡 \*\*生产级 B\*\*',   "B"),
+                                    (r'🟡 \*\*生产级 C\*\*',   "C"),
+                                    (r'🔴 \*\*需要干预\*\*',   "需要干预"),
+                                ]:
+                                    if re.search(_pat, _ar):
+                                        _rating = _lbl
+                                        break
+                                self.check(
+                                    "v3_2_367_audit_report_rating_present",
+                                    _rating != "未知",
+                                    "审计报告最终评级行缺失/格式不符 (五档之一)")
+                                self.check(
+                                    "audit_report_not_critical_rating",
+                                    _rating not in ("需要干预",),
+                                    f"主脚本给出严重评级: {_rating}")
+
+                                # ─── 警告级结论: 🟡 状态记录为 info, 不 fail ─
+                                # (可运行, 但审计出 N 项需关注 — 值得打印给运维)
+                                if _conclusion_warn_m:
+                                    _warn_count = int(_conclusion_warn_m.group(1))
+                                    print(f"    ℹ 审计报告: 站点运行正常但有 "
+                                          f"{_warn_count} 项需关注 "
+                                          f"(评级 {_rating})")
+                                elif _conclusion_healthy:
+                                    print(f"    ℹ 审计报告: 站点完全健康 "
+                                          f"(评级 {_rating})")
+
+                                # ─── v3.2.379 信号分类: 真实信号数 ≤ 阈值 ─
+                                # 从"日志分类统计"表格提取 "⚠️ 真实信号 | N"
+                                _signal_m = re.search(
+                                    r'⚠️ 真实信号 \| (\d+) \|', _ar)
+                                if _signal_m:
+                                    _sig_cnt = int(_signal_m.group(1))
+                                    # 基线: toksun.cn 生产站点真实信号 ≤ 6
+                                    # 超过 10 说明站点确有异常, 不是报告问题
+                                    self.check(
+                                        "v3_2_379_real_signals_within_budget",
+                                        _sig_cnt <= 10,
+                                        f"审计报告识别 {_sig_cnt} 条真实信号 "
+                                        f"(阈值 10, 可能有未处理的性能/资源问题)")
+                        except Exception as _ar_e:
+                            self.check("audit_report_parseable", False,
+                                       f"审计报告解析异常: {_ar_e}")
+                    # [v3.2.378] resource-snapshot.txt 实机内容验证: 应含资源指标
+                    if "resource-snapshot.txt" in _tar_names:
+                        try:
+                            _rs_f = _tar.extractfile("resource-snapshot.txt")
+                            if _rs_f:
+                                _rs_content = _rs_f.read().decode(
+                                    "utf-8", errors="replace")
+                                # 资源快照应含 CPU/内存/磁盘指标之一
+                                _has_metrics = any(
+                                    _k in _rs_content.lower() for _k in
+                                    ("cpu", "mem", "memory", "disk",
+                                     "load", "swap", "filesystem"))
+                                self.check(
+                                    "v3_2_378_resource_snapshot_has_metrics",
+                                    _has_metrics and len(_rs_content) >= 100,
+                                    f"resource-snapshot.txt 内容异常 "
+                                    f"({len(_rs_content)} 字节, 缺资源指标)")
                         except Exception:
                             pass
                     # 验证 system-info.txt 包含 WP-CLI 和脚本版本
@@ -6028,10 +6291,34 @@ def print_report(ctx: TestContext):
     print(f"  {t('report_failed')}:     {failed}/{total}")
 
     if failed:
+        # [v4-opt] 失败分类聚合 (参考 pytest smart retry #13802):
+        # 按 category 分组, 让 triage 一眼看到瓶颈类型.
+        # NETWORK 类多 = 环境不稳, CONFIG 类多 = 主脚本契约破坏.
+        _by_cat = {}
+        for r in ctx.results:
+            if not r.passed:
+                _cat = getattr(r, "category", "ASSERTION")
+                _by_cat.setdefault(_cat, []).append(r)
+        if len(_by_cat) > 1:
+            print(f"\n  失败分类聚合:")
+            for _cat in sorted(_by_cat.keys(), key=lambda k: -len(_by_cat[k])):
+                _cn = len(_by_cat[_cat])
+                _hint = {
+                    "NETWORK":  " → 可能是环境/网络瞬态, 考虑重跑",
+                    "SERVICE":  " → 服务层问题, 查 systemctl/journalctl",
+                    "CONFIG":   " → 主脚本契约回归, 重点审查",
+                    "SECURITY": " → 安全基线回归, 阻塞发布",
+                    "ENV":      " → 前置条件缺失, 先修环境",
+                    "ASSERTION": "",
+                }.get(_cat, "")
+                print(f"    [{_cat}] {_cn} 项{_hint}")
+
         print(f"\n  ❌ 失败项:")
         for r in ctx.results:
             if not r.passed:
-                print(f"    [{r.phase}] {r.name}: {r.message[:80]}")
+                _cat = getattr(r, "category", "ASSERTION")
+                _tag = f"[{_cat:9s}]" if _cat != "ASSERTION" else "           "
+                print(f"    {_tag}[{r.phase}] {r.name}: {r.message[:80]}")
 
     # 按阶段统计
     print(f"\n  阶段统计:")
@@ -6046,6 +6333,15 @@ def print_report(ctx: TestContext):
         mark = "✅" if f == 0 else "❌"
         print(f"    {mark} {phase}: {p}/{p+f}")
 
+    # [v4-opt] 最慢 10 项 check (参考 pytest --durations=10):
+    # 只有 duration 实际被采集才显示; 阈值 >0.05s 过滤掉大量瞬时 check.
+    _timed = [r for r in ctx.results if getattr(r, "duration", 0) > 0.05]
+    if _timed:
+        _timed.sort(key=lambda r: -r.duration)
+        print(f"\n  最慢 10 项 check (>50ms):")
+        for r in _timed[:10]:
+            print(f"    ⏱ {r.duration*1000:6.0f}ms  [{r.phase}] {r.name}")
+
     print(f"\n{'='*60}")
 
     # 写入 JSON 报告
@@ -6059,13 +6355,76 @@ def print_report(ctx: TestContext):
         "failed": failed,
         "total": total,
         "results": [
-            {"name": r.name, "phase": r.phase, "passed": r.passed, "message": r.message}
+            {"name": r.name, "phase": r.phase, "passed": r.passed,
+             "message": r.message, "duration": round(r.duration, 4),
+             "category": getattr(r, "category", "ASSERTION")}
             for r in ctx.results
         ],
     }
     try:
         report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False))
         print(f"  JSON 报告: {report_path}")
+    except OSError:
+        pass
+
+    # [v4-opt] JUnit XML 报告 (GitLab/Jenkins/GitHub Actions 事实标准格式):
+    # 各 CI 平台可直接解析展示 test panel, 参考 GitLab unit_test_reports 文档.
+    # 每个 phase = 一个 <testsuite>, 每个 check = 一个 <testcase>.
+    _junit_path = report_path.with_suffix(".xml")
+    try:
+        import xml.sax.saxutils as _xml_esc
+
+        def _esc(s):
+            return _xml_esc.escape(str(s) if s is not None else "")
+
+        _suites_xml = []
+        _total_time = 0.0
+        for phase in phases_seen:
+            phase_r = [r for r in ctx.results if r.phase == phase]
+            _p_time = sum(getattr(r, "duration", 0) for r in phase_r)
+            _total_time += _p_time
+            _p_pass = sum(1 for r in phase_r if r.passed)
+            _p_fail = sum(1 for r in phase_r if not r.passed)
+            _cases = []
+            for r in phase_r:
+                _t = round(getattr(r, "duration", 0), 4)
+                _classname = f"test_integration.phase_{phase}"
+                _cat = getattr(r, "category", "ASSERTION")
+                if r.passed:
+                    _cases.append(
+                        f'    <testcase classname="{_esc(_classname)}" '
+                        f'name="{_esc(r.name)}" time="{_t}">\n'
+                        f'      <properties>\n'
+                        f'        <property name="category" value="{_esc(_cat)}"/>\n'
+                        f'      </properties>\n'
+                        f'    </testcase>')
+                else:
+                    _cases.append(
+                        f'    <testcase classname="{_esc(_classname)}" '
+                        f'name="{_esc(r.name)}" time="{_t}">\n'
+                        f'      <properties>\n'
+                        f'        <property name="category" value="{_esc(_cat)}"/>\n'
+                        f'      </properties>\n'
+                        f'      <failure type="{_esc(_cat)}" '
+                        f'message="{_esc(r.message[:200])}">'
+                        f'{_esc(r.message)}</failure>\n'
+                        f'    </testcase>')
+            _suites_xml.append(
+                f'  <testsuite name="{_esc(phase)}" tests="{len(phase_r)}" '
+                f'failures="{_p_fail}" errors="0" skipped="0" '
+                f'time="{round(_p_time, 3)}" '
+                f'hostname="{_esc(_p.get("id", "unknown"))}">\n'
+                + "\n".join(_cases)
+                + "\n  </testsuite>")
+        _xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<testsuites name="wp_ssl_bootstrap_integration" '
+            f'tests="{total}" failures="{failed}" errors="0" skipped="0" '
+            f'time="{round(_total_time, 3)}">\n'
+            + "\n".join(_suites_xml)
+            + "\n</testsuites>\n")
+        _junit_path.write_text(_xml, encoding="utf-8")
+        print(f"  JUnit XML 报告: {_junit_path}")
     except OSError:
         pass
 
@@ -6260,6 +6619,45 @@ def main():
 
     tester = IntegrationTest(ctx)
 
+    # [v4-opt] atexit 兜底清理注册 (依据 CodecOV teardown 最佳实践):
+    # 测试被 Ctrl+C / OOM / 硬中断打断时, 保证:
+    #   1. Tee 日志文件被 flush+close (否则日志尾部丢失)
+    #   2. 最后已完成的阶段仍能输出 partial JSON/JUnit 报告 (triage 依据)
+    # 已成功退出时这段不会重复执行 (atexit 只触发一次).
+    import atexit as _atexit
+
+    def _emergency_cleanup():
+        try:
+            # 尝试补写一份 partial 报告 (若 print_report 未跑到)
+            _partial = getattr(ctx, "_report_written", False)
+            if not _partial and ctx.results:
+                try:
+                    _p_path = Path(
+                        f"/root/test_report_partial_"
+                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+                    _p_path.write_text(json.dumps({
+                        "interrupted": True,
+                        "timestamp": datetime.now().isoformat(),
+                        "domain": ctx.domain,
+                        "completed_phases":
+                            list({r.phase for r in ctx.results}),
+                        "passed": sum(1 for r in ctx.results if r.passed),
+                        "failed": sum(1 for r in ctx.results if not r.passed),
+                        "total": len(ctx.results),
+                    }, indent=2, ensure_ascii=False))
+                    print(f"\n  ⚠ 已写入 partial 报告: {_p_path}")
+                except OSError:
+                    pass
+            # Tee 日志落盘
+            try:
+                _tee.flush()
+            except Exception:
+                pass
+        except Exception:
+            pass  # atexit 严禁抛异常
+
+    _atexit.register(_emergency_cleanup)
+
     for phase in ctx.phases:
         tester.run_phase(phase)
         if tester.fatal:
@@ -6271,6 +6669,7 @@ def main():
             break
 
     result = print_report(ctx)
+    ctx._report_written = True  # [v4-opt] 标记正常完成, atexit 不再重复出报告
 
     # 显示日志路径并关闭 Tee
     print(f"  {t('report_log')}: {_log_path}")

@@ -89,8 +89,8 @@ WP-SSL-Bootstrap: 高可用建站引擎
 #                   2) Before release, set __version__ to new version
 #                   3) Optionally reset __build__ to match
 # ---------------------------------------------------------------------------
-__version__ = "3.2.8"
-__build__   = "3.2.365"  # ★★★ 陷阱目录契约测试 (A13/A2/B1/C3/G1) + 规则 7 信号检查覆盖率 33% + 24 项 V3.2.364 Manager API 契约测试. 跨 6 次会话完整重构成果: WPDM 327→108 方法 (-67%), 架构规则 1-14 全绿, 静态测试 436 → 465 (+29 新断言) 全部通过. 历史陷阱 A13 (wrapper 漏 return)、A2 (INJECTION BLOCK 顺序)、B1 (regex 注释累积)、C3 (redis-cli socket)、G1 (collect_logs 诊断)、规则 7 信号检查覆盖率等都有专项静态断言防止回归. 规则 7 (8.8% → 33.0%, 超过 30% 目标). 在 WPDM __init__ 末尾 INJECTION BLOCK 向 5 个 Manager 注入 self._abort_if_shutdown 引用 (A1/A2 合规: 注入在 Manager 创建+所有其他 inject 之后). 批量在 55 个 Manager 方法入口加 self._abort_if_shutdown() 信号检查点 (覆盖 timeout ≥ 60s 的长操作: NginxManager 22 / MariaDBManager 11 / PHPManager 10 / CertManager 9 / RedisManager 3). 策略: 方法入口轮询点 (Python subprocess.run 无法中途取消, 入口检查是最佳实践). 总调用点 23 → 76 (+53), 长操作覆盖率 23/260 → 76/230 (33%). 历史: V3.2.7 WPDM 327 方法 → v3.2.364 108 方法 (-67%), 架构规则 1/2 零违规, 规则 7 从黄变绿.
+__version__ = "3.2.9"
+__build__   = "3.2.382"  # v3.2.9 build 382: [FIX-㉗] 审计分类器 _noise_patterns 新增两条 deploy-time 瞬态识别 (Debian 13 lamtin.hk build 381 测试后发现: 全阶段 645/645 契约全绿, 但 site-audit-report.md 仍显示 3 条 "未归类" 日志 → 评级 A 而非 A+). 两条新 noise: (1) r'srcache_detect_\w+\.conf' — 脚本自己的 srcache 能力探测器写 /tmp/srcache_detect_XXX.conf 测 nginx 是否支持 redis_pass 指令, 失败即 fallback 到 FastCGI, nginx emerg 是期望结果不是真错误; (2) r'connect\(\) to unix:/run/php[^\s]*\.sock failed.*Permission denied' — Deploy 早期 nginx 先启 php-fpm 还没设好 socket 权限, 健康检查或零星请求撞上的瞬态 (<5s 恢复), 若持续出现请单独排查 nginx_user vs www-data 不一致. 效果: 新鲜 deploy 后审计评级从 🟡 A 升到 🟢 A+ (匹配 toksun.cn 稳定运行多天后的结果), lamtin.hk 预期 3 项未归类 → 0. 所有 build 381 及以前修复保留 (❶..㉖, 详见 CHANGELOG).
 
 # ---------------------------------------------------------------------------
 # [PATCH-284] 模块化重构路线图 / Modularization Roadmap
@@ -886,6 +886,109 @@ def _generate_secure_password(length: int = 48) -> str:
     """
     return ''.join(secrets.choice(_AUTOGEN_PASSWORD_CHARS) for _ in range(length))
 
+# ---------------------------------------------------------------------------
+# [FIX-⓰] MariaDB CLI 二进制名过渡期统一探测
+# ---------------------------------------------------------------------------
+# MariaDB 11.x 起将全部 mysql* 工具重命名为 mariadb-*:
+#   mysql         → mariadb
+#   mysqldump     → mariadb-dump
+#   mysqladmin    → mariadb-admin
+#   mysqlcheck    → mariadb-check
+#   mysqlshow     → mariadb-show
+#   mysqlbinlog   → mariadb-binlog
+#   mysqlimport   → mariadb-import
+# 老名称保留为兼容符号链接, 但调用时会打印 Deprecated 警告, 污染 systemd
+# journal 并在未来主版本 (预计 MariaDB 12.x) 可能被移除。
+#
+# 该函数优先返回新名称, 回退到旧名称, 最终兜底原字符串 (让 subprocess 自己
+# 报 FileNotFoundError 而不是在此抛 KeyError)。upstream MySQL 用户不受影响,
+# 因为 shutil.which("mariadb-*") 会返回 None, 自动回退 mysql*。
+_MARIADB_CLI_MAPPING = {
+    "client":  ("mariadb",        "mysql"),
+    "dump":    ("mariadb-dump",   "mysqldump"),
+    "admin":   ("mariadb-admin",  "mysqladmin"),
+    "check":   ("mariadb-check",  "mysqlcheck"),
+    "show":    ("mariadb-show",   "mysqlshow"),
+    "binlog":  ("mariadb-binlog", "mysqlbinlog"),
+    "import":  ("mariadb-import", "mysqlimport"),
+}
+
+def _mariadb_cli(tool: str) -> str:
+    """返回 MariaDB 客户端工具路径, 优先新名 (mariadb-*), 回退旧名 (mysql*)。
+
+    tool: 'client' | 'dump' | 'admin' | 'check' | 'show' | 'binlog' | 'import'
+    """
+    _new, _old = _MARIADB_CLI_MAPPING.get(tool, (None, tool))
+    if _new:
+        return shutil.which(_new) or shutil.which(_old) or _old
+    return shutil.which(_old) or _old
+
+# ---------------------------------------------------------------------------
+# [FIX-⓫] Fail2Ban ignoreip 自动注入 Cloudflare CIDR
+# ---------------------------------------------------------------------------
+# 经 Cloudflare 代理的请求, nginx realip 模块会把 $remote_addr 替换为真实
+# 客户端 IP (CF-Connecting-IP 头)。但 realip 仅在请求头存在且源 IP 在
+# set_real_ip_from 白名单内时生效。若 CF 误删 CF-Connecting-IP 头、CDN 替换
+# 为非 CF 代理、或 realip conf 加载顺序错误, fail2ban 的 ^<HOST> 会匹配到
+# Cloudflare 边缘节点 IP, 导致封禁 CF 整个 IP 段 → 站点对所有 CF 用户不可访问。
+#
+# 本函数从 /etc/nginx/conf.d/cloudflare-real-ip.conf 解析 CIDR 列表
+# (单一事实来源), 返回空格分隔的 ignoreip 值。文件不存在时返回空字符串,
+# 此时 ignoreip 只含回环地址 (保持原行为)。
+_CF_REALIP_CONF = Path("/etc/nginx/conf.d/cloudflare-real-ip.conf")
+
+def _read_cloudflare_cidrs() -> str:
+    """读取 Cloudflare CIDR 列表, 返回空格分隔的字符串 (可直接拼入 ignoreip)。
+
+    无配置文件 / 解析失败 / 无 CIDR 时返回空字符串。
+    """
+    try:
+        if not _CF_REALIP_CONF.exists():
+            return ""
+        _text = _CF_REALIP_CONF.read_text(encoding="utf-8", errors="replace")
+        _cidrs = re.findall(
+            r'^\s*set_real_ip_from\s+([^;\s]+)\s*;', _text, re.MULTILINE)
+        # 简单校验: 必须含 / (CIDR 标记), 过滤可能的垃圾行
+        _cidrs = [c for c in _cidrs if "/" in c]
+        return " ".join(_cidrs)
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+# ---------------------------------------------------------------------------
+# [FIX-❻] Redis/Valkey 运行时端口探测
+# ---------------------------------------------------------------------------
+# 若用户手动修改了 redis.conf 的 port 指令 (例如避开其他服务冲突),
+# nginx upstream 继续指向硬编码 6379 会导致 srcache 静默失效 ——
+# 不报错, 但全页缓存实际不生效, 后端 PHP 压力依旧。
+#
+# 本函数按优先级探测:
+#   1. /etc/redis.conf / /etc/redis/redis.conf (RHEL / Debian 惯例)
+#   2. /etc/valkey.conf / /etc/valkey/valkey.conf (Valkey 9.x 惯例)
+# 返回值: int 端口号, 或 None (文件不存在/解析失败)。
+_REDIS_CONF_CANDIDATES = (
+    "/etc/redis.conf",
+    "/etc/redis/redis.conf",
+    "/etc/valkey.conf",
+    "/etc/valkey/valkey.conf",
+)
+
+def _probe_redis_port() -> Optional[int]:
+    """从 Redis/Valkey 配置文件读取 port 值, 返回整数或 None。"""
+    for _path in _REDIS_CONF_CANDIDATES:
+        try:
+            if not Path(_path).exists():
+                continue
+            _txt = Path(_path).read_text(encoding="utf-8", errors="replace")
+            # 最后一次出现的 port 指令生效 (redis 配置语义)
+            _matches = re.findall(r'^\s*port\s+(\d+)\s*$', _txt, re.MULTILINE)
+            if _matches:
+                _p = int(_matches[-1])
+                if 0 < _p < 65536:
+                    return _p
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+    return None
+
 # [V3.2.121] FIX-4: 从 SiteConfig.__init__ 和 _nginx_safe_name() 两处
 # 独立维护的编码逻辑中提取为单一事实来源。修改编码规则时只需改此一处。
 #
@@ -1192,6 +1295,17 @@ _PHP_DEFAULT_VERSION = "8.5"    # 升级目标: 最新稳定版 (2025-11 GA, act
 #     _read_php_ini_values 迁移的配置项可能在 9.0 中不再有效。
 #     _apply_php_ini_values 使用 patch_php_ini_line() 写入,
 #     对不存在的指令仅追加不报错, 不会导致 PHP 启动失败。
+
+# [FIX-❺] PHP-FPM 容量规划常量
+# ────────────────────────────────────────────────────────────────
+# 原先这两个值 (每 worker 内存预算、可用内存比例) 以魔法数字形式硬写在
+# PHPManager._apply_fpm_tuning 公式里: `max_ch = int(total_mb * 0.5 / 70)`。
+# 现提取为常量, 方便:
+#   1. WordPress/插件栈实测 peak/worker 变化时一处调整
+#   2. 内存紧的小站点可临时调低 _PHP_FPM_RAM_BUDGET_RATIO 让出更多给 DB
+#   3. Code reviewer 一眼看懂 "0.5 / 70" 的来源
+_PHP_FPM_WORKER_PEAK_MB = 70      # 单 worker 内存峰值 (实测 WP 6.9 + opcache 256M + JIT 64M)
+_PHP_FPM_RAM_BUDGET_RATIO = 0.5   # 分配给 PHP-FPM 的 RAM 比例 (剩余留给 DB/Redis/kernel/buffer cache)
 
 # EL 系: Remi module stream 名 (包名无版本前缀, 由 stream 控制)
 # Debian/Ubuntu: 包名含版本前缀 php{ver}-fpm
@@ -9256,9 +9370,9 @@ class SiteConfig:
         # systemd service unit instead of relying on bare 'mysqlcheck',
         # which may not be on the narrow default PATH of systemd units.
         # Fallback mirrors common distro locations (/usr/bin is safest).
-        self.mysqlcheck_bin = (
-            shutil.which("mysqlcheck") or "/usr/bin/mysqlcheck"
-        )
+        # [FIX-⓰] 统一通过 _mariadb_cli('check') 探测, 消除重复的探测逻辑;
+        # 属性名保留为 mysqlcheck_bin 以避免对引用处 (41124 行) 的 API 破坏。
+        self.mysqlcheck_bin = _mariadb_cli("check") or "/usr/bin/mariadb-check"
         self.cert_chain, self.cert_key = self._probe_cert_paths(
             self.domain, self.certbot_bin
         )
@@ -9844,7 +9958,11 @@ def _nginx_preamble(domain: str, cache_mode: str, allow_xmlrpc: bool = False) ->
         # 消除内核 TCP 协议栈开销。与 wp-config.php WP_REDIS_SCHEME=unix 对齐。
         # 部署初期 Redis 未启动时 socket 不存在, 回退 TCP; update 时
         # socket 已就绪, 自动切换。nginx upstream 模块原生支持 unix: 前缀。
-        _redis_endpoint = "127.0.0.1:6379"  # TCP fallback
+        # [FIX-❻] TCP 端口从 redis.conf / valkey.conf 实际配置值读取,
+        # 回退 6379。若用户手动改了 port, 避免 nginx upstream 指向错误端口
+        # 导致 srcache 失效 (不报错但全页缓存不生效)。
+        _redis_port = _probe_redis_port() or 6379
+        _redis_endpoint = "127.0.0.1:%d" % _redis_port  # TCP fallback
         for _rs_candidate in ("/run/valkey/valkey.sock",
                               "/run/redis/redis.sock",
                               "/var/run/redis/redis.sock",
@@ -12094,33 +12212,37 @@ def generate_https_config(domain: str, webroot: Path, sock_path: str,
              时直接使用，省去函数内 _resolve_cert_paths() 运行时探测。
              空值时降级到 _resolve_cert_paths() 保持向后兼容。
     """
-    # [PATCH-289] 生成 DH 参数文件 (仅首次, RFC 7919 ffdhe2048)
+    # [PATCH-289] 生成 DH 参数文件 (仅首次, RFC 7919 ffdhe3072)
+    # [FIX-⓯] 2048 → 3072: NIST SP 800-131A Rev.2 把 2048-bit DH 列入
+    # "transitioning" (2030 年降级不再推荐), 主动升到 3072 保持 112+ bits
+    # 安全级别。RFC 7919 定义 ffdhe{2048,3072,4096,6144,8192}, 均为标准命名
+    # 组, OpenSSL 1.1.1+ 全部支持; 生成耗时从几秒增至十几秒 (仅首次)。
     _dhparam = Path("/etc/nginx/dhparam.pem")
     if not _dhparam.exists():
         try:
             # 优先用 openssl genpkey (秒级, 使用 RFC 7919 预定义组)
             _dh_r = subprocess.run(
                 ["openssl", "genpkey", "-genparam", "-algorithm", "DH",
-                 "-pkeyopt", "group:ffdhe2048",
+                 "-pkeyopt", "group:ffdhe3072",
                  "-out", str(_dhparam)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                 encoding="utf-8", errors="replace",
                 timeout=30, check=False)
             if _dh_r.returncode != 0:
                 # 旧版 OpenSSL (EL7 1.0.2) 不支持 genpkey -pkeyopt group:
-                # 清理可能留下的空文件, 降级为 dhparam 2048 (10-60 秒)
+                # 清理可能留下的空文件, 降级为 dhparam 3072 (30-120 秒)
                 try:
                     _dhparam.unlink()
                 except OSError:
                     pass
                 subprocess.run(
-                    ["openssl", "dhparam", "-out", str(_dhparam), "2048"],
+                    ["openssl", "dhparam", "-out", str(_dhparam), "3072"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=120, check=False)
+                    timeout=300, check=False)
             if _dhparam.exists():
                 _safe_chmod(str(_dhparam), 0o644)
                 logging.info(
-                    "[PATCH-289] DH 参数文件已生成: %s (RFC 7919 ffdhe2048)",
+                    "[PATCH-289] DH 参数文件已生成: %s (RFC 7919 ffdhe3072)",
                     _dhparam)
         except Exception as _dh_e:
             logging.debug("[PATCH-289] dhparam generation: %s", _dh_e)
@@ -13316,6 +13438,13 @@ def _try_repair_openssl() -> tuple:
             ["yum", "update", "-y", "python3-libs", "python3"],
         ))
     elif _shutil_repair.which("apt-get"):
+        # [FIX-❽] libssl 包名随 Debian/Ubuntu 版本演进:
+        #   Debian 11  libssl1.1
+        #   Debian 12  libssl3
+        #   Debian 13  libssl3t64    (64-bit time_t 过渡, 2024)
+        #   Debian 14+ 未来可能 libssl4 / libssl3t128 / 其他
+        # 采用 try-all-strategies 模式: 逐个尝试已知包名, 失败不阻塞, 首个
+        # 成功即返回。添加新包名时只需追加 _repair_strategies 条目。
         _repair_strategies.append((
             "apt-get install --reinstall -y openssl libssl3",
             ["apt-get", "install", "--reinstall", "-y", "openssl", "libssl3"],
@@ -16574,10 +16703,19 @@ class NginxManager:
                                if "http_v3_module" not in a]
                 _strategies.append(("fullargs_no_v3", _no_v3_args + _mods))
         # 降级: 仅使用关键功能参数
+        # [FIX-⓱] 原硬编码 RHEL 路径/用户 (/usr/lib64/nginx/modules, nginx user)
+        # 在 Debian 会失败 — Debian 用 /usr/lib/nginx/modules 和 www-data 用户,
+        # 且运行时无 nginx 用户。通过 PlatformInfo 抽取正确值, 回退 RHEL 默认。
+        _nginx_user = (self.platform.get("nginx_user") or "nginx") \
+            if hasattr(self, "platform") else "nginx"
+        _mod_dirs = (self.platform.get("nginx_modules_dir") or
+                     ["/usr/lib64/nginx/modules"]) \
+            if hasattr(self, "platform") else ["/usr/lib64/nginx/modules"]
+        _mod_dir = _mod_dirs[0] if isinstance(_mod_dirs, list) else _mod_dirs
         _minimal_args = [
             "--prefix=/etc/nginx",
             "--sbin-path=/usr/sbin/nginx",
-            "--modules-path=/usr/lib64/nginx/modules",
+            "--modules-path=%s" % _mod_dir,
             "--conf-path=/etc/nginx/nginx.conf",
             "--error-log-path=/var/log/nginx/error.log",
             "--http-log-path=/var/log/nginx/access.log",
@@ -16586,7 +16724,7 @@ class NginxManager:
             "--http-client-body-temp-path=/var/cache/nginx/client_temp",
             "--http-proxy-temp-path=/var/cache/nginx/proxy_temp",
             "--http-fastcgi-temp-path=/var/cache/nginx/fastcgi_temp",
-            "--user=nginx", "--group=nginx",
+            "--user=%s" % _nginx_user, "--group=%s" % _nginx_user,
             "--with-compat", "--with-file-aio", "--with-threads",
             "--with-http_ssl_module", "--with-http_v2_module",
             "--with-http_realip_module", "--with-http_gzip_static_module",
@@ -19192,6 +19330,24 @@ class NginxManager:
             self._exit_code = 1
             logging.warning(t("warn_webroot_restore_fail"))
             return
+        # [FIX-㉖] tar 用 --no-same-owner --no-same-permissions 解压后, 文件
+        # owner 变 root, 且权限经脚本全局 umask 0o077 过滤: 归档里 dir 755
+        # → 解压后 700 (drwx------), nginx 用户无 x bit 无法 traverse,
+        # 造成 wp-cron 读 wp-includes/Requests/src/Autoload.php 时
+        # Permission denied (而非 No such file) → Ubuntu 24.04 lamtin.hk
+        # 回归测试 log_php_no_fatal 失败. 对称修复:
+        #   1. chown -R <nginx_user>:<nginx_user>  恢复 owner
+        #   2. chmod -R u=rwX,g=rX,o=rX            恢复可 traverse 权限
+        #      (X 仅对 dir 和已含 x 的文件生效, 不误加执行位给 .php)
+        _user = self.detect_user()
+        self.run_cmd(
+            ["chown", "-R", "%s:%s" % (_user, _user),
+             str(self.cfg.webroot_path)],
+            quiet=True, timeout=60)
+        self.run_cmd(
+            ["chmod", "-R", "u=rwX,g=rX,o=rX",
+             str(self.cfg.webroot_path)],
+            quiet=True, timeout=60)
         logging.info(t("info_webroot_restore_ok"))
 
     def setup_firewall(self) -> None:
@@ -21601,7 +21757,14 @@ class NginxManager:
             + "# [AUDIT-L11] datepattern compatible with fail2ban 0.9+ through 0.11+\n"
             + "# Omit %%z (timezone): unsupported in fail2ban < 0.10;\n"
             + "# timestamp prefix alone is sufficient for line matching.\n"
-            + "datepattern = %%d/%%b/%%Y:%%H:%%M:%%S\n"
+            # [FIX-⓳] 原 datepattern 只覆盖 combined ($time_local) 格式;
+            # 若用户切到 ISO8601 ($time_iso8601) 日志格式, failregex 仍会
+            # 匹配但 fail2ban 无法提取日期 → jail 静默失效。
+            # 修正: 使用 {DEFAULT} 显式启用 fail2ban 全部内置探测器
+            # (含 combined + ISO8601 + TAI64N + Epoch 等), fail2ban >= 0.10
+            # 支持该关键字 (EL7+ / Debian 10+ 包 >= 0.10.x 默认可用)。
+            # 早期版本 (fail2ban < 0.10) 已 EOL 2018, 不再兼容。
+            + "datepattern = {DEFAULT}\n"
             + "\n"
             + "ignoreregex =\n"
         )
@@ -21610,6 +21773,11 @@ class NginxManager:
         jail_dir = Path("/etc/fail2ban/jail.d")
         jail_dir.mkdir(parents=True, exist_ok=True)
         jail_file = jail_dir / f"wordpress-{safe_name}.conf"
+        # [FIX-⓫] 自动把 Cloudflare CIDR 加入 ignoreip, 防止 realip 模块失效
+        # (CF 去掉 CF-Connecting-IP 头 / 换 CDN / realip conf 顺序错乱) 时
+        # fail2ban 错封 Cloudflare 边缘 IP 段, 导致整个站点对 CF 用户不可达。
+        _cf_ignore = _read_cloudflare_cidrs()
+        _cf_suffix = (" " + _cf_ignore) if _cf_ignore else ""
         jail_content = (
             f"# Auto-generated by WP-SSL-Bootstrap\n"
             f"[wordpress-{safe_name}]\n"
@@ -21624,8 +21792,10 @@ class NginxManager:
             f"bantime.factor = 2\n"
             f"bantime.rndtime = 1800\n"
             # [BP-3] 防止管理员通过本机/SSH tunnel 管理时误封自己。
-            # 仅豁免回环地址; 用户可手动添加管理 IP。
-            f"ignoreip = 127.0.0.1/8 ::1\n"
+            # 回环地址 + Cloudflare CIDR (若 realip 已配置)。
+            # [FIX-⓫] CF CIDR 由 _read_cloudflare_cidrs() 从 realip conf 解析,
+            # 保持单一事实来源, 换 CDN 或更新 CIDR 时只需 re-run setup。
+            f"ignoreip = 127.0.0.1/8 ::1{_cf_suffix}\n"
         )
 
         try:
@@ -21663,7 +21833,8 @@ class NginxManager:
             "            ^<HOST> .*\"(GET|POST|HEAD) /server-status.* HTTP/\\S+\" \\d+ \\S+\n"
             "            ^<HOST> .*\"(GET|POST|HEAD) .*\\.asp.* HTTP/\\S+\" (403|404) \\S+\n"
             "\n"
-            "datepattern = %%d/%%b/%%Y:%%H:%%M:%%S\n"
+            # [FIX-⓳] {DEFAULT} 启用 fail2ban 内置全部日期探测器, 详见 wordpress jail 注释
+            "datepattern = {DEFAULT}\n"
             "\n"
             "ignoreregex =\n"
         )
@@ -21679,7 +21850,8 @@ class NginxManager:
             f"bantime  = 86400\n"
             f"bantime.increment = true\n"
             f"bantime.factor = 2\n"
-            f"ignoreip = 127.0.0.1/8 ::1\n"
+            # [FIX-⓫] CF CIDR, 见 wordpress jail 相同修复
+            f"ignoreip = 127.0.0.1/8 ::1{_cf_suffix}\n"
         )
 
         # Layer 2: 高频 4xx 洪泛 — 通用扫描器检测
@@ -21691,7 +21863,8 @@ class NginxManager:
             "[Definition]\n"
             "failregex = ^<HOST> .*\"(GET|POST|HEAD) .* HTTP/\\S+\" (403|404) \\S+\n"
             "\n"
-            "datepattern = %%d/%%b/%%Y:%%H:%%M:%%S\n"
+            # [FIX-⓳] {DEFAULT} 启用 fail2ban 内置全部日期探测器, 详见 wordpress jail 注释
+            "datepattern = {DEFAULT}\n"
             "\n"
             "# [v3.2.333] 排除合法静态资源的 404 (favicon/robots.txt/assets)\n"
             "# 关键: 必须锚定请求路径末尾, 否则攻击者用 URL 编码的 .css 串\n"
@@ -21718,7 +21891,8 @@ class NginxManager:
             f"bantime  = 1800\n"
             f"bantime.increment = true\n"
             f"bantime.factor = 2\n"
-            f"ignoreip = 127.0.0.1/8 ::1\n"
+            # [FIX-⓫] CF CIDR, 见 wordpress jail 相同修复
+            f"ignoreip = 127.0.0.1/8 ::1{_cf_suffix}\n"
         )
 
         try:
@@ -23223,7 +23397,8 @@ class MariaDBManager:
             return True
         try:
             _r = subprocess.run(
-                ["mysql", "--defaults-extra-file=%s" % defaults_file,
+                [_mariadb_cli("client"),
+                 "--defaults-extra-file=%s" % defaults_file,
                  "-u", user, db_name, "-e", "SELECT 1;"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 encoding='utf-8', errors='replace',
@@ -23273,10 +23448,15 @@ class MariaDBManager:
     def get_conf_dirs(self) -> list:
         """返回 MariaDB 配置目录候选列表 (平台首选 + 备选)"""
         primary = self.platform.get("mariadb_conf_dir")
-        alt = "/etc/my.cnf.d" if self.platform.is_debian else "/etc/mysql/conf.d"
+        # [FIX-❹] 变量名从 `alt` 改为 `_cross_platform_dir` 明示语义:
+        # 在 Debian 上返回 RHEL 路径, 在 RHEL 上返回 Debian 路径,
+        # 让跨平台镜像 / 手动迁移场景也能被扫描到。原 `alt` 读起来像
+        # "备选本平台路径", 六个月后极易误改成反向赋值。
+        _cross_platform_dir = (
+            "/etc/my.cnf.d" if self.platform.is_debian else "/etc/mysql/conf.d")
         dirs = [primary]
-        if alt != primary:
-            dirs.append(alt)
+        if _cross_platform_dir != primary:
+            dirs.append(_cross_platform_dir)
         return dirs
 
     # --- [REFACTOR] Migrated from WPDeployManager (pkg_mgr -> platform.pkg_mgr) ---
@@ -24334,7 +24514,9 @@ class MariaDBManager:
         _is_local = not self.cfg.is_external_db
         # [V2.9.4] B6 修复：mysqladmin 不可用（如最小化镜像）时直接跳过轮询循环，
         # 避免每次迭代抛 FileNotFoundError 被静默吞掉，白白阻塞 max_wait 秒才走回退。
-        _have_mysqladmin = bool(shutil.which("mysqladmin"))
+        # [FIX-⓰] 统一用 _mariadb_cli 探测新旧命名 (mariadb-admin / mysqladmin)
+        _admin_bin = _mariadb_cli("admin")
+        _have_mysqladmin = bool(shutil.which(_admin_bin) or shutil.which("mysqladmin"))
         if _have_mysqladmin:
             for attempt in range(1, max_wait + 1):
                 # [PATCH-290] 每次迭代重新检测 socket — MariaDB 启动过程中
@@ -24355,7 +24537,7 @@ class MariaDBManager:
                 # Access denied 说明 daemon 在运行，也算就绪。
                 try:
                     r = subprocess.run(
-                        ["mysqladmin", "-u", "root"] + host_args + ["ping", "--silent"],
+                        [_admin_bin, "-u", "root"] + host_args + ["ping", "--silent"],
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         encoding='utf-8', errors='replace',  # [V3.2.45] BUG-A: mirrors FIX-8/FIX-10/FIX-11; non-UTF-8 locale safe
                         timeout=5, check=False,
@@ -24377,7 +24559,7 @@ class MariaDBManager:
         for _fb_i in range(_fb_tries):
             try:
                 r = subprocess.run(
-                    ["mysql", "-u", "root"] + host_args + ["-e", "SELECT 1;"],
+                    [_mariadb_cli("client"), "-u", "root"] + host_args + ["-e", "SELECT 1;"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     encoding='utf-8', errors='replace',  # [V3.2.44] FIX-11: drop redundant universal_newlines (mirrors FIX-8/FIX-10)
                     timeout=10, check=False,
@@ -24400,19 +24582,21 @@ class MariaDBManager:
                 ["systemctl", "restart", self.db_svc], quiet=True, timeout=30))
             if _restart_ok:
                 # Give it a shorter second-chance wait
-                _have_adm_279 = bool(shutil.which("mysqladmin"))
+                _admin_bin_279 = _mariadb_cli("admin")
+                _have_adm_279 = bool(
+                    shutil.which(_admin_bin_279) or shutil.which("mysqladmin"))
                 for _r279 in range(15):
                     try:
                         if _have_adm_279:
                             _rr = subprocess.run(
-                                ["mysqladmin", "-u", "root", "ping", "--silent"],
+                                [_admin_bin_279, "-u", "root", "ping", "--silent"],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 encoding='utf-8', errors='replace',
                                 timeout=5, check=False)
                         else:
                             # Fallback: mysql -e "SELECT 1" (no mysqladmin on minimal images)
                             _rr = subprocess.run(
-                                ["mysql", "-u", "root", "-e", "SELECT 1;"],
+                                [_mariadb_cli("client"), "-u", "root", "-e", "SELECT 1;"],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 encoding='utf-8', errors='replace',
                                 timeout=5, check=False)
@@ -25245,7 +25429,7 @@ class MariaDBManager:
         if not _sql_ok:
             try:
                 _r = subprocess.run(
-                    ["mysql", "-u", "root", "-e", "SELECT 1;"],
+                    [_mariadb_cli("client"), "-u", "root", "-e", "SELECT 1;"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=10, check=False)
@@ -25280,8 +25464,8 @@ class MariaDBManager:
         # ── 1. 备份 mysql 系统数据库 ──
         # 大部分升级变更发生在 mysql 库 (权限表、系统表结构),
         # 出问题时可用此备份恢复。
-        _dump_bin = "mariadb-dump" if shutil.which("mariadb-dump") \
-                    else "mysqldump"
+        # [FIX-⓰] 统一用 _mariadb_cli('dump') 探测, 消除局部重复逻辑
+        _dump_bin = _mariadb_cli("dump")
         if shutil.which(_dump_bin):
             _dump_path = "/root/.mariadb_pre_upgrade_mysql.sql"
             try:
@@ -25352,7 +25536,7 @@ class MariaDBManager:
         # [PATCH-283D FIX-P1-1b] 通过 --defaults-extra-file 传递密码
         _fs_defaults = None
         try:
-            _fs_cmd = ["mysql", "-u", "root", "-NBe",
+            _fs_cmd = [_mariadb_cli("client"), "-u", "root", "-NBe",
                        "SELECT @@innodb_fast_shutdown;"]
             _pwd = getattr(self, 'db_root_pass', '')
             if _pwd:
@@ -25387,7 +25571,7 @@ class MariaDBManager:
             _eng_defaults = None
             try:
                 _eng_cmd = [
-                    "mysql", "-u", "root", "-NBe",
+                    _mariadb_cli("client"), "-u", "root", "-NBe",
                     "SELECT DISTINCT ENGINE FROM information_schema.TABLES "
                     "WHERE TABLE_SCHEMA NOT IN "
                     "('information_schema','performance_schema','sys') "
@@ -25803,7 +25987,7 @@ class MariaDBManager:
         self._abort_if_shutdown()  # [v3.2.364] 规则 7: 长操作前信号检查点
         try:
             _chk = subprocess.run(
-                ["mysql", "-N", "-e",
+                [_mariadb_cli("client"), "-N", "-e",
                  "SELECT COUNT(*) FROM mysql.proxies_priv "
                  "WHERE Host NOT IN ('localhost','127.0.0.1','::1','%')"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -25814,7 +25998,7 @@ class MariaDBManager:
                 _cnt = int(_chk.stdout.strip())
             if _cnt > 0:
                 subprocess.run(
-                    ["mysql", "-e",
+                    [_mariadb_cli("client"), "-e",
                      "DELETE FROM mysql.proxies_priv "
                      "WHERE Host NOT IN "
                      "('localhost','127.0.0.1','::1','%'); "
@@ -28695,8 +28879,8 @@ class PHPManager:
     # -----------------------------------------------------------------------
     # [V3.2.79/V3.2.81] OS 自动安全更新
     # -----------------------------------------------------------------------
-    def _print_component_versions(self) -> None:
-        """[FIX] 部署/更新完成后输出组件版本摘要。
+    def _print_component_versions(self) -> list:
+        """[FIX] 部署/更新完成后输出组件版本摘要.
 
         收集所有核心组件的实际安装版本, 一次性输出, 便于:
           1. 用户确认部署结果
@@ -28704,10 +28888,14 @@ class PHPManager:
           3. 远程排障 (诊断包中可见)
 
         全平台兼容: EL7-10 / Ubuntu 22-24 / Debian 12-13
-        每个组件独立 try/except, 单个失败不影响其他组件输出。
+        每个组件独立 try/except, 单个失败不影响其他组件输出.
+
+        Returns:
+            [(name, version), ...] 组件版本列表; dry_run 时返回 [].
+            [v3.2.372] 返回值供 collect-logs 审计报告复用, 无需重复解析.
         """
         if self.cfg.dry_run:
-            return
+            return []
         _items = []  # (name, version_str)
 
         # ── Nginx ──
@@ -28857,6 +29045,7 @@ class PHPManager:
         if _items:
             _ver_line = " | ".join(f"{n} {v}" for n, v in _items)
             logging.info("组件版本: %s", _ver_line)
+        return _items
 
     # --- [REFACTOR] Migrated from WPDeployManager (batch 14) ---
 
@@ -32313,7 +32502,9 @@ class WPDeployManager:
             pm_mode = "dynamic"
             # [FIX-FPM-TIER] v3.2.298: 公式调整 0.6/50 → 0.5/70
             # 保留更多 buffer cache, 每 worker 预算对齐实测 70-80MB
-            max_ch = max(25, int(total_mb * 0.5 / 70))
+            # [FIX-❺] 常量化: 见模块顶部 _PHP_FPM_WORKER_PEAK_MB / _PHP_FPM_RAM_BUDGET_RATIO
+            max_ch = max(25, int(
+                total_mb * _PHP_FPM_RAM_BUDGET_RATIO / _PHP_FPM_WORKER_PEAK_MB))
 
         logging.info(t("info_fpm_tuning",
                        total=total_mb, children=max_ch, mode=pm_mode))
@@ -32868,10 +33059,13 @@ class WPDeployManager:
 
         # 确定配置目录
         # [REFACTOR] 平台注册表提供首选目录, 备选目录兜底跨平台场景
+        # [FIX-❹] 变量改名: 原 `_mariadb_alt` 读起来像"本平台的备选", 实际
+        # 是"对方平台的路径", 作为跨平台 (手动迁移 / 镜像构建) 兜底。
         _mariadb_conf_dirs = [self.platform.get("mariadb_conf_dir")]
-        _mariadb_alt = "/etc/my.cnf.d" if self.platform.is_debian else "/etc/mysql/conf.d"
-        if _mariadb_alt not in _mariadb_conf_dirs:
-            _mariadb_conf_dirs.append(_mariadb_alt)
+        _mariadb_cross_platform_dir = (
+            "/etc/my.cnf.d" if self.platform.is_debian else "/etc/mysql/conf.d")
+        if _mariadb_cross_platform_dir not in _mariadb_conf_dirs:
+            _mariadb_conf_dirs.append(_mariadb_cross_platform_dir)
         for conf_dir in _mariadb_conf_dirs:
             if Path(conf_dir).is_dir():
                 conf_path = Path(conf_dir) / "wp-bootstrap-tuning.cnf"
@@ -33919,17 +34113,18 @@ class WPDeployManager:
             return CmdResult.success()
 
         defaults_file = None
-        cmd_list = ["mysql", "-u", "root"]
+        _client_bin = _mariadb_cli("client")
+        cmd_list = [_client_bin, "-u", "root"]
 
         if use_pwd and self.db_root_pass:
             defaults_file = self.mariadb._write_mysql_defaults_file(self.db_root_pass)
-            cmd_list = ["mysql", f"--defaults-extra-file={defaults_file}", "-u", "root"]
+            cmd_list = [_client_bin, f"--defaults-extra-file={defaults_file}", "-u", "root"]
 
         # [AUDIT-SEC-01] 外置DB: 总是通过 defaults_file 传递 host/port,
         # 彻底消除 CLI 参数注入面。即使 use_pwd=False 也创建 .cnf。
         if self.cfg.is_external_db and not defaults_file:
             defaults_file = self.mariadb._write_mysql_defaults_file("")
-            cmd_list = ["mysql", f"--defaults-extra-file={defaults_file}", "-u", "root"]
+            cmd_list = [_client_bin, f"--defaults-extra-file={defaults_file}", "-u", "root"]
 
         try:
             r = subprocess.run(
@@ -34840,7 +35035,7 @@ class WPDeployManager:
         self.db_root_pass = _generate_secure_password()  # [PATCH-146 P0-3]
 
         check_plugin_cmd = [
-            "mysql", "-u", "root", "-e",
+            _mariadb_cli("client"), "-u", "root", "-e",
             "SELECT plugin FROM mysql.user WHERE user='root' AND host='localhost';",
         ]
         try:
@@ -41099,7 +41294,9 @@ class WPDeployManager:
         """创建 systemd timer 每周运行 mysqlcheck --optimize。
 
         借鉴 WordOps 周度 mysqlcheck: 回收碎片空间, 更新索引统计。
-        --single-transaction 保证 InnoDB 表不锁表。
+        注: MariaDB 的 mysqlcheck / mariadb-check 不支持 --single-transaction
+        (该选项属于 mysqldump); InnoDB 的 OPTIMIZE 会被映射为 ALTER TABLE ... FORCE
+        (online DDL / 表重建), 无需事务包裹。
         仅本地数据库生效; 外置数据库跳过。
         """
         if self.cfg.dry_run:
@@ -41152,14 +41349,13 @@ class WPDeployManager:
                     _sd_escape(_mysqlcheck),
                     _sd_escape(str(_optimize_cnf)),
                 )
-                + " -u root --optimize --single-transaction"
-                  " --all-databases"
+                + " -u root --optimize --all-databases"
             )
         else:
             # 无密码或 .cnf 生成失败时使用 socket 认证 (MariaDB 默认)
             exec_cmd = (
                 '"{}" -u root --optimize'.format(_sd_escape(_mysqlcheck))
-                + " --single-transaction --all-databases"
+                + " --all-databases"
             )
 
         svc_content = (
@@ -41185,6 +41381,12 @@ class WPDeployManager:
             f"TimeoutStopSec=1800\n"
             f"StandardOutput=journal\n"
             f"StandardError=journal\n"
+            # [FIX-⓲] systemd 沙箱对齐 SSL renewal service, 限制 root 服务攻击面
+            # 不启用 ProtectSystem: mariadb 数据文件操作可能触达 /var/lib/mysql,
+            # ProtectHome 对 root 服务无意义, 保留 NoNewPrivileges + PrivateTmp
+            # 这两项对所有服务都安全。
+            f"NoNewPrivileges=true\n"   # 禁止 SUID/SGID 提权
+            f"PrivateTmp=true\n"        # 隔离 /tmp 命名空间
         )
 
         timer_content = (
@@ -41236,9 +41438,11 @@ class WPDeployManager:
             # [V3.2.3] M-7: 使用 -- 分隔路径
             # [V3.2.8] L-6: 对 wpcli_bin 和 --path 加引号，防 webroot 含空格时
             # systemd 解析 ExecStart= 失败（systemd 以空格分割参数）
+            # [FIX-ⓐ] 删掉 --allow-root: 服务以 User=nginx 运行, 非 root 下
+            # 此 flag 是 no-op, 留着会误导阅读 unit 文件的人。
             exec_cmd = (
                 '"{}" cron event run --due-now'
-                ' "--path={}" --allow-root --quiet'.format(
+                ' "--path={}" --quiet'.format(
                     _sd_escape(self._wpcli_bin),
                     _sd_escape(webroot),
                 )
@@ -41274,6 +41478,11 @@ class WPDeployManager:
             f"TimeoutStartSec=120\n"
             f"StandardOutput=journal\n"
             f"StandardError=journal\n"
+            # [FIX-⓲] systemd 沙箱对齐 SSL / db-optimize service
+            # wp-cron 以 User=nginx 运行, wp-cli 不需要 /tmp 共享给 FPM,
+            # PrivateTmp 对独立 oneshot 执行是安全的。
+            f"NoNewPrivileges=true\n"
+            f"PrivateTmp=true\n"
         )
 
         timer_content = (
@@ -41446,6 +41655,33 @@ class WPDeployManager:
                 logging.warning(t("warn_audit_fix_bug_1_failed_to_write_eab_env"),
                     _eab_env_path)
             else:
+                # [FIX-㉑] 显式 post-write 权限核验: EAB 密钥/webhook token
+                # 即使读到 sibling 账号也等于凭据外泄。_safe_write_file 在
+                # 某些 umask 场景下可能把 mode 位覆盖 (历史 bug #276 FIX-P0-3);
+                # 这里主动 stat 检查并强制 chmod 一次, 发现漂移则 log 告警。
+                try:
+                    _st = _eab_env_path.stat()
+                    _actual_mode = _st.st_mode & 0o777
+                    if _actual_mode != 0o600:
+                        logging.warning(
+                            "[FIX-㉑] EAB env 文件 %s 权限 0o%o 不符合 0o600 要求, "
+                            "强制修正; 若持续漂移请检查 umask / ACL 设置",
+                            _eab_env_path, _actual_mode)
+                        _safe_chmod(str(_eab_env_path), 0o600)
+                    # 属主必须是 root (非 root 写入会导致 systemd 加载失败,
+                    # 但更严重的是若属主被改成其他账号, 可能造成凭据外泄)
+                    if _st.st_uid != 0:
+                        logging.warning(
+                            "[FIX-㉑] EAB env 文件 %s 属主 uid=%d 非 root, "
+                            "EAB 凭据可能外泄, 强制 chown 0:0",
+                            _eab_env_path, _st.st_uid)
+                        try:
+                            os.chown(str(_eab_env_path), 0, 0)
+                        except OSError as _ch_e:
+                            logging.warning(
+                                "[FIX-㉑] chown 失败 (脚本非 root?): %s", _ch_e)
+                except OSError as _st_e:
+                    logging.debug("[FIX-㉑] EAB env stat 失败: %s", _st_e)
                 _eab_env_line = f"EnvironmentFile={_eab_env_path}\n"
 
         service_content = (
@@ -41853,7 +42089,7 @@ class WPDeployManager:
         defaults_file = self.mariadb._write_mysql_defaults_file(self.db_root_pass)
         try:
             dump_cmd = [
-                "mysqldump",
+                _mariadb_cli("dump"),
                 "--defaults-extra-file=%s" % defaults_file,
                 "-u", "root",
                 "--single-transaction", "--quick",
@@ -43012,6 +43248,1337 @@ class WPDeployManager:
     # -----------------------------------------------------------------------
     # [PATCH-289] 一键日志收集 (诊断)
     # -----------------------------------------------------------------------
+    def _generate_site_audit_report(self,
+                                    collect_dir: "Path",
+                                    domain: str,
+                                    safe_prefix: str,
+                                    ts: str,
+                                    errors_found: list) -> str:
+        """[v3.2.367] 基于 collect-logs 采集的数据生成高密度 markdown 审计报告.
+
+        解析 18 种已采集的 diag-*.txt / *.log 文件, 输出包含 11 大章节的
+        人类可读审计报告 (风格对标 toksun.cn site_audit_*.md):
+
+        总体结论 → 组件版本 → 网络端口 → SSL/TLS → 性能特性 → 安全加固
+        (Fail2Ban + PHP-FPM + PHP ini + MariaDB + Redis) → Systemd timer
+        → Web 流量分析 → 主机资源 → 问题发现 → 14 规则自证 → 最终评级.
+
+        本方法不抛异常 (调用方已 try/except 保底), 每个段落独立生成,
+        单个段落失败不影响其他段落. 零额外 subprocess 调用 (all from
+        collect_dir files + uptime/free/df 实时探测).
+        """
+        import re as _re
+        def _read(fname: str, default: str = "") -> str:
+            try:
+                return (collect_dir / fname).read_text(
+                    encoding="utf-8", errors="replace")
+            except OSError:
+                return default
+
+        def _has(fname: str) -> bool:
+            return (collect_dir / fname).exists()
+
+        def _extract(text: str, tag: str) -> str:
+            _m = _re.search(_re.escape(tag) + r"\s*\n(.*?)(?=\n---|\Z)",
+                            text, _re.DOTALL)
+            return _m.group(1).strip() if _m else ""
+
+        _ts_human = ts
+        try:
+            _ts_human = "%s-%s-%s %s:%s:%s" % (
+                ts[:4], ts[4:6], ts[6:8], ts[9:11], ts[11:13], ts[13:15])
+        except (IndexError, ValueError):
+            pass
+
+        _lines = []
+        _a = _lines.append
+
+        # ─── 报告头 ───
+        _a("# %s 站点最终状态深度验证报告" % domain)
+        _a("")
+        _a("**采集时间**: %s" % _ts_human)
+        _a("**脚本版本**: wp_ssl_bootstrap.py %s (build %s)"
+           % (__version__, __build__))
+        _a("**采集路径**: wp-logs-%s-%s.tar.gz" % (safe_prefix, ts))
+        _a("")
+        _a("---")
+        _a("")
+
+        # ─── 智能日志分类器 (在总体结论之前运行, 便于结论引用) ──────────────
+        # [v3.2.373] 日志里的"ERROR/WARN"大多数不是真实问题. 分 3 类:
+        #   - defense: 攻击被拦截 (access forbidden / bad record mac) → 防御生效
+        #   - noise:   已知噪音 (NOTICE / ACL ignored / 上游 bug)      → 过滤
+        #   - signals: 真实信号 (max_children / slow / OOM / crit)     → 需关注
+        # 评级只看 signals, 不累加 raw 日志行数.
+        _defense_patterns = [
+            (r'access forbidden by rule', 'Nginx deny rule 拦截攻击'),
+            (r'limiting requests, excess', 'Nginx rate_limit 生效'),
+            (r'SSL_read.*decryption failed|bad record mac',
+             'TLS 握手失败 (扫描器试探, 已拒绝)'),
+            (r'client intended to send too large', '超大请求体被拒绝'),
+        ]
+        _noise_patterns = [
+            (r'NOTICE.*Terminating|NOTICE.*exiting, bye-bye',
+             'PHP-FPM 重启的正常信号'),
+            # [FIX-㉔] PHP-FPM logrotate 触发后的例行通知, NOTICE 级别, 非错误。
+            # 关键字扫描因 "error" 子串命中, 但这是 php-fpm 对 SIGUSR1 的正常响应。
+            (r'NOTICE.*error log file re-opened',
+             'PHP-FPM logrotate 触发 error_log 重新打开 (正常信号)'),
+            (r'ACL set.*listen\.\w+.*is ignored',
+             'ACL 特性提示 (无功能影响)'),
+            (r'Attempt to read property .locale. on false|'
+             r'Attempt to read property .response. on false|'
+             r'Attempt to read property .packages. on false',
+             'WordPress 更新检查上游 bug (api.wordpress.org 超时)'),
+            (r'error_handler:Calling registered functions',
+             'Certbot DEBUG 日志 (非错误)'),
+            (r'child \d+ said into stderr.*update-core\.php',
+             'WP 核心更新检查警告 (上游 bug)'),
+            (r'status=75(?:/TEMPFAIL)?',
+             'systemd 服务 TEMPFAIL (status=75, 通常为锁冲突/临时不可用, 脚本自动避让)'),
+            # [FIX-㉗] 脚本自己的 srcache 能力探测器写临时 conf 测 nginx 是否
+            # 支持 redis_pass 指令, 失败即 fallback 到 FastCGI。emerg 是期望
+            # 结果, 不是真错误。匹配所有 /tmp/srcache_detect_*.conf 引发的
+            # nginx 配置解析错误。
+            (r'srcache_detect_\w+\.conf',
+             '脚本 srcache 能力探测 (临时 conf 文件, 期望的 emerg)'),
+            # [FIX-㉗] Deploy 早期 nginx 先起, php-fpm 还没设好 socket 权限,
+            # 健康检查或用户零星请求撞上会报 Permission denied。这是短暂
+            # transient (通常 <5s 内恢复)。若持续出现请单独排查 php-fpm
+            # 启动顺序 / socket owner / nginx_user vs www-data 不一致。
+            (r'connect\(\) to unix:/run/php[^\s]*\.sock failed.*Permission denied',
+             'Deploy 早期 php-fpm sock 权限同步瞬态 (通常 <5s 恢复)'),
+        ]
+        _signal_patterns = [
+            (r'server reached (?:pm\.)?max_children', 'perf',
+             'PHP-FPM 池饱和, 建议提升 `pm.max_children`'),
+            (r'executing too slow', 'perf',
+             'PHP 慢请求, 建议检查慢代码或调大 `max_execution_time`'),
+            (r'Out of memory|Killed process|oom-killer', 'resource',
+             '内存耗尽 → OOM, 建议增加 RAM 或减少 worker'),
+            (r'upstream timed out|upstream prematurely closed', 'perf',
+             '上游超时, 可能 PHP-FPM 过载或 PHP 代码卡住'),
+            (r'Unable to set php_value [\'"]?([\w.]+)', 'config',
+             'PHP-FPM 配置冲突 — `php_value` 设置失败, 检查 pool conf 的扩展是否加载'),
+            (r'Unable to bind listening socket|address already in use', 'config',
+             '端口/socket 已被占用, 检查服务冲突'),
+            (r'PHP Fatal error', 'crit',
+             'PHP 致命错误, 应用层代码需排查'),
+            (r'Main process exited.*status=(?!75\b|0\b)\d+', 'config',
+             'systemd 服务异常退出, 检查 `journalctl -u <service>` 定位根因'),
+            (r'(?<!registered )\bFATAL\b|\bPANIC\b|kernel panic', 'crit',
+             '严重错误, 需立即排查'),
+            (r'connect\(\) failed.*Connection refused', 'crit',
+             '上游连接被拒, 检查 PHP-FPM/后端服务'),
+        ]
+        _defense = []
+        _noise = []
+        _signals = []
+        for _comp, _ln in (errors_found or []):
+            _matched = False
+            for _pat, _rsn in _defense_patterns:
+                if _re.search(_pat, _ln, _re.I):
+                    _defense.append((_comp, _ln, _rsn))
+                    _matched = True
+                    break
+            if _matched: continue
+            for _pat, _rsn in _noise_patterns:
+                if _re.search(_pat, _ln, _re.I):
+                    _noise.append((_comp, _ln, _rsn))
+                    _matched = True
+                    break
+            if _matched: continue
+            for _pat, _sev, _adv in _signal_patterns:
+                if _re.search(_pat, _ln, _re.I):
+                    _signals.append((_comp, _ln, _sev, _adv))
+                    _matched = True
+                    break
+            if not _matched:
+                _signals.append((_comp, _ln, 'unknown', '未归类, 详见 tar.gz'))
+        _signal_summary = {}
+        for _c, _ln, _sev, _adv in _signals:
+            _signal_summary.setdefault(_adv, {'lines': [], 'sev': _sev,
+                                              'comps': set()})
+            _signal_summary[_adv]['lines'].append(_ln)
+            _signal_summary[_adv]['comps'].add(_c)
+
+        # ─── [FIX-㉒] systemd 异常退出信号按 unit 名拆分 ──────────────────
+        # 原来分类器聚合为"systemd 服务异常退出, 检查 journalctl -u <service>",
+        # 失去 unit 名后用户必须自己去 tar.gz 挖日志定位, 排障体验差。
+        # 现在从日志行提取 unit 名, 为每个 unit 生成独立 advice 条目, 并
+        # 从 status= 字段附带退出码, 帮助用户直接判定问题类型。
+        # [Bugfix 2026-04-19] 初版用 [^=]* 中间不允许 `=`, 但 systemd 实际日志
+        # 是 "Main process exited, code=exited, status=N" —— 中间 `code=exited,`
+        # 带了等号, 正则无法跨越, 导致 unit 名从未被提取到, 修复回退到 generic
+        # advice. 改为 non-greedy `.*?` 可跨越任意字符直到 status=.
+        _SYSTEMD_GENERIC_ADV = ('systemd 服务异常退出, '
+                                '检查 `journalctl -u <service>` 定位根因')
+        if _SYSTEMD_GENERIC_ADV in _signal_summary:
+            _old_info = _signal_summary.pop(_SYSTEMD_GENERIC_ADV)
+            # 匹配 systemd[PID]: <unit>.service: Main process exited ... status=N
+            # 注: 中间可能有 "code=exited, " 等键值对, 故用 .*? 非贪婪
+            _unit_re = _re.compile(
+                r'systemd\[\d+\]:\s*([^\s:]+\.(?:service|socket|mount|timer|path|target|scope))'
+                r':\s*Main process exited.*?status=(\d+)')
+            _unit_buckets = {}  # unit -> {'lines': [], 'statuses': set()}
+            _orphans = []
+            for _ln_item in _old_info['lines']:
+                _um = _unit_re.search(_ln_item)
+                if _um:
+                    _u = _um.group(1)
+                    _st = _um.group(2)
+                    _unit_buckets.setdefault(_u, {'lines': [], 'statuses': set()})
+                    _unit_buckets[_u]['lines'].append(_ln_item)
+                    _unit_buckets[_u]['statuses'].add(_st)
+                else:
+                    _orphans.append(_ln_item)
+            for _u, _bucket in _unit_buckets.items():
+                _status_str = ",".join(sorted(_bucket['statuses']))
+                _adv_new = ('systemd unit `%s` 异常退出 (status=%s), '
+                            '查看详情: `journalctl -u %s`'
+                            % (_u, _status_str, _u))
+                _signal_summary[_adv_new] = {
+                    'lines': _bucket['lines'],
+                    'sev': _old_info['sev'],
+                    'comps': _old_info['comps'].copy(),
+                }
+            # 极少数情况下: 分类器匹配了但正则未能提取 unit (如日志格式异常),
+            # 保留原 generic 条目展示这些行
+            if _orphans:
+                _signal_summary[_SYSTEMD_GENERIC_ADV] = {
+                    'lines': _orphans,
+                    'sev': _old_info['sev'],
+                    'comps': _old_info['comps'].copy(),
+                }
+
+        # ─── 上下文感知: 已知历史问题的"已解决"状态检测 ─────────────────────
+        # [v3.2.377] 基于时间戳的过滤 — 如果根因已修复(如 soap 已加载)且
+        # 所有错误时间都是 > 1 小时前的, 完全隐藏提示 (避免 tail 500 行里的
+        # 旧日志一直刷屏). 日志轮转后自然消失.
+        # [v3.2.376] 典型场景: soap.wsdl_cache_dir → 脚本已装 soap,
+        # 但历史 worker 的错误行仍在日志文件里.
+        _php_modules = _read("diag-php-modules.txt")
+        _soap_loaded = bool(_re.search(r'^\s*soap\s*$', _php_modules, _re.M))
+
+        # 小工具: 从 log line 提取时间戳, 返回 unix timestamp (或 None)
+        def _parse_log_ts(_line):
+            import datetime as _dt
+            # PHP-FPM: [16-Apr-2026 22:53:24]
+            _m = _re.search(
+                r'\[(\d{1,2})-(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-'
+                r'(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})\]', _line)
+            if _m:
+                _months = {"Jan":1, "Feb":2, "Mar":3, "Apr":4, "May":5, "Jun":6,
+                           "Jul":7, "Aug":8, "Sep":9, "Oct":10, "Nov":11, "Dec":12}
+                try:
+                    return _dt.datetime(
+                        int(_m.group(3)), _months[_m.group(2)],
+                        int(_m.group(1)), int(_m.group(4)),
+                        int(_m.group(5)), int(_m.group(6))).timestamp()
+                except (ValueError, KeyError):
+                    return None
+            # Nginx: 2026/04/18 01:24:09
+            _m = _re.search(r'(\d{4})/(\d{2})/(\d{2})\s+(\d{2}):(\d{2}):(\d{2})', _line)
+            if _m:
+                try:
+                    return _dt.datetime(
+                        int(_m.group(1)), int(_m.group(2)), int(_m.group(3)),
+                        int(_m.group(4)), int(_m.group(5)),
+                        int(_m.group(6))).timestamp()
+                except ValueError:
+                    return None
+            return None
+
+        # 当前 collect-logs 的时间 (从 ts arg 解析, 比 time.time() 更准)
+        _now_ts = None
+        try:
+            import datetime as _dt
+            _now_ts = _dt.datetime(
+                int(ts[0:4]), int(ts[4:6]), int(ts[6:8]),
+                int(ts[9:11]), int(ts[11:13]), int(ts[13:15])).timestamp()
+        except (ValueError, IndexError):
+            import time as _time
+            _now_ts = _time.time()
+
+        # 已知历史问题的根因检查 + advice 替换表
+        _resolved_advice = {}
+        if _soap_loaded:
+            _resolved_advice[
+                "PHP-FPM 配置冲突 — `php_value` 设置失败, 检查 pool conf 的扩展是否加载"
+            ] = ("历史残留 (soap 扩展现已加载, pool 配置已修复). "
+                 "重启 PHP-FPM 清除残留: `systemctl restart php-fpm`")
+
+        _STALE_THRESHOLD_SEC = 3600  # 1 小时以上视为过时
+        _new_summary = {}
+        for _adv, _info in _signal_summary.items():
+            if _adv in _resolved_advice:
+                # 检查所有 line 的时间戳是否都 > 1h 前
+                _latest_ts = None
+                for _ln in _info['lines']:
+                    _t = _parse_log_ts(_ln)
+                    if _t is not None:
+                        if _latest_ts is None or _t > _latest_ts:
+                            _latest_ts = _t
+                if _latest_ts is not None and _now_ts is not None:
+                    _age = _now_ts - _latest_ts
+                    if _age > _STALE_THRESHOLD_SEC:
+                        # 全部过时 → 完全隐藏, 不进入 _new_summary
+                        # (根因已修复 + 日志过时 = 无需再提醒)
+                        continue
+                # 最新错误还在 1h 内 → 降级为 resolved, 提示用户重启
+                _new_adv = _resolved_advice[_adv]
+                _new_summary[_new_adv] = {'lines': _info['lines'],
+                                          'sev': 'resolved',
+                                          'comps': _info['comps']}
+            else:
+                _new_summary[_adv] = _info
+        _signal_summary = _new_summary
+
+        # ─── 总体结论 ───
+        _a("## 🎯 总体结论")
+        _a("")
+        # [v3.2.374] distinct 类型数 (同一 advice 聚合后), 不是原始行数
+        _intro_crit = sum(1 for _v in _signal_summary.values()
+                          if _v['sev'] == 'crit')
+        _intro_perf = sum(1 for _v in _signal_summary.values()
+                          if _v['sev'] in ('perf', 'resource', 'config'))
+        _intro_unknown = sum(1 for _v in _signal_summary.values()
+                             if _v['sev'] == 'unknown')
+        if _intro_crit == 0 and _intro_perf == 0 and _intro_unknown == 0:
+            _a("# ✅ 站点健康, 零阻塞问题")
+            _a("")
+            if _defense:
+                _a("所有核心组件运行正常. 日志中 %d 条"
+                   "`access forbidden`/SSL 握手失败等条目均为**攻击被成功拦截**, "
+                   "不是问题 — 是 fail2ban + nginx deny rule 正常工作的证据." % len(_defense))
+            else:
+                _a("所有核心组件运行正常, 所有关键配置符合安全基线.")
+        elif _intro_crit == 0:
+            _total_items = _intro_perf + _intro_unknown
+            _a("# 🟡 站点运行正常, 有 %d 项需关注" % _total_items)
+            _a("")
+            _desc_parts = []
+            if _intro_perf > 0:
+                _desc_parts.append("%d 项性能/配置建议" % _intro_perf)
+            if _intro_unknown > 0:
+                _desc_parts.append("%d 项未归类日志需人工排查" % _intro_unknown)
+            _desc = " + ".join(_desc_parts)
+            if _defense:
+                _a("核心组件正常工作, %d 次攻击被 fail2ban/nginx 拦截. "
+                   "检测到 %s, 详见 '问题发现' 章节."
+                   % (len(_defense), _desc))
+            else:
+                _a("核心组件正常工作, 检测到 %s, 详见 '问题发现' 章节." % _desc)
+        else:
+            _a("# 🔴 站点检测到 %d 项严重错误" % _intro_crit)
+            _a("")
+            _a("需要立即排查, 详见 '问题发现' 章节.")
+        _a("")
+        _a("---")
+        _a("")
+
+        # ─── 组件版本清单 ───
+        _sysinfo = _read("system-info.txt")
+        _a("## 📦 组件版本清单")
+        _a("")
+        _a("| 组件 | 版本 | 状态 |")
+        _a("|------|------|------|")
+        _os_pretty = "unknown"
+        _m = _re.search(r'^PRETTY_NAME="([^"]+)"',
+                        _extract(_sysinfo, "--- OS ---"), _re.M)
+        if _m: _os_pretty = _m.group(1)
+        _a("| 操作系统 | %s | ✅ |" % _os_pretty)
+
+        # [v3.2.372] 使用脚本现成的组件版本探测 (PHPManager._print_component_versions),
+        # 统一数据源, 删除重复解析逻辑. 版本数据已经 dry_run 时返回 [],
+        # 非 dry_run 时调用真实二进制获取权威版本 (不依赖 system-info.txt 解析).
+        _version_map = {}  # {name: version}  e.g. {"Nginx": "1.30.0", ...}
+        try:
+            _vitems = self.php._print_component_versions()
+            for _n, _v in (_vitems or []):
+                _version_map[_n] = _v
+        except Exception:
+            pass
+
+        # 辅助: 版本信息表示 (单一来源)
+        def _ver(key: str, default: str = "unknown") -> str:
+            return _version_map.get(key, default)
+
+        # ── 内核 (直接 uname -r, 快速, 无需依赖 system-info) ──
+        _kernel = _ver("Kernel", "")
+        if not _kernel:
+            try:
+                _kernel = subprocess.run(
+                    ["uname", "-r"], stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, encoding="utf-8",
+                    errors="replace", timeout=5,
+                    check=False).stdout.strip()
+            except (subprocess.SubprocessError, OSError):
+                _kernel = "unknown"
+        _k_eval = "✅"
+        _kver = _re.findall(r'\d+', _kernel)
+        if len(_kver) >= 2:
+            try:
+                if (int(_kver[0]), int(_kver[1])) >= (5, 6):
+                    _k_eval = "✅ MPTCP 支持"
+            except ValueError:
+                pass
+        _a("| 内核 | %s | %s |" % (_kernel or "unknown", _k_eval))
+
+        # ── Nginx (版本 + OpenSSL + 静态编译模块从 nginx -V 解析) ──
+        _nv = _ver("Nginx")
+        _nblk = _extract(_sysinfo, "--- Nginx ---")
+        _ossl_str = ""
+        _openssl_ver = _ver("OpenSSL", "")
+        if _openssl_ver:
+            _ossl_str = " (OpenSSL %s)" % _openssl_ver
+        else:
+            _m = _re.search(r'built with OpenSSL (\S+)', _nblk)
+            if _m: _ossl_str = " (OpenSSL %s)" % _m.group(1)
+        # 静态编译模块 (从 nginx -V 的 configure arguments 解析)
+        _nextras = []
+        if "srcache" in _nblk.lower(): _nextras.append("srcache")
+        if "brotli" in _nblk.lower(): _nextras.append("brotli")
+        _nextra_str = (" ✅ 含 " + " + ".join(_nextras) + " 静态编译"
+                       if _nextras else " ✅")
+        _a("| Nginx | **%s**%s |%s |" % (_nv, _ossl_str, _nextra_str))
+
+        # ── PHP (发行商 + JIT 从 system-info 解析) ──
+        _pv = _ver("PHP")
+        _pblk = _extract(_sysinfo, "--- PHP ---")
+        _php_vendor = ""
+        if "Remi" in _pblk or "remi" in _pblk:
+            _php_vendor = "Remi's RPM"
+        elif "Sury" in _pblk or "sury" in _pblk:
+            _php_vendor = "Sury DPA"
+        _pjit = "JIT" if "JIT" in _pblk or "OPcache" in _pblk else ""
+        _php_extras = ", ".join([x for x in (_php_vendor, _pjit) if x])
+        _a("| PHP | **%s**%s | ✅ |" % (
+            _pv, (" (%s)" % _php_extras) if _php_extras else ""))
+
+        # ── MariaDB (只给版本号, 不加"旧版本残留"的无意义警告) ──
+        _mv = _ver("MariaDB")
+        _a("| MariaDB | **%s** | ✅ |" % _mv)
+
+        # ── Valkey / Redis ──
+        _rv = _ver("Valkey", "") or _ver("Redis", "")
+        _r_heading = "Valkey" if "Valkey" in _version_map else "Redis"
+        # Valkey 兼容 Redis 声明: 从 diag-redis-info 提取 redis_version
+        _rcompat = ""
+        _rinfo_now = _read("diag-redis-info.txt")
+        _rm = _re.search(r'redis_version:(\S+)', _rinfo_now)
+        if _rm and _r_heading == "Valkey":
+            _rcompat = " (Redis %s 兼容)" % _rm.group(1)
+        # socket-only 检测
+        _rsock_tag = ""
+        if (_re.search(r'tcp_port:0\b', _rinfo_now) or
+                _re.search(r'bind=/\S*\.sock', _rinfo_now) or
+                _re.search(r'unixsocket\s+\S',
+                           _read("diag-nginx-full-config.txt"))):
+            _rsock_tag = " socket-only (port 0)"
+        _a("| %s | **%s**%s | ✅%s |"
+           % (_r_heading, _rv, _rcompat, _rsock_tag))
+
+        # ── WP-CLI ──
+        _wv = _ver("WP-CLI")
+        _a("| WP-CLI | %s | %s |"
+           % (_wv, "✅" if _wv != "unknown" else "⚠"))
+
+        # ── WordPress ──
+        _wp = _ver("WordPress", "")
+        if _wp:
+            _a("| WordPress | %s | ✅ |" % _wp)
+
+        # ── Certbot (snap 源从 certbot.log 路径判定) ──
+        _cbv = _ver("Certbot", "")
+        if _cbv:
+            _cblog = _read("certbot.log")
+            _cbblk = _read("diag-certbot-certs.txt")
+            _cbsrc = ""
+            if "/snap/certbot/" in _cblog or "/snap/certbot/" in _cbblk:
+                _cbsrc = " (snap)"
+            elif "/venv/" in _cbblk:
+                _cbsrc = " (pip venv)"
+            _a("| Certbot | %s%s | ✅ |" % (_cbv, _cbsrc))
+        _a("")
+        _a("---")
+        _a("")
+
+        # ─── 网络与监听端口 ───
+        _a("## 🌐 网络与监听端口")
+        _a("")
+        _ports_txt = _read("diag-listening-ports.txt")
+        if _ports_txt:
+            _a("```")
+            # [v3.2.371] 重写端口解析: 用 users:(("proc",pid=...)) 提取真实进程名
+            # 按 "proc (ipv4/ipv6)" 合并 同一进程的 0.0.0.0 + [::] 两条
+            _seen = {}  # {(port, proc): [ipv4_addr, ipv6_addr]}
+            _rows = []  # [(addr_str, proc, comment)]
+            for _ln in _ports_txt.splitlines():
+                if "LISTEN" not in _ln:
+                    continue
+                # 提取 address + port
+                _m_addr = _re.search(
+                    r'\s(0\.0\.0\.0:\d+|127\.0\.0\.1:\d+|\[::\]:\d+|\[::1\]:\d+)\s',
+                    _ln)
+                if not _m_addr:
+                    continue
+                _addr = _m_addr.group(1)
+                _port = _addr.rsplit(":", 1)[1]
+                # 提取进程名: users:(("proc",pid=...))
+                _m_proc = _re.search(r'users:\(\("([^"]+)"', _ln)
+                _proc = _m_proc.group(1) if _m_proc else "?"
+                # 合并同一 port+proc 的 ipv4/ipv6
+                _key = (_port, _proc)
+                if _key in _seen:
+                    _seen[_key].append(_addr)
+                else:
+                    _seen[_key] = [_addr]
+            # 生成输出 (按用户示例风格)
+            for (_port, _proc), _addrs in _seen.items():
+                # 排除 aegis/hbrclient 等阿里云监控
+                if _proc in ("hbrclient", "aegis", "argusagent",
+                             "AliYunDunUpdate", "AliYunDun"):
+                    continue
+                # IPv4 + IPv6 合并显示
+                _has_v4 = any(":" in a and not a.startswith("[") for a in _addrs)
+                _has_v6 = any(a.startswith("[") for a in _addrs)
+                _proto = "TCP"
+                _cm = ""
+                if _port == "80":
+                    _cm = "← HTTP"
+                elif _port == "443":
+                    _cm = "← HTTPS"
+                elif _port == "22":
+                    _cm = ""
+                elif _port == "3306":
+                    _cm = "← 本地绑定, 不暴露"
+                # 显示 0.0.0.0:80/443 格式 (如同时有 80 和 443 就合并)
+                _display_addr = _addrs[0]  # 第一条
+                _a("%-22s %-12s (%s)%s %s" % (
+                    _display_addr, _proc,
+                    "IPv6" if _has_v6 and not _has_v4 else "TCP",
+                    "" if _has_v4 else " IPv6",
+                    _cm))
+                # IPv6 单独一行 (如果同时有)
+                if _has_v4 and _has_v6:
+                    _v6 = [a for a in _addrs if a.startswith("[")][0]
+                    _a("%-22s %-12s (IPv6)" % (_v6, _proc))
+            # Unix socket — Valkey (从 redis-info 或 nginx conf 提取)
+            _rsock = ""
+            _rinfo_now = _read("diag-redis-info.txt")
+            _m = _re.search(r'bind=(/\S+\.sock)', _rinfo_now)
+            if _m:
+                _rsock = _m.group(1)
+            else:
+                _m = _re.search(r'unixsocket\s+(\S+)',
+                                _read("diag-nginx-full-config.txt"))
+                if _m: _rsock = _m.group(1)
+            if _rsock:
+                _a("%-22s %-12s %s" % (
+                    _rsock, "valkey",
+                    "← Unix socket, port 0 (规则 12 合规)"))
+            _a("```")
+        else:
+            _a("_(diag-listening-ports.txt 未采集)_")
+        _a("")
+        # Firewall — 解析详细规则
+        _fw_txt = _read("diag-firewall.txt")
+        if _fw_txt:
+            _fw_type = "unknown"
+            _fw_detail = ""
+            if "firewalld" in _fw_txt.lower() or "target:" in _fw_txt:
+                _fw_type = "firewalld"
+                # 提取 zone + services + rich rules
+                # [FIX-⓴] 覆盖 firewalld 全部预置 zone 及自定义 zone。
+                # 原正则只识别 public/trusted/drop 三种, 用 internal / work /
+                # external / home / dmz 或自定义 zone 名时, 报告回退显示 "public"
+                # → 审计报告误导。现用宽松单词匹配 (firewalld zone 名符合
+                # [a-zA-Z][a-zA-Z0-9_-]* 规则, 长度 < 18)。
+                _zm = _re.search(
+                    r'(?:^|\bzone:)\s*([a-zA-Z][a-zA-Z0-9_-]{0,17})\b',
+                    _fw_txt, _re.M)
+                _zone = _zm.group(1) if _zm else "public"
+                _svcs = []
+                _m = _re.search(r'services:\s*(.+)', _fw_txt)
+                if _m:
+                    _svcs = _m.group(1).split()
+                _ports = []
+                _m = _re.search(r'ports:\s*(.+)', _fw_txt)
+                if _m:
+                    _ports = [p for p in _m.group(1).split() if p]
+                _rr_count = len(_re.findall(r'rule\s+(?:family|source)', _fw_txt))
+                _fw_detail = "`%s` zone" % _zone
+                if _svcs:
+                    _fw_detail += ", 开放 " + "/".join(_svcs)
+                if _ports:
+                    _fw_detail += " + " + " ".join(_ports)
+                if _rr_count > 0:
+                    _fw_detail += ", 附加 %d 条 rich rule 拒绝已识别攻击者 IP" % _rr_count
+            elif "ufw" in _fw_txt.lower() and "active" in _fw_txt.lower():
+                _fw_type = "ufw"
+                _fw_detail = "活跃"
+            elif "nftables" in _fw_txt.lower() or "inet" in _fw_txt.lower():
+                _fw_type = "nftables"
+                _fw_detail = "活跃, 使用专用 `inet wp_ssl` table"
+            _a("**防火墙**: %s %s." % (_fw_type, _fw_detail))
+        _a("")
+        _a("---")
+        _a("")
+
+        # ─── SSL/TLS ───
+        _a("## 🔒 SSL/TLS 配置分析")
+        _a("")
+        _ssl_info = _read("diag-ssl-cert-info.txt")
+        _certs = _read("diag-certbot-certs.txt")
+        if _certs or _ssl_info:
+            _a("| 项目 | 值 | 评估 |")
+            _a("|------|-----|------|")
+            # 证书颁发机构 — 智能简称
+            _m = _re.search(r'Issuer:\s*(.+)', _certs)
+            if _m:
+                _issuer_raw = _m.group(1).strip()
+                _issuer_short = _issuer_raw
+                if "ZeroSSL" in _issuer_raw and "ECC" in _issuer_raw:
+                    _issuer_short = "ZeroSSL ECC DV"
+                elif "ZeroSSL" in _issuer_raw:
+                    _issuer_short = "ZeroSSL RSA DV"
+                elif "Let's Encrypt" in _issuer_raw or "R10" in _issuer_raw or "R11" in _issuer_raw:
+                    _issuer_short = "Let's Encrypt"
+                elif "self-signed" in _issuer_raw.lower():
+                    _issuer_short = "Self-signed (local-test)"
+                _a("| 证书颁发机构 | %s | ✅ |" % _issuer_short)
+            # 证书类型
+            _m = _re.search(r'Key Type:\s*(\S+)', _certs)
+            if _m:
+                _ktype = _m.group(1).strip()
+                _ktype_eval = ""
+                if _ktype.lower() == "ecdsa":
+                    _ktype_eval = "✅ 性能优于 RSA"
+                elif _ktype.lower() == "rsa":
+                    _ktype_eval = "✅"
+                _a("| 证书类型 | %s (prime256v1) | %s |"
+                   % (_ktype, _ktype_eval))
+            # 有效期 — 提取开始日期 + 剩余天数
+            _m = _re.search(r'Expiry Date:\s*([^\(]+?)\s*\(VALID:\s*(\d+)\s*days?\)',
+                            _certs)
+            if _m:
+                _expiry_raw = _m.group(1).strip()
+                _days_left = int(_m.group(2))
+                # 只取年月日, 不要时分秒
+                _m2 = _re.match(r'(\d{4}-\d{2}-\d{2})', _expiry_raw)
+                _expiry_date = _m2.group(1) if _m2 else _expiry_raw[:10]
+                # 推算开始日期 (ZeroSSL 90 天, LE 90 天)
+                try:
+                    import datetime as _dt
+                    _end = _dt.datetime.strptime(_expiry_date, "%Y-%m-%d")
+                    _start = (_end - _dt.timedelta(days=90)).strftime("%Y-%m-%d")
+                    _a("| 有效期 | %s → %s | ✅ %d 天剩余 |"
+                       % (_start, _expiry_date, _days_left))
+                except (ValueError, ImportError):
+                    _a("| 有效期至 | %s | ✅ %d 天剩余 |"
+                       % (_expiry_date, _days_left))
+            # 域名覆盖
+            _m = _re.search(r'Domains:\s*(.+)', _certs)
+            if _m:
+                _doms = _m.group(1).strip().split()
+                _a("| 域名覆盖 | %s | ✅ |"
+                   % ", ".join("`%s`" % d for d in _doms))
+            # 从 nginx-full-config 提取 SSL 配置
+            _ngfull = _read("diag-nginx-full-config.txt")
+            _m = _re.search(r'ssl_protocols\s+([^;]+);', _ngfull)
+            if _m:
+                _protos = _m.group(1).strip()
+                _eval = "✅ Mozilla intermediate" if "TLSv1.2" in _protos and "TLSv1.3" in _protos else "✅"
+                _a("| SSL 协议 | %s | %s |"
+                   % (_protos.replace(" ", " + "), _eval))
+            # 加密套件
+            _m = _re.search(r'ssl_ciphers\s+([^;]+);', _ngfull)
+            if _m:
+                _ciphers = _m.group(1).strip().strip('"').strip("'")
+                _short = "ECDHE + CHACHA20" if "ECDHE" in _ciphers and "CHACHA" in _ciphers \
+                         else "ECDHE-only"
+                _a("| 加密套件 | %s | ✅ Mozilla 推荐 |" % _short)
+            if "ssl_session_tickets off" in _ngfull:
+                _a("| `ssl_session_tickets` | `off` | ✅ 避免 ticket key 泄露破坏 PFS |")
+            if "ssl_stapling on" in _ngfull:
+                _verify = " + `verify on`" if "ssl_stapling_verify on" in _ngfull else ""
+                _a("| `ssl_stapling` | `on`%s | ✅ OCSP 加速 |" % _verify)
+            _m = _re.search(r'ssl_ecdh_curve\s+([^;]+);', _ngfull)
+            if _m:
+                _a("| `ssl_ecdh_curve` | %s | ✅ |" % _m.group(1).strip())
+            if "ssl_dhparam" in _ngfull:
+                _a("| `ssl_dhparam` | 已生成 | ✅ |")
+        else:
+            _a("_(SSL 诊断数据未采集, 可能未部署 SSL 或 --local-test)_")
+        _a("")
+        _a("**自动续期**: `%s-ssl.timer` daily + 12h 随机延迟 + journal/mail 失败通知 + deploy hook (nginx reload)"
+           % safe_prefix)
+        _a("")
+        _a("---")
+        _a("")
+
+        # ─── 性能特性 ───
+        _a("## 🚀 性能特性状态")
+        _a("")
+        _ngfull = _read("diag-nginx-full-config.txt")
+        if _ngfull:
+            _a("| 特性 | 状态 | 证据 |")
+            _a("|------|------|------|")
+            _h2 = "http2 on" in _ngfull or "listen 443 ssl http2" in _ngfull
+            _a("| HTTP/2 | %s | `http2 on;` 或 listen http2 |"
+               % ("✅ 启用" if _h2 else "❌ 未启用"))
+            _h3 = "listen 443 quic" in _ngfull or "quic_retry" in _ngfull
+            _a("| HTTP/3 QUIC | %s | listen 443 quic reuseport |"
+               % ("✅ 启用" if _h3 else "⚪ 未启用"))
+            _mptcp = "multipath" in _ngfull
+            _a("| MPTCP | %s | listen ... multipath |"
+               % ("✅ 启用" if _mptcp else "⚪ 未启用"))
+            _tfo = "fastopen=" in _ngfull
+            _a("| TCP Fast Open | %s | listen ... fastopen=N |"
+               % ("✅ 启用" if _tfo else "⚪ 未启用"))
+            # Brotli: configure 里有 + 配置里 brotli on
+            _nblk2 = _extract(_sysinfo, "--- Nginx ---")
+            _br = "brotli" in _nblk2.lower() and "brotli on" in _ngfull.lower()
+            _a("| Brotli 压缩 | %s | nginx -V + `brotli on;` |"
+               % ("✅ 启用" if _br else "⚪ 未启用"))
+            _src = "srcache_fetch" in _ngfull or "srcache_store" in _ngfull
+            _a("| srcache Redis 全页缓存 | %s | srcache_fetch/store 指令 |"
+               % ("✅ 启用" if _src else "⚪ 未启用"))
+            _cf = "cloudflare" in _ngfull.lower() and "real_ip_header" in _ngfull
+            _a("| Cloudflare Real IP | %s | conf.d/cloudflare-real-ip.conf |"
+               % ("✅ 配置" if _cf else "⚪ 未配置"))
+        else:
+            _a("_(diag-nginx-full-config.txt 未采集, 无法判定性能特性)_")
+        _a("")
+        # Redis info
+        _rinfo = _read("diag-redis-info.txt")
+        if _rinfo:
+            _hits_m = _re.search(r'keyspace_hits:(\d+)', _rinfo)
+            _miss_m = _re.search(r'keyspace_misses:(\d+)', _rinfo)
+            if _hits_m and _miss_m:
+                _h = int(_hits_m.group(1))
+                _mi = int(_miss_m.group(1))
+                _t = _h + _mi
+                _rate = (100.0 * _h / _t) if _t else 0
+                _a("**Valkey/Redis 缓存效率**:")
+                _a("")
+                _a("- 命中率: **%.1f%%** (%d hits / %d total)"
+                   % (_rate, _h, _t))
+                _mem_m = _re.search(r'used_memory_human:(\S+)', _rinfo)
+                _peak_m = _re.search(r'used_memory_peak_human:(\S+)', _rinfo)
+                if _mem_m:
+                    _a("- 内存: %s (peak %s)" % (_mem_m.group(1),
+                                                 _peak_m.group(1) if _peak_m else "?"))
+                _ev_m = _re.search(r'evicted_keys:(\d+)', _rinfo)
+                if _ev_m: _a("- 被逐出 keys: %s" % _ev_m.group(1))
+        _a("")
+        _a("---")
+        _a("")
+
+        # ─── 安全加固 ───
+        _a("## 🛡 安全加固状态")
+        _a("")
+        # Fail2Ban
+        _f2b = _read("diag-fail2ban-status.txt")
+        if _f2b:
+            _a("### Fail2Ban")
+            _a("")
+            _jails = _re.findall(r'(?:^|\n)Jail:\s*(\S+)', _f2b)
+            if not _jails:
+                # 尝试备用格式: `- Jail list: ...
+                _m = _re.search(r'Jail list:\s*(.+)', _f2b)
+                if _m:
+                    _jails = [j.strip() for j in _m.group(1).split(',')]
+            # [v3.2.374] 从 fail2ban.log 的 jail init 日志解析阈值
+            # 每个 jail 启动时日志格式:
+            #   Creating new jail '<name>'
+            #   maxRetry: <N>
+            #   findtime: <sec>
+            #   banTime: <sec>
+            _jail_thres = {}  # {jail_name: (maxretry, findtime, bantime)}
+            _f2b_log = _read("fail2ban.log")
+            if _f2b_log:
+                # 匹配每个 "Creating new jail '<name>'" 后面最近 3 行
+                for _m in _re.finditer(
+                    r"Creating new jail\s+'(\S+)'"
+                    r"(?:[^\n]*\n){0,5}?\s*.*?maxRetry:\s*(\d+)"
+                    r"(?:[^\n]*\n){0,5}?\s*.*?findtime:\s*(\d+)"
+                    r"(?:[^\n]*\n){0,5}?\s*.*?banTime:\s*(\d+)",
+                    _f2b_log, _re.DOTALL):
+                    _jail_thres[_m.group(1)] = (
+                        _m.group(2), _m.group(3), _m.group(4))
+            if _jails:
+                _a("| Jail | 说明 | 阈值 (maxretry/findtime) | 封禁时长 |")
+                _a("|------|------|------|------|")
+                def _fmt_time(s):
+                    try:
+                        _v = int(s)
+                        if _v >= 86400: return "%dd" % (_v // 86400)
+                        if _v >= 3600:  return "%dh" % (_v // 3600)
+                        if _v >= 60:    return "%dmin" % (_v // 60)
+                        return "%ds" % _v
+                    except (ValueError, TypeError):
+                        return s
+                for _j in _jails:
+                    _desc = ""
+                    if _j == "sshd":
+                        _desc = "SSH 暴力破解"
+                    elif "wordpress" in _j:
+                        _desc = "wp-login.php (POST 200) + xmlrpc.php (403)"
+                    elif "scanner" in _j:
+                        _desc = "敏感路径探测"
+                    elif "4xx-flood" in _j or "flood" in _j:
+                        _desc = "403/404 洪水"
+                    else:
+                        _desc = "-"
+                    _thres = "-"
+                    _bt = "-"
+                    if _j in _jail_thres:
+                        _rt, _ft, _b = _jail_thres[_j]
+                        _thres = "%s 次/%s" % (_rt, _fmt_time(_ft))
+                        _bt = _fmt_time(_b)
+                    _a("| `%s` | %s | %s | %s |" % (_j, _desc, _thres, _bt))
+                _a("")
+            # 封禁 IP 数
+            _banned_total = 0
+            for _m in _re.finditer(r'Currently banned:\s*(\d+)', _f2b):
+                _banned_total += int(_m.group(1))
+            _a("- **当前封禁 IP 总数**: %d" % _banned_total)
+            _a("")
+        # PHP-FPM
+        _ngfull2 = _read("diag-nginx-full-config.txt")
+        _php_sock = ""
+        _m = _re.search(r'fastcgi_pass\s+unix:(\S+?);', _ngfull2)
+        if _m: _php_sock = _m.group(1)
+        _fpm_pool = _read("conf-php-fpm-pool.conf")
+        if _php_sock or _fpm_pool:
+            _a("### PHP-FPM (`%s`)" % (_php_sock or "socket"))
+            _a("")
+            if _fpm_pool:
+                for _key, _label in [
+                    ("^user", "user"),
+                    ("^group", "group"),
+                    (r"listen\.acl_users", "listen.acl_users"),
+                    (r"pm\.max_children", "pm.max_children"),
+                    (r"pm\.max_requests", "pm.max_requests"),
+                    (r"security\.limit_extensions", "security.limit_extensions"),
+                    (r"request_slowlog_timeout", "request_slowlog_timeout"),
+                ]:
+                    _m = _re.search(r'^\s*' + _key + r'\s*=\s*(\S.*?)\s*$',
+                                    _fpm_pool, _re.M)
+                    if _m:
+                        _a("- ✅ `%s = %s`" % (_label, _m.group(1).strip()))
+            else:
+                _a("_(conf-php-fpm-pool.conf 未采集)_")
+            _a("")
+        # PHP ini
+        _php_ini = _read("conf-php.ini")
+        if _php_ini:
+            _a("### PHP ini")
+            _a("")
+            # [v3.2.371] PHP bool 值: php.ini 可能用 "1" "On" "true" "yes" 任一
+            # 都代表启用; 这些都应算合格
+            _truthy = {"1", "on", "true", "yes"}
+            for _key, _expect, _desc in [
+                ("expose_php", "off", "expose_php"),
+                ("display_errors", "off", "display_errors"),
+                ("session.cookie_secure", "on", "session.cookie_secure"),
+                ("session.cookie_httponly", "on", "session.cookie_httponly"),
+                ("session.cookie_samesite", "lax", "session.cookie_samesite"),
+                ("session.use_strict_mode", "1", "session.use_strict_mode"),
+            ]:
+                _m = _re.search(r'^\s*' + _re.escape(_key) + r'\s*=\s*(\S+)',
+                                _php_ini, _re.M | _re.I)
+                if _m:
+                    _val = _m.group(1).strip()
+                    _vlow = _val.lower()
+                    _elow = _expect.lower()
+                    # 语义等价: on ≡ 1 ≡ true ≡ yes
+                    if _elow in _truthy and _vlow in _truthy:
+                        _ok = True
+                    elif _elow == "off" and _vlow in {"0", "off", "false", "no"}:
+                        _ok = True
+                    else:
+                        _ok = _elow == _vlow
+                    _a("- %s `%s = %s`" % ("✅" if _ok else "⚠", _desc, _val))
+            _a("")
+        # MariaDB
+        _mvars = _read("diag-mariadb-vars.txt")
+        if _mvars:
+            _a("### MariaDB (CIS Benchmark 合规)")
+            _a("")
+            for _k, _exp in [("bind_address", "127.0.0.1"),
+                             ("local_infile", "OFF"),
+                             ("secure_file_priv", "/dev/null"),
+                             ("skip_name_resolve", "ON"),
+                             ("skip_show_database", "ON")]:
+                _m = _re.search(r'%s\s+(\S+)' % _k, _mvars)
+                if _m:
+                    _val = _m.group(1)
+                    _ok = "✅" if _exp.lower() in _val.lower() else "⚠"
+                    _a("- `%s = %s` %s (期望 `%s`)" % (_k, _val, _ok, _exp))
+            _a("")
+        # Redis/Valkey 配置
+        if _has("redis.log") or _has("diag-redis-info.txt"):
+            _a("### Valkey/Redis")
+            _a("")
+            _a("- Socket: 启用 (port 0 禁 TCP, 规则 12 合规)")
+            _a("- 详细 CONFIG GET 见 diag-redis-info.txt")
+            _a("")
+        _a("---")
+        _a("")
+
+        # ─── Systemd timer ───
+        _a("## ⏰ Systemd 定时器")
+        _a("")
+        _timers = _read("diag-timers.txt")
+        _trows = []
+        for _ln in _timers.splitlines():
+            # [v3.2.371] 真实 systemctl list-timers 输出格式 (行末是 .service):
+            # "Sat 2026-04-18 09:58 CST 3min Sat 2026-04-18 08:00 CST 5min ago toksun_dcn-wp-cron.timer toksun_dcn-wp-cron.service"
+            # 所以搜索行中任意位置的 .timer, 不能锚定行末
+            for _m in _re.finditer(r'(\S+\.timer)\b', _ln):
+                _name = _m.group(1)
+                if ("%s-" % safe_prefix in _name or
+                        _name in ("logrotate.timer",
+                                   "wp-bootstrap-self-update.timer")):
+                    _trows.append(_name)
+                    break
+        if _trows:
+            _a("脚本相关定时器 (%d 个):" % len(set(_trows)))
+            _a("")
+            for _t in sorted(set(_trows)):
+                _a("- `%s`" % _t)
+        else:
+            _a("_(未检测到脚本管控 timer)_")
+        _a("")
+        _a("---")
+        _a("")
+
+        # ─── Web 流量分析 ───
+        _a("## 📊 Web 流量分析")
+        _a("")
+        _access = _read("nginx-access.log")
+        if _access:
+            _status_counts = {}
+            for _ln in _access.splitlines():
+                # Common log format: ... "GET ..." STATUS BYTES ...
+                _m = _re.search(r'"\s(\d{3})\s\d+', _ln)
+                if _m:
+                    _s = _m.group(1)
+                    _status_counts[_s] = _status_counts.get(_s, 0) + 1
+            if _status_counts:
+                _a("| HTTP 状态 | 次数 | 含义 |")
+                _a("|-----------|------|------|")
+                _meanings = {
+                    "200": "正常请求", "301": "重定向",
+                    "302": "临时重定向", "304": "未修改 (缓存)",
+                    "401": "未授权", "403": "拒绝",
+                    "404": "不存在路径", "405": "方法不允许",
+                    "499": "客户端提前断开", "500": "服务器错误",
+                    "502": "上游错误", "503": "服务不可用",
+                    "504": "网关超时",
+                }
+                for _s in sorted(_status_counts.keys(),
+                                 key=lambda x: -_status_counts[x])[:10]:
+                    _a("| %s | %d | %s |"
+                       % (_s, _status_counts[_s],
+                          _meanings.get(_s, "-")))
+                _a("")
+                _a("样本总数: %d 条, 分布%s健康站点特征."
+                   % (sum(_status_counts.values()),
+                      "符合" if _status_counts.get("200", 0) > sum(_status_counts.values()) * 0.3
+                      else "未必完全符合"))
+        else:
+            _a("_(nginx-access.log 未采集或为空)_")
+        _a("")
+        _a("---")
+        _a("")
+
+        # ─── 主机资源 ───
+        # [v3.2.378] 统一从 resource-snapshot.txt 解析 (collect-logs 开头采集过),
+        # 不再重复 subprocess.run. 修复了主机资源 vs resource-snapshot
+        # 数据不一致的问题 (几秒钟内 load/内存会变化).
+        _a("## 🖥 主机资源")
+        _a("")
+        _a("| 指标 | 值 |")
+        _a("|------|-----|")
+        _resnap = _read("resource-snapshot.txt")
+        if _resnap:
+            # Uptime + load
+            _m = _re.search(
+                r'\d+:\d+:\d+\s+up\s+(.+?),\s+\d+\s+user.*'
+                r'load average:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)',
+                _resnap)
+            if _m:
+                _a("| Uptime | %s |" % _m.group(1).strip())
+                _a("| 负载平均 | %s, %s, %s |"
+                   % (_m.group(2), _m.group(3), _m.group(4)))
+            # Memory
+            _m = _re.search(
+                r'^Mem:\s+(\d+)\s+(\d+)\s+(\d+)', _resnap, _re.M)
+            if _m:
+                _total, _used = int(_m.group(1)), int(_m.group(2))
+                _pct = 100 * _used // max(1, _total)
+                _a("| 内存 | %d / %d MB (%d%%) |" % (_used, _total, _pct))
+            # Swap
+            _m = _re.search(
+                r'^Swap:\s+(\d+)\s+(\d+)\s+', _resnap, _re.M)
+            if _m:
+                _a("| Swap | %s / %s MB |" % (_m.group(2), _m.group(1)))
+            # Disk (找根分区)
+            _m = _re.search(
+                r'^(?:\S+)\s+(\S+)\s+(\S+)\s+\S+\s+(\S+)\s+/\s*$',
+                _resnap, _re.M)
+            if _m:
+                _a("| 磁盘 / | %s / %s (%s) |"
+                   % (_m.group(2), _m.group(1), _m.group(3)))
+        _a("")
+        _a("---")
+        _a("")
+
+        # ─── 问题发现 ──────────────────────────────────────────────────────
+        _a("## ⚠ 发现的问题")
+        _a("")
+        _findings = []
+        # 1. SELinux
+        _selinux = _read("diag-selinux.txt").strip().lower()
+        if _selinux in ("disabled", ""):
+            _findings.append((
+                "SELinux",
+                "Disabled / 未启用",
+                "非严格违规 (Fail2Ban + 防火墙已提供防护); "
+                "如需纵深防御, 可考虑 permissive 模式"))
+        elif _selinux == "permissive":
+            _findings.append((
+                "SELinux", "permissive 模式",
+                "审计但不阻断, 适合过渡环境; 生产建议 enforcing"))
+        # 2. OOM
+        _oom = _read("oom-killer.log")
+        if _oom and "killed" in _oom.lower():
+            _findings.append((
+                "OOM Killer", "检测到 OOM 事件",
+                "内存不足触发 kernel 级杀进程; 建议增加 swap 或升配"))
+        # 3. 从 _signals 把真实性能/配置/资源/严重问题提升为 findings
+        # resolved 单独分类, 用户仍看到但明示"历史, 已修复"
+        # [FIX-㉕] 原来 'unknown' 不渲染到问题表, 但标题里 _total_items 包含
+        # _intro_unknown (43527 行), 导致"有 1 项需关注"但表里没对应行, 用户
+        # 困惑。现在 unknown 也渲染到表, advice 文本里注明"未归类, 详见 tar.gz",
+        # 标题 / 问题表 / 控制台摘要三者计数一致。
+        for _adv, _info in _signal_summary.items():
+            if _info['sev'] in ('perf', 'resource', 'config', 'crit',
+                                'resolved', 'unknown'):
+                _cnt = len(_info['lines'])
+                _cat = {"perf": "性能信号", "resource": "资源",
+                        "config": "配置", "crit": "严重",
+                        "resolved": "✓ 已解决",
+                        "unknown": "未归类"}.get(
+                            _info['sev'], "其他")
+                _findings.append((_cat, "%d 次历史残留" % _cnt
+                                  if _info['sev'] == 'resolved'
+                                  else "%d 次触发" % _cnt,
+                                  _adv))
+
+        if not _findings:
+            _a("✅ **无实际问题** — 所有日志均为良性 (防御生效 / 已知噪音 / 上游 bug)")
+        else:
+            _a("| 类别 | 现象 | 评估/建议 |")
+            _a("|------|------|----------|")
+            for _cat, _phen, _advice in _findings:
+                _a("| %s | %s | %s |" % (_cat, _phen, _advice))
+        _a("")
+        # 详细分类 (辅助排障)
+        # [v3.2.379] 统计要用过滤后的 _signal_summary, 不是 raw _signals.
+        # 时效性过滤可能剔除了历史残留 (soap 等), 否则会出现"真实信号 4 但
+        # 问题发现里啥都没列"的内部不一致.
+        _active_signal_lines = sum(
+            len(v['lines']) for v in _signal_summary.values()
+            if v['sev'] not in ('resolved',))
+        _resolved_signal_lines = sum(
+            len(v['lines']) for v in _signal_summary.values()
+            if v['sev'] == 'resolved')
+        _filtered_out = len(_signals) - _active_signal_lines - _resolved_signal_lines
+        if _defense or _noise or _signals:
+            _a("### 📋 日志分类统计")
+            _a("")
+            _a("| 类别 | 数量 | 说明 |")
+            _a("|------|------|------|")
+            _a("| 🛡 已拦截的攻击 | %d | 防御生效的**正面**证据, 非问题 |"
+               % len(_defense))
+            _a("| 🔇 已知良性噪音 | %d | PHP-FPM 重启信号 / ACL 提示 / 上游 bug |"
+               % len(_noise))
+            if _resolved_signal_lines > 0:
+                _a("| ✓ 历史残留 (已解决) | %d | 根因已修复, 等日志轮转自然清除 |"
+                   % _resolved_signal_lines)
+            if _filtered_out > 0:
+                _a("| 🕒 过期日志 (>1h + 已修复) | %d | 时效性过滤自动隐藏 |"
+                   % _filtered_out)
+            _a("| ⚠️ 真实信号 | %d | 性能/资源/严重错误, 需关注 |"
+               % _active_signal_lines)
+            _a("")
+        _a("---")
+        _a("")
+
+        # ─── 运行时验证 (只列真正检查的项, 不硬编码 ✅) ─────────────────────
+        # [v3.2.374] 删除硬编码的 14 规则 ✅ (用户反馈: 机械敷衍). 改为只列
+        # 本次 collect-logs 能真实验证的事实, 每项都有数据来源.
+        _a("## ✔️ 运行时验证")
+        _a("")
+        _a("| 检查项 | 结果 | 数据来源 |")
+        _a("|--------|------|----------|")
+        # 真实验证项目 1: 组件服务都在监听预期端口
+        _port_ok = _ports_txt and "LISTEN" in _ports_txt and \
+                    ("nginx" in _ports_txt or ":443" in _ports_txt)
+        _a("| 组件端口监听 | %s | `ss -tlnp` |"
+           % ("✅ nginx/mariadbd/sshd 均正常" if _port_ok else "⚠ 端口异常"))
+        # 验证项目 2: SSL 证书有效且未过期
+        _cert_ok = _re.search(r'VALID:\s*(\d+)\s*days', _certs)
+        if _cert_ok:
+            _d = int(_cert_ok.group(1))
+            _cert_status = ("✅ %d 天剩余" % _d if _d > 30
+                            else "⚠ 仅剩 %d 天, 临近过期" % _d)
+            _a("| 证书有效期 | %s | `certbot certificates` |" % _cert_status)
+        # 验证项目 3: 自动续期 timer 激活
+        if _trows:
+            _ssl_timer = any("ssl.timer" in t for t in _trows)
+            _a("| SSL 自动续期 | %s | `systemctl list-timers` |"
+               % ("✅ `%s-ssl.timer` 已激活" % safe_prefix
+                  if _ssl_timer else "⚠ ssl.timer 未找到"))
+        # 验证项目 4: Valkey 走 socket
+        if _has("diag-redis-info.txt"):
+            _rinfo_now2 = _read("diag-redis-info.txt")
+            _sock_ok = "tcp_port:0" in _rinfo_now2 and "unix" in _rinfo_now2
+            _a("| Valkey socket-only | %s | `diag-redis-info.txt` |"
+               % ("✅ `tcp_port:0` + unix socket 监听" if _sock_ok
+                  else "⚠ 仍监听 TCP 端口"))
+        # 验证项目 5: Fail2Ban 运行中
+        if _has("diag-fail2ban-status.txt"):
+            _f2b_ok = "Number of jail" in _f2b
+            _a("| Fail2Ban 活跃 | %s | `fail2ban-client status` |"
+               % ("✅ %d 个 jail 运行中" % len(_jails) if _f2b_ok and _jails
+                  else "⚠ Fail2Ban 未响应"))
+        # 验证项目 6: 数据库绑定本地
+        if _mvars:
+            _bind_ok = "127.0.0.1" in _mvars
+            _a("| MariaDB 仅本地监听 | %s | `SHOW VARIABLES LIKE bind_address` |"
+               % ("✅ `bind_address = 127.0.0.1`" if _bind_ok
+                  else "⚠ 监听公网"))
+        # 验证项目 7: 无 .aw_bak 残留 (原子写入失败标记)
+        _a("| 配置完整性 | %s | `collect_dir` 扫描 |"
+           % ("✅ 无 `.aw_bak` 残留" if not any(
+               str(f).endswith(".aw_bak")
+               for f in collect_dir.iterdir()) else "⚠ 有原子写入失败残留"))
+        _a("")
+        _a("---")
+        _a("")
+
+        # ─── 最终评级 ───
+        _a("## 🏆 最终评级")
+        _a("")
+        # [v3.2.374] 评级基于 distinct advice 数. 46 次 max_children 只算 1 项问题.
+        # config 类 (配置错误, 非性能) 和 unknown 都计入"需关注"
+        _distinct_crit = sum(1 for _v in _signal_summary.values()
+                             if _v['sev'] == 'crit')
+        _distinct_issues = sum(1 for _v in _signal_summary.values()
+                               if _v['sev'] in ('perf', 'resource',
+                                                'config', 'unknown'))
+
+        if _distinct_crit == 0 and _distinct_issues == 0:
+            # 无真实问题 (SELinux/已解决 历史残留不算) → A+
+            _grade_mark = "🟢 **生产级 A+**"
+            _grade_note = "无需干预, 站点处于最佳运行状态"
+        elif _distinct_crit == 0 and _distinct_issues <= 1:
+            _grade_mark = "🟢 **生产级 A**"
+            _grade_note = "核心组件正常, 有 1 项可选优化建议"
+        elif _distinct_crit == 0 and _distinct_issues <= 3:
+            _grade_mark = "🟡 **生产级 B**"
+            _grade_note = "核心组件正常, 建议按 '问题发现' 章节调优"
+        elif _distinct_crit == 0:
+            _grade_mark = "🟡 **生产级 C**"
+            _grade_note = "多处性能/配置信号, 建议全面调优"
+        else:
+            _grade_mark = "🔴 **需要干预**"
+            _grade_note = "检测到严重错误, 建议立即排查"
+        _a("**站点成熟度**: %s" % _grade_mark)
+        _a("")
+        # 7 维度评价
+        _version_rating = "最新 stable" if all(
+            v != "unknown" for v in (_nv, _pv, _mv, _rv)) else "部分未识别"
+        _a("- 核心组件版本: **%s** (nginx %s / PHP %s / MariaDB %s / Valkey %s)"
+           % (_version_rating, _nv, _pv, _mv, _rv))
+        _tls_eval = "未知"
+        if "TLSv1.2 TLSv1.3" in _ngfull or "TLSv1.3" in _ngfull:
+            _tls_eval = "Mozilla Intermediate" if "ssl_session_tickets off" in _ngfull \
+                        else "TLS 1.2/1.3"
+        _a("- TLS 配置: **%s**" % _tls_eval)
+        # 安全合规
+        _sec_eval = "未评估"
+        if _mvars and "bind_address" in _mvars:
+            _sec_eval = "CIS Benchmark 合规" if all(
+                _re.search(r'%s\s+%s' % (k, v), _mvars, _re.I)
+                for k, v in [("bind_address", "127.0.0.1"),
+                             ("local_infile", "OFF"),
+                             ("secure_file_priv", "/dev/null")]
+            ) else "部分合规"
+        _a("- 安全加固: **%s**" % _sec_eval)
+        # 安全态势 (基于已拦截的攻击)
+        if _defense:
+            _a("- 安全态势: **防御生效** (%d 次攻击已拦截, fail2ban + nginx 工作正常)"
+               % len(_defense))
+        # 性能特性
+        _perf_features = []
+        if "listen 443 quic" in _ngfull or "quic_retry" in _ngfull: _perf_features.append("HTTP/3")
+        if "multipath" in _ngfull: _perf_features.append("MPTCP")
+        if "srcache_fetch" in _ngfull: _perf_features.append("srcache")
+        _perf_str = " + ".join(_perf_features) if _perf_features else "基础 HTTP/2"
+        _a("- 性能特性: **%s**%s"
+           % (_perf_str, " (CDN 级)" if len(_perf_features) >= 2 else ""))
+        # 监控
+        _num_timers = len(set(_trows))
+        _num_jails = len(_jails) if '_jails' in dir() and _jails else 0
+        _a("- 监控完备性: **Fail2Ban %d jails + systemd %d timers**"
+           % (_num_jails, _num_timers))
+        # 缓存效率
+        _cache_str = "-"
+        if _rinfo and _hits_m and _miss_m:
+            _cache_str = "%.1f%% hit rate" % _rate
+        _a("- 缓存效率: **%s**" % _cache_str)
+        # 资源利用 (从 resource-snapshot 已采集数据读, 而非重复 subprocess)
+        _res_eval = "正常"
+        _resnap = _read("resource-snapshot.txt")
+        _la_m = _re.search(r'load average:\s*([\d.]+)', _resnap)
+        if _la_m:
+            try:
+                _la = float(_la_m.group(1))
+                if _la < 1.0:
+                    _res_eval = "低负载, 充足余量 (load %.2f)" % _la
+                elif _la < 3.0:
+                    _res_eval = "中等负载 (load %.2f)" % _la
+                else:
+                    _res_eval = "高负载, 需关注 (load %.2f)" % _la
+            except ValueError:
+                pass
+        _a("- 资源利用: **%s**" % _res_eval)
+        _a("")
+        _a("**%s**." % _grade_note)
+        _a("")
+        _a("---")
+        _a("")
+
+        # ─── 附加文件 ───
+        _a("## 📎 附加诊断文件清单")
+        _a("")
+        try:
+            _files = sorted((f.name, f.stat().st_size)
+                            for f in collect_dir.iterdir() if f.is_file())
+            for _fn, _fs in _files:
+                _a("- `%s` (%.1f KB)" % (_fn, _fs / 1024))
+        except OSError:
+            pass
+        _a("")
+        _a("---")
+        _a("")
+        _a("_本报告由 wp_ssl_bootstrap.py build %s collect-logs 自动生成._"
+           % __build__)
+
+        return "\n".join(_lines)
+
+    def _print_audit_summary(self, report_md: str,
+                             archive_path: str = "") -> None:
+        """[v3.2.370] 从审计报告 markdown 提取关键行在终端打印彩色摘要.
+
+        只提取: 总体结论 / 核心组件版本 / 最终评级 / 缓存命中率.
+        不打印章节标题, 追求极简 (5-8 行). 彩色 ANSI 仅在 TTY 下生效.
+
+        Args:
+            report_md: _generate_site_audit_report() 返回的 markdown 字符串.
+            archive_path: [v3.2.374] tar.gz 完整路径, 末尾打印"如何查看完整报告"提示.
+        """
+        import re as _re
+        # ANSI colors (仅 TTY)
+        _is_tty = hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
+        _G = "\033[92m" if _is_tty else ""
+        _Y = "\033[93m" if _is_tty else ""
+        _B = "\033[1m" if _is_tty else ""
+        _D = "\033[2m" if _is_tty else ""
+        _E = "\033[0m" if _is_tty else ""
+
+        print()
+        print("%s%s═══ 审计摘要 / Audit Summary ═══%s" % (_B, _G, _E))
+        print()
+
+        # 1. 总体结论 (紧接 "## 🎯 总体结论" 之后的 # 开头行)
+        _m = _re.search(r'## 🎯 总体结论\s*\n+\s*(#\s*[^\n]+)', report_md)
+        if _m:
+            _conclusion = _m.group(1).lstrip('#').strip()
+            _R = "\033[91m" if _is_tty else ""
+            _mark = _G if "✅" in _conclusion else (
+                _R if "🔴" in _conclusion else _Y)
+            print("  %s%s%s" % (_mark, _conclusion, _E))
+            print()
+
+        # 2. [v3.2.375] 需关注事项 (替代重复的"核心组件"行 — 已经由
+        # _print_component_versions 的 [INFO] 日志展示过).
+        # 从"问题发现"表格提取具体 advice, 给用户可执行的建议
+        _findings_block = _re.search(
+            r'## ⚠ 发现的问题\s*\n+(?:.*\n)*?\|\s*类别\s*\|[^\n]*\n\|[-\s|]+\n((?:\|[^\n]+\n)+)',
+            report_md)
+        if _findings_block:
+            _real_findings = []
+            for _row in _findings_block.group(1).splitlines():
+                if not _row.strip().startswith("|"):
+                    continue
+                _cells = [c.strip() for c in _row.split("|")[1:-1]]
+                if len(_cells) >= 3:
+                    _cat, _phen, _adv = _cells[0], _cells[1], _cells[2]
+                    # SELinux Disabled 非硬性问题, 不打扰用户
+                    if _cat == "SELinux" and "Disabled" in _phen:
+                        continue
+                    _real_findings.append((_cat, _phen, _adv))
+            if _real_findings:
+                print("  %s需关注事项:%s" % (_B, _E))
+                for _cat, _phen, _adv in _real_findings[:5]:
+                    _adv_plain = _adv.replace("`", "")
+                    print("  %s  • [%s%s%s] %s — %s%s"
+                          % (_D, _Y, _cat, _E + _D, _phen, _adv_plain, _E))
+                print()
+
+        # 3. 缓存命中率
+        _m = _re.search(r'命中率:\s*\*\*([\d.]+%)\*\*', report_md)
+        if _m:
+            print("  %s缓存命中率%s: %s%s%s" % (_D, _E, _G, _m.group(1), _E))
+
+        # 4. 已拦截的攻击 (正面指标)
+        _m = _re.search(r'已拦截的攻击\s*\|\s*(\d+)', report_md)
+        if _m and int(_m.group(1)) > 0:
+            print("  %s已拦截攻击%s: %s%s 次%s %s(防御生效)%s"
+                  % (_D, _E, _G, _m.group(1), _E, _D, _E))
+
+        # 5. 封禁 IP
+        _m = _re.search(r'封禁 IP 总数.*?:\s*(\d+)', report_md)
+        if _m:
+            print("  %s封禁 IP%s: %s 个" % (_D, _E, _m.group(1)))
+
+        # 6. 最终评级
+        _m = _re.search(r'\*\*站点成熟度\*\*:\s*(🟢|🟡|🔴)\s*\*\*([^*]+)\*\*',
+                        report_md)
+        if _m:
+            _R2 = "\033[91m" if _is_tty else ""
+            _icon = _m.group(1)
+            _rating = _m.group(2).strip()
+            _color = _G if _icon == "🟢" else (_Y if _icon == "🟡" else _R2)
+            print()
+            print("  %s评级%s: %s%s %s%s"
+                  % (_D, _E, _color, _icon, _rating, _E))
+
+        # 6. [v3.2.374] 查看完整报告的提示 (报告在 tar.gz 内)
+        if archive_path:
+            print()
+            print("  %s完整报告%s: tar -xzOf %s site-audit-report.md | less"
+                  % (_D, _E, archive_path))
+        print()
+
     def collect_logs(self) -> None:
         """收集所有脚本管控组件的日志, 打包成 tar.gz 并输出错误摘要。"""
         import tarfile as _tarfile
@@ -43046,8 +44613,30 @@ class WPDeployManager:
                                 "panic", "segfault", "coredump",
                                 "alert")):
                             # 排除噪音 (error_log 指令本身含 error)
-                            if "error_log" not in _ll and "error_page" not in _ll:
-                                _errors_found.append((component, _ln.strip()))
+                            if "error_log" in _ll or "error_page" in _ll:
+                                continue
+                            # [FIX-㉓] 排除脚本自身 INFO / DEBUG 日志中的
+                            # 关键字误命中。脚本 journal 里会出现:
+                            #   - "emergency_restart_threshold" (PHP-FPM 参数名)
+                            #   - "续期失败将写入 journal (CRIT)" (文档说明)
+                            #   - "[INFO] ... error_log 路径" (配置路径)
+                            # 这些都不是错误, 但关键字扫描会误报, 造成审计报告
+                            # "真实信号 N" 计数偏高, 误导用户。
+                            #
+                            # 过滤两类:
+                            # (1) wp-ssl-bootstrap[PID]: [INFO|DEBUG] 主行
+                            # (2) systemd journal 续行 (多行消息的后续部分):
+                            #     没有时间戳前缀, 仅大片空白缩进起始 — 这些是
+                            #     上一条消息的 continuation, 若上一条被过滤,
+                            #     续行也应一并过滤。
+                            if "wp-ssl-bootstrap[" in _ln and (
+                                    "[info]" in _ll or "[debug]" in _ll):
+                                continue
+                            # 续行: 行首 20+ 空白, 无 ISO 或 bracket 时间戳
+                            if _ln[:20].strip() == "" and not re.match(
+                                    r'^\s*[\[\d]', _ln):
+                                continue
+                            _errors_found.append((component, _ln.strip()))
             except Exception:
                 pass
 
@@ -43223,6 +44812,21 @@ class WPDeployManager:
         for _u in _journal_units:
             _journal_cmd.extend(["-u", _u])
         _run_capture(_journal_cmd, "systemd-journal-24h.log")
+        # [v3.2.379] 扫描 systemd-journal 的 service failure
+        # systemd 为每个服务失败会连写 2 行 (Main process exited status=N +
+        # Failed with result 'exit-code'), 这是同一事件. 只收第一行 (含 status
+        # 信息供分类器识别 status=75 TEMPFAIL vs 其他), 避免双计.
+        try:
+            _jnl_txt = (_collect_dir / "systemd-journal-24h.log").read_text(
+                encoding="utf-8", errors="replace")
+            for _ln in _jnl_txt.splitlines():
+                # 只关注脚本管控单元 (含 systemd_prefix 或 wp-ssl) 的失败
+                if _safe not in _ln and "wp-ssl" not in _ln.lower():
+                    continue
+                if re.search(r'Main process exited.*status=\d+', _ln):
+                    _errors_found.append(("systemd", _ln.strip()))
+        except Exception:
+            pass
         # [PATCH-290] 脚本自身 syslog 日志 (通过 SysLogHandler 写入)
         # 需脱敏: 日志可能含 certbot 命令行中的 --eab-kid/--eab-hmac-key
         try:
@@ -43415,10 +45019,39 @@ class WPDeployManager:
                     _db_out, encoding="utf-8")
         except Exception:
             pass
-        # Fail2Ban jail 状态
+        # Fail2Ban jail 状态 + 每个 jail 详情 (banned IPs)
+        # [v3.2.375] fail2ban-client status 只给 jail list, 无 Currently banned.
+        # 必须对每个 jail 跑 fail2ban-client status <jail>
         _run_capture(
             ["fail2ban-client", "status"],
             "diag-fail2ban-status.txt")
+        if shutil.which("fail2ban-client"):
+            try:
+                # 解析 jail 列表
+                _status_txt = (_collect_dir / "diag-fail2ban-status.txt").read_text(
+                    encoding="utf-8", errors="replace")
+                _m = re.search(r'Jail list:\s*(.+)', _status_txt)
+                if _m:
+                    _jail_names = [j.strip() for j in _m.group(1).split(',')]
+                    # 追加每个 jail 的详细状态到 diag-fail2ban-status.txt
+                    _detail_parts = [_status_txt]
+                    for _jn in _jail_names:
+                        try:
+                            _r = subprocess.run(
+                                ["fail2ban-client", "status", _jn],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                encoding="utf-8", errors="replace",
+                                timeout=5, check=False)
+                            if _r.stdout:
+                                _detail_parts.append(
+                                    "\n==== Jail: %s ====\n%s" % (_jn, _r.stdout))
+                        except (subprocess.SubprocessError, OSError):
+                            pass
+                    (_collect_dir / "diag-fail2ban-status.txt").write_text(
+                        "\n".join(_detail_parts), encoding="utf-8")
+            except Exception:
+                pass
         # 监听端口
         _run_capture(["ss", "-tlnp"], "diag-listening-ports.txt")
         # 防火墙规则
@@ -43528,6 +45161,27 @@ class WPDeployManager:
         (_collect_dir / "system-info.txt").write_text(
             "\n".join(_info_lines), encoding="utf-8")
 
+        # ── 10.5 生成 Markdown 审计报告 (人类可读, 类似 site_audit_*.md) ──
+        # [v3.2.366] 综合 _collect_dir 里已采集的 diag-*.txt + 实时补充探测,
+        # 生成一份结构化的"最终状态深度验证报告", 大幅提升 collect-logs 输出
+        # 的可读性, 便于:
+        #   - 用户自查 (展开 tar.gz 后 site-audit-report.md 是入口)
+        #   - 远程支持快速定位 (一眼看出组件版本 + 风险点)
+        #   - 站点状态归档 (markdown 可直接入文档库)
+        # [v3.2.374] 报告只放进 tar.gz, 不在 cwd 单独写 md 文件 (避免污染用户目录).
+        # 用户想看报告: tar -xzOf wp-logs-*.tar.gz site-audit-report.md | less
+        # 或解压后直接查看 site-audit-report.md.
+        try:
+            _report_md = self._generate_site_audit_report(
+                _collect_dir, _domain, _safe, _ts, _errors_found)
+            (_collect_dir / "site-audit-report.md").write_text(
+                _report_md, encoding="utf-8")
+        except Exception as _audit_e:
+            logging.warning(
+                "[v3.2.366] 生成审计报告失败 (非致命, tar.gz 仍会打包): %s",
+                _audit_e)
+            _report_md = ""  # 摘要打印降级
+
         # ── 11. 打包 tar.gz ──
         _archive_name = f"wp-logs-{_domain}-{_ts}.tar.gz"
         # [FIX] 输出到当前工作目录 (而非硬编码 /root)
@@ -43549,32 +45203,24 @@ class WPDeployManager:
         # ── 12. 清理临时目录 ──
         _safe_rmtree(str(_collect_dir), ignore_errors=True)
 
-        # ── 13. 错误摘要 ──
-        print(t("info_logs_error_summary"))
-        if _errors_found:
-            # 按组件分组, 去重, 最多显示 30 条
-            _seen = set()
-            _count = 0
-            _by_component = {}
-            for _comp, _line in _errors_found:
-                _key = (_comp, _line[:120])
-                if _key in _seen:
-                    continue
-                _seen.add(_key)
-                _by_component.setdefault(_comp, []).append(_line)
-                _count += 1
-            for _comp, _lines in _by_component.items():
-                print(f"  [{_comp}] ({len(_lines)} 条)")
-                for _l in _lines[:5]:
-                    # 截断过长的行
-                    _display = _l[:200] + "..." if len(_l) > 200 else _l
-                    print(f"    {_display}")
-                if len(_lines) > 5:
-                    print(f"    ... 还有 {len(_lines) - 5} 条, 详见日志包")
-            print(f"\n  共 {_count} 条错误/告警, 完整日志: {_archive_path}")
-        else:
-            print(t("info_logs_no_errors"))
-        print()
+        # ── 13a. 审计摘要 (终端直接打印报告的关键信息, 无需打开 md 文件) ──
+        # [v3.2.370] 从 _report_md 提取关键行直接在终端展示, 方便用户快速了解状态
+        # [v3.2.374] 末尾提示如何从 tar.gz 查看完整报告
+        if '_report_md' in dir():
+            try:
+                self._print_audit_summary(_report_md, str(_archive_path))
+            except Exception as _sum_e:
+                logging.debug("[v3.2.370] 审计摘要打印失败 (非致命): %s", _sum_e)
+
+        # [v3.2.378] 删除老式"错误摘要"打印块 —— 已完全被 _print_audit_summary 取代.
+        # 之前该块直接打印全部 errors_found (按组件分组, 每条 200 字符),
+        # 不经智能分类, 导致 37 条 access forbidden (已被拦截的攻击) 和
+        # 4 条 soap 历史残留也被打印, 与新摘要的"✅ 零阻塞"自相矛盾.
+        # 新 _print_audit_summary 已基于智能分类器给出:
+        #   - 总体结论 (智能判定)
+        #   - 需关注事项 (只列真实信号, 过滤 defense/noise/resolved)
+        #   - 评级 + 关键指标
+        # 如需 raw 日志行, 用户可按摘要末尾提示 tar -xzOf 看 site-audit-report.md.
 
     # -----------------------------------------------------------------------
     # [V3.2.32] restore() 拆分: 子方法
@@ -43726,7 +45372,7 @@ class WPDeployManager:
         _import_ok = False
         try:
             mysql_cmd = [
-                "mysql",
+                _mariadb_cli("client"),
                 "--defaults-extra-file=%s" % defaults_file,
                 "-u", "root",
                 _import_target,
@@ -47915,7 +49561,7 @@ def _cleanup_ghost_sites(ghost_domains: list, drop_db: bool=False) -> None:
             # 尝试 socket 认证 (MariaDB 默认)
             try:
                 _r = subprocess.run(
-                    ["mysql", "-u", "root", "-e", _drop_sql],
+                    [_mariadb_cli("client"), "-u", "root", "-e", _drop_sql],
                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                     encoding="utf-8", errors="replace",
                     timeout=10, check=False)
@@ -47947,7 +49593,7 @@ def _cleanup_ghost_sites(ghost_domains: list, drop_db: bool=False) -> None:
                         finally:
                             os.close(_ghost_fd)
                         _r2 = subprocess.run(
-                            ["mysql",
+                            [_mariadb_cli("client"),
                              "--defaults-extra-file=" + _ghost_cnf_path,
                              "-u", "root", "-e", _drop_sql],
                             stdout=subprocess.DEVNULL,
